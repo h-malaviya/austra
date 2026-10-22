@@ -3,72 +3,43 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Austra · Business assistant</title>
+  <title>Austra · Blank workspace</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar" id="sidebar" aria-label="Conversations">
-      <div class="brand"><span class="brand-mark">A</span><span>Austra<small>Business assistant</small></span></div>
-      <button class="new-chat" id="newChat" type="button"><span aria-hidden="true">＋</span> New chat</button>
+      <div class="brand"><span class="brand-mark">A</span><span>Austra<small>Business workspace</small></span></div>
+      <button class="new-chat" id="newChat" type="button">＋ New chat</button>
       <div class="sidebar-label">YOUR CHATS</div>
       <nav class="chat-list" id="chatList" aria-label="Previous chats"></nav>
       <div class="sidebar-bottom">
-        <button class="side-action" id="policiesButton" type="button">Policies <span aria-hidden="true">↗</span></button>
-        <button class="side-action" id="recordsButton" type="button">Add case data <span aria-hidden="true">↗</span></button>
-        <button class="side-action" id="accessButton" type="button">Manager access <span aria-hidden="true">↗</span></button>
-        <div class="connection" id="connection">Checking connection…</div>
+        <button class="side-action" id="workspaceButton" type="button">Approved workspace <span>↗</span></button>
+        <button class="side-action" id="connectionsButton" type="button">Connections <span>↗</span></button>
+        <button class="side-action" id="logoutButton" type="button">Sign out <span>↗</span></button>
+        <div class="connection" id="connection">Checking setup…</div>
       </div>
     </aside>
-
     <main class="chat-area">
       <header class="topbar">
         <button class="mobile-menu icon-button" id="menuButton" type="button" aria-label="Open chats">☰</button>
-        <div class="chat-heading"><strong id="chatTitle">New chat</strong><span id="chatSubtitle">Purchasing · Sales · Inventory · Stock</span></div>
-        <button class="top-action" id="policyTopButton" type="button">View policies</button>
+        <div class="chat-heading"><strong id="chatTitle">New chat</strong><span>Skills and structures grow from your instructions</span></div>
+        <button class="top-action" id="topConnections" type="button">Connections</button>
       </header>
-
       <div class="messages" id="messages" role="log" aria-live="polite"></div>
-
       <div class="composer-wrap">
         <div class="status" id="status" role="status"></div>
         <div class="attachment-preview" id="attachmentPreview" hidden></div>
         <div class="composer">
           <button class="attach-button icon-button" id="attachButton" type="button" aria-label="Attach PDF, DOCX, or CSV">＋</button>
           <input id="fileInput" type="file" accept=".pdf,.docx,.csv" hidden>
-          <textarea id="messageInput" rows="1" maxlength="10000" aria-label="Message Austra" placeholder="Message Austra about your business…"></textarea>
+          <textarea id="messageInput" rows="1" maxlength="10000" aria-label="Message Austra" placeholder="Describe your business or ask Austra to build something…"></textarea>
           <button class="send-button" id="sendButton" type="button" aria-label="Send message">➤</button>
         </div>
-        <p class="composer-hint">Enter to send · Shift+Enter for a new line · PDF, DOCX, CSV attachments</p>
+        <p class="composer-hint">Enter to send · Shift+Enter for a new line · Never paste API keys here</p>
       </div>
     </main>
   </div>
-
-  <div class="dialog-backdrop" id="accessDialog" hidden>
-    <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="accessTitle">
-      <button class="dialog-close" id="closeAccess" type="button" aria-label="Close">×</button>
-      <h2 id="accessTitle">Manager access</h2>
-      <p>Enter the local prototype's manager credentials to review proposals, upload documents, and publish policies.</p>
-      <label for="managerName">Your name</label>
-      <input id="managerName" autocomplete="name" placeholder="Manager name">
-      <label for="managerToken">Manager token</label>
-      <input id="managerToken" type="password" autocomplete="off" placeholder="Token configured on the server">
-      <button class="primary" id="saveAccess" type="button">Continue</button>
-      <small>The token stays in this browser tab's memory.</small>
-    </section>
-  </div>
-
-  <div class="dialog-backdrop" id="policiesDialog" hidden>
-    <section class="dialog wide-dialog" role="dialog" aria-modal="true" aria-labelledby="policiesTitle">
-      <button class="dialog-close" id="closePolicies" type="button" aria-label="Close">×</button>
-      <h2 id="policiesTitle">Business policies</h2>
-      <p>Active rules guide the agent. A draft needs manager approval before it applies.</p>
-      <div id="policyList" class="policy-list"></div>
-      <button class="primary" id="draftPolicy" type="button">Draft a policy in chat</button>
-    </section>
-  </div>
-
-  <script src="/static/ui.js" defer></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

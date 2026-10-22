@@ -1,12 +1,13 @@
 [project]
 name = "austra"
 version = "0.1.0"
-description = "Policy guided business operations for polysilicon manufacturing"
+description = "Chat guided blank business workspace"
 requires-python = ">=3.13"
 dependencies = [
     "anthropic>=1.0",
     "fastapi>=0.118",
     "httpx>=0.28",
+    "jsonschema>=4.25",
     "pypdf>=6.20.1",
     "python-docx>=1.2.0",
     "python-multipart>=0.0.32",

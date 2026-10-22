@@ -19,5 +19,4 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pytest -q
-      - run: node --check src/austra/static/ui.js
       - run: node --check src/austra/static/app.js
