@@ -26,7 +26,13 @@ from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 from austra.access import CONNECTORS, GUIDES, Access
-from austra.agent import AgentReply, AnalysisUnavailable, analyze
+from austra.agent import (
+    AgentReply,
+    AnalysisUnavailable,
+    ConnectionCheckError,
+    analyze,
+    verify_anthropic_key,
+)
 from austra.files import SECRET_PATTERN, Files
 from austra.slack import event_message, verify_signature
 
@@ -74,6 +80,7 @@ def _extract_attachment(filename: str, content: bytes) -> str:
 def create_app(
     root: str | Path | None = None,
     planner: Callable[[Files, Access, str], AgentReply] = analyze,
+    anthro_verifier: Callable[[str], None] = verify_anthropic_key,
 ) -> FastAPI:
     workspace = Path(root or os.getenv("AUSTRA_WORKSPACE", "data/blank"))
     files = Files(workspace)
@@ -94,10 +101,12 @@ def create_app(
             raise HTTPException(status_code=401, detail="Administrator sign in required")
 
     def analyzed_chat(chat_id: str) -> dict[str, Any]:
+        analysis_error = None
         try:
             result = planner(files, access, chat_id)
         except AnalysisUnavailable as error:
             logger.warning("Chat analysis unavailable: %s", error)
+            analysis_error = str(error)
             result = AgentReply(reply=str(error))
         if result.drafts:
             try:
@@ -109,6 +118,7 @@ def create_app(
             "chat": files.chat(chat_id),
             "drafts": files.drafts(chat_id),
             "credential_requests": result.credential_requests,
+            "analysis_error": analysis_error,
         }
 
     @app.get("/")
@@ -152,10 +162,30 @@ def create_app(
     @app.post("/api/credentials/{connector}", dependencies=[Depends(require_admin)])
     def save_credentials(connector: str, payload: Credentials) -> dict[str, Any]:
         try:
+            if connector == "anthropic":
+                key = payload.values.get("ANTHROPIC_API_KEY", "")
+                if not key:
+                    raise ValueError("Enter an Anthropic API key")
+                if len(key) > 8000 or "\n" in key or "\r" in key:
+                    raise ValueError("Credential values must be nonempty single lines")
+                anthro_verifier(key)
             missing = access.save(connector, payload.values)
+        except ConnectionCheckError as error:
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"connector": connector, "configured": not missing, "missing": missing}
+
+    @app.post("/api/credentials/anthropic/test", dependencies=[Depends(require_admin)])
+    def test_anthropic_connection() -> dict[str, bool]:
+        key = access.get("ANTHROPIC_API_KEY")
+        if not key:
+            raise HTTPException(status_code=400, detail="Enter a Claude API key first")
+        try:
+            anthro_verifier(key)
+        except ConnectionCheckError as error:
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        return {"connected": True}
 
     @app.get("/api/chats", dependencies=[Depends(require_admin)])
     def list_chats() -> list[dict[str, Any]]:

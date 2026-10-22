@@ -5,7 +5,7 @@ import time
 
 from fastapi.testclient import TestClient
 
-from austra.agent import AgentReply, Draft
+from austra.agent import AgentReply, ConnectionCheckError, Draft
 from austra.web import create_app
 
 
@@ -43,7 +43,7 @@ def test_first_run_chat_review_and_authentication(tmp_path):
 
 
 def test_private_credential_endpoint_and_secret_free_responses(tmp_path):
-    client = TestClient(create_app(tmp_path))
+    client = TestClient(create_app(tmp_path, anthro_verifier=lambda _key: None))
     assert (
         client.post(
             "/api/credentials/anthropic", json={"values": {"ANTHROPIC_API_KEY": "private"}}
@@ -55,8 +55,45 @@ def test_private_credential_endpoint_and_secret_free_responses(tmp_path):
         "/api/credentials/anthropic", json={"values": {"ANTHROPIC_API_KEY": "private"}}
     )
     assert response.json() == {"connector": "anthropic", "configured": True, "missing": []}
+    assert client.post("/api/credentials/anthropic/test").json() == {"connected": True}
     assert "private" not in json.dumps(client.get("/api/config").json())
     assert client.post("/api/chats", json={"body": "sk-ant-secret"}).status_code == 400
+
+
+def test_invalid_anthropic_key_is_not_saved_and_can_be_replaced(tmp_path):
+    def verify(key):
+        if key != "valid-example-key":
+            raise ConnectionCheckError("Anthropic rejected this API key.", 400)
+
+    client = TestClient(create_app(tmp_path, anthro_verifier=verify))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    bad = client.post(
+        "/api/credentials/anthropic", json={"values": {"ANTHROPIC_API_KEY": "wrong-key"}}
+    )
+    assert bad.status_code == 400
+    assert bad.json()["detail"] == "Anthropic rejected this API key."
+    assert not (tmp_path / ".env").exists()
+
+    good = client.post(
+        "/api/credentials/anthropic",
+        json={"values": {"ANTHROPIC_API_KEY": "valid-example-key"}},
+    )
+    assert good.status_code == 200
+    assert client.post("/api/credentials/anthropic/test").json() == {"connected": True}
+    assert "valid-example-key" not in json.dumps(client.get("/api/config").json())
+
+
+def test_saved_bad_key_reports_failure_without_returning_key(tmp_path):
+    def verify(_key):
+        raise ConnectionCheckError("Anthropic rejected this API key.", 400)
+
+    client = TestClient(create_app(tmp_path, anthro_verifier=verify))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=old-invalid-key\n", encoding="utf-8")
+    response = client.post("/api/credentials/anthropic/test")
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Anthropic rejected this API key."
+    assert "old-invalid-key" not in response.text
 
 
 def test_signed_slack_event_is_added_once(tmp_path):

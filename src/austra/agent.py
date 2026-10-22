@@ -3,7 +3,7 @@
 import json
 from typing import Any, Literal
 
-from anthropic import Anthropic
+from anthropic import Anthropic, APIConnectionError, APIStatusError
 from pydantic import BaseModel, ConfigDict, Field
 
 from austra.access import Access
@@ -73,6 +73,37 @@ OUTPUT_SCHEMA = {
 
 class AnalysisUnavailable(RuntimeError):
     """The configured model could not return a usable answer."""
+
+
+class ConnectionCheckError(RuntimeError):
+    """A connector could not be verified without exposing its credential."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def verify_anthropic_key(key: str) -> None:
+    """Check the key and access to the model used by this workspace."""
+    try:
+        Anthropic(api_key=key, timeout=10.0, max_retries=0).models.retrieve("claude-sonnet-5")
+    except APIStatusError as error:
+        messages = {
+            401: "Anthropic rejected this API key. Check it in Anthropic Console and try again.",
+            402: "Anthropic billing needs attention. Check your Anthropic Console account.",
+            403: "This API key cannot access Claude Sonnet 5. Check workspace permissions.",
+            404: "Claude Sonnet 5 is unavailable for this API key.",
+            429: "Anthropic has limited this account. Check its usage or try again later.",
+        }
+        message = messages.get(
+            error.status_code, "Anthropic could not verify the connection. Try again."
+        )
+        status_code = 400 if error.status_code < 500 else 503
+        raise ConnectionCheckError(message, status_code) from error
+    except APIConnectionError as error:
+        raise ConnectionCheckError(
+            "Could not reach Anthropic. Check your internet connection and try again.", 503
+        ) from error
 
 
 def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
@@ -158,5 +189,25 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
         return AgentReply.model_validate_json(blocks[0])
     except AnalysisUnavailable:
         raise
+    except APIStatusError as error:
+        if error.status_code == 401:
+            raise AnalysisUnavailable(
+                "Anthropic rejected the saved API key. Open Connections to replace it."
+            ) from error
+        if error.status_code == 402:
+            raise AnalysisUnavailable(
+                "Anthropic billing needs attention. Check your account."
+            ) from error
+        if error.status_code == 403:
+            raise AnalysisUnavailable(
+                "The saved API key cannot access Claude Sonnet 5. Check workspace permissions."
+            ) from error
+        raise AnalysisUnavailable(
+            f"Claude request failed (HTTP {error.status_code}). Try again."
+        ) from error
+    except APIConnectionError as error:
+        raise AnalysisUnavailable(
+            "Could not reach Anthropic. Check your internet connection."
+        ) from error
     except Exception as error:
         raise AnalysisUnavailable("Claude could not analyze this chat") from error

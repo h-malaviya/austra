@@ -64,14 +64,37 @@ function renderWelcome() {
 
 async function refreshConfig() {
   currentConfig = await api("/api/config");
-  const connected = currentConfig.connectors.anthropic;
-  byId("connection").textContent = connected ? "Claude connected" : "Claude setup needed";
+  byId("connection").textContent = currentConfig.connectors.anthropic
+    ? "Claude key saved · checking" : "Claude setup needed";
+  byId("connection").classList.remove("ready");
+}
+
+function connectionStatus(connected) {
+  byId("connection").textContent = connected ? "Claude connected" : "Claude connection failed";
   byId("connection").classList.toggle("ready", connected);
+}
+
+function showError(message) {
+  status(message, true);
+  window.alert(message);
+}
+
+async function testSavedClaude() {
+  try {
+    await api("/api/credentials/anthropic/test", { method: "POST" });
+    connectionStatus(true);
+    status("Claude connection verified.");
+  } catch (error) {
+    connectionStatus(false);
+    showError(error.message);
+    securePrompt("anthropic");
+  }
 }
 
 function securePrompt(connector) {
   const guide = currentConfig.guides[connector];
-  const missing = currentConfig.missing[connector];
+  const missing = connector === "anthropic"
+    ? ["ANTHROPIC_API_KEY"] : currentConfig.missing[connector];
   const card = bubble(`Connect ${guide.title}. ${guide.steps}`);
   const link = add(card, "a", "Open official setup guide ↗", "guide-link");
   link.href = guide.url;
@@ -80,6 +103,21 @@ function securePrompt(connector) {
   if (!missing.length) {
     add(card, "p", "Already configured.");
     return;
+  }
+  if (connector === "anthropic" && currentConfig.connectors.anthropic) {
+    add(card, "p", "A key is saved. Enter a new key here to replace it, or test the saved key.");
+    const test = add(card, "button", "Test saved connection", "inline-button");
+    test.type = "button";
+    test.onclick = async () => {
+      try {
+        await api("/api/credentials/anthropic/test", { method: "POST" });
+        connectionStatus(true);
+        status("Claude connection verified.");
+      } catch (error) {
+        connectionStatus(false);
+        showError(error.message);
+      }
+    };
   }
   const inputs = new Map();
   missing.forEach(name => {
@@ -94,23 +132,31 @@ function securePrompt(connector) {
   save.onclick = async () => {
     const values = Object.fromEntries([...inputs].map(([name, input]) => [name, input.value.trim()]));
     if (Object.values(values).some(value => !value)) {
-      status("Complete each connection value before saving.", true);
+      showError("Complete each connection value before saving.");
       return;
     }
     try {
+      save.disabled = true;
+      save.textContent = connector === "anthropic" ? "Testing connection…" : "Saving…";
       await api(`/api/credentials/${connector}`, {
         method: "POST", body: JSON.stringify({ values })
       });
       inputs.forEach(input => { input.value = ""; input.remove(); });
       save.remove();
       await refreshConfig();
-      status(`${guide.title} credentials saved in the private local environment file.`);
+      if (connector === "anthropic") connectionStatus(true);
+      status(`${guide.title} ${connector === "anthropic" ? "connection verified and key" : "credentials"} saved privately.`);
       if (connector === "anthropic" && currentChatId) {
+        status("Claude is continuing your chat…");
         const result = await api(`/api/chats/${currentChatId}/retry`, { method: "POST" });
         renderChat(result);
+        if (!result.analysis_error) status("Claude replied.");
       }
     } catch (error) {
-      status(error.message, true);
+      showError(error.message);
+    } finally {
+      save.disabled = false;
+      save.textContent = "Save privately";
     }
   };
   scrollBottom();
@@ -138,6 +184,7 @@ function accessPrompt(setup) {
       renderWelcome();
       await loadChats();
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
+      else await testSavedClaude();
     } catch (error) {
       status(error.message, true);
     }
@@ -192,6 +239,7 @@ function renderChat(result) {
   (result.credential_requests || []).forEach(name => {
     if (!currentConfig.connectors[name]) securePrompt(name);
   });
+  if (result.analysis_error) showError(result.analysis_error);
   scrollBottom();
   loadChats().catch(error => status(error.message, true));
 }
@@ -214,6 +262,7 @@ async function sendMessage() {
   }
   busy = true;
   byId("sendButton").disabled = true;
+  status("Claude is working on your request…");
   try {
     let result;
     if (currentChatId) {
@@ -237,13 +286,15 @@ async function sendMessage() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Attachment failed");
+      result = data;
       renderChat(data);
       pendingFile = null;
       byId("fileInput").value = "";
       byId("attachmentPreview").hidden = true;
     }
+    if (!result.analysis_error) status("Claude replied.");
   } catch (error) {
-    status(error.message, true);
+    showError(error.message);
   } finally {
     busy = false;
     byId("sendButton").disabled = false;
@@ -307,6 +358,7 @@ async function start() {
       renderWelcome();
       await loadChats();
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
+      else await testSavedClaude();
     }
   } catch (error) { status(error.message, true); }
 }
