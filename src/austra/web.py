@@ -34,6 +34,8 @@ from austra.agent import (
     verify_anthropic_key,
 )
 from austra.files import SECRET_PATTERN, Files
+from austra.infrastructure import Infrastructure, InfrastructureError
+from austra.skills import PLATFORM_SKILLS
 from austra.slack import event_message, verify_signature
 
 logger = logging.getLogger(__name__)
@@ -85,12 +87,16 @@ def create_app(
     workspace = Path(root or os.getenv("AUSTRA_WORKSPACE", "data/blank"))
     files = Files(workspace)
     access = Access(workspace)
+    infrastructure = Infrastructure()
     app = FastAPI(title="Austra")
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.middleware("http")
     async def restrict_local_access(request: Request, call_next):
-        if request.url.path != "/integrations/slack/events":
+        if (
+            request.url.path != "/integrations/slack/events"
+            and os.getenv("AUSTRA_DOCKER_PROXY") != "1"
+        ):
             host = request.client.host if request.client else ""
             if host not in {"127.0.0.1", "::1", "testclient"}:
                 return JSONResponse({"detail": "Local access only"}, status_code=403)
@@ -106,14 +112,44 @@ def create_app(
             result = planner(files, access, chat_id)
         except AnalysisUnavailable as error:
             logger.warning("Chat analysis unavailable: %s", error)
+            files.record_event(
+                "agent.analysis_failed",
+                "Austra",
+                "chat",
+                chat_id,
+                chat_id=chat_id,
+                skills_used=list(PLATFORM_SKILLS),
+                outcome="failed",
+            )
             analysis_error = str(error)
             result = AgentReply(reply=str(error))
         if result.drafts:
             try:
-                files.add_drafts(chat_id, [draft.model_dump() for draft in result.drafts])
+                files.add_drafts(
+                    chat_id,
+                    [draft.model_dump() for draft in result.drafts],
+                    skills_used=list(PLATFORM_SKILLS),
+                )
             except ValueError:
+                files.record_event(
+                    "agent.draft_rejected",
+                    "Austra",
+                    "chat",
+                    chat_id,
+                    chat_id=chat_id,
+                    skills_used=list(PLATFORM_SKILLS),
+                    outcome="failed",
+                )
                 result = AgentReply(reply="A draft failed validation. Please clarify the request.")
         files.add_message(chat_id, "assistant", result.reply, "Austra")
+        files.record_event(
+            "agent.replied",
+            "Austra",
+            "chat",
+            chat_id,
+            chat_id=chat_id,
+            skills_used=list(PLATFORM_SKILLS),
+        )
         return {
             "chat": files.chat(chat_id),
             "drafts": files.drafts(chat_id),
@@ -140,8 +176,12 @@ def create_app(
         try:
             session = access.setup(payload.password)
         except ValueError as error:
+            files.record_event(
+                "admin.setup_failed", "unknown", "access", "administrator", outcome="failed"
+            )
             raise HTTPException(status_code=400, detail=str(error)) from error
         response.set_cookie(SESSION_COOKIE, session, httponly=True, samesite="strict")
+        files.record_event("admin.setup", "Admin", "access", "administrator")
         return {"authenticated": True}
 
     @app.post("/api/login")
@@ -149,14 +189,19 @@ def create_app(
         try:
             session = access.login(payload.password)
         except ValueError as error:
+            files.record_event(
+                "admin.login_failed", "unknown", "access", "administrator", outcome="failed"
+            )
             raise HTTPException(status_code=401, detail=str(error)) from error
         response.set_cookie(SESSION_COOKIE, session, httponly=True, samesite="strict")
+        files.record_event("admin.login", "Admin", "access", "administrator")
         return {"authenticated": True}
 
     @app.post("/api/logout")
     def logout(request: Request, response: Response) -> dict[str, bool]:
         access.logout(request.cookies.get(SESSION_COOKIE))
         response.delete_cookie(SESSION_COOKIE)
+        files.record_event("admin.logout", "Admin", "access", "administrator")
         return {"authenticated": False}
 
     @app.post("/api/credentials/{connector}", dependencies=[Depends(require_admin)])
@@ -170,6 +215,7 @@ def create_app(
                     raise ValueError("Credential values must be nonempty single lines")
                 anthro_verifier(key)
             missing = access.save(connector, payload.values)
+            files.record_event("credential.updated", "Admin", "connector", connector)
         except ConnectionCheckError as error:
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
         except ValueError as error:
@@ -206,6 +252,14 @@ def create_app(
             return {"chat": files.chat(chat_id), "drafts": files.drafts(chat_id)}
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Chat not found") from error
+
+    @app.delete("/api/chats/{chat_id}", dependencies=[Depends(require_admin)])
+    def delete_chat(chat_id: str) -> dict[str, bool]:
+        try:
+            files.delete_chat(chat_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Chat not found") from error
+        return {"deleted": True, "memory_preserved": True}
 
     @app.post("/api/chats/{chat_id}/messages", dependencies=[Depends(require_admin)])
     def add_message(chat_id: str, payload: Message) -> dict[str, Any]:
@@ -251,6 +305,14 @@ def create_app(
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             destination.write_bytes(content)
+            files.record_event(
+                "evidence.uploaded",
+                "Admin",
+                "evidence",
+                file_id,
+                chat_id=chat_id,
+                details={"type": Path(filename).suffix.lower()},
+            )
         files.add_message(
             chat_id, "user", f"Attachment {filename} ({file_id}):\n{extracted[:15000]}", "Admin"
         )
@@ -264,14 +326,27 @@ def create_app(
     def list_records() -> list[dict[str, Any]]:
         return files.records()
 
+    @app.get("/api/audit", dependencies=[Depends(require_admin)])
+    def list_audit() -> list[dict[str, Any]]:
+        return files.audit_entries()
+
+    @app.get("/api/infrastructure", dependencies=[Depends(require_admin)])
+    def infrastructure_status() -> dict[str, Any]:
+        try:
+            return {"services": infrastructure.status()}
+        except InfrastructureError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
     @app.post("/api/drafts/{draft_id}/review", dependencies=[Depends(require_admin)])
     def review_draft(draft_id: str, payload: Review) -> dict[str, Any]:
         try:
-            return files.review(draft_id, payload.decision)
+            return files.review(draft_id, payload.decision, infrastructure)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Draft not found") from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except InfrastructureError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
 
     def analyze_slack(chat_id: str, channel: str, thread_ts: str) -> None:
         result = analyzed_chat(chat_id)

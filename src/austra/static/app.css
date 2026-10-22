@@ -32,6 +32,10 @@ button:disabled { cursor: wait; opacity: .55; }
 .chat-link.active { background: #dcebe1; color: #153f31; font-weight: 680; }
 .chat-link strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: inherit; }
 .chat-link small { display: block; margin-top: 5px; color: #73877c; font-size: 11px; font-weight: 400; }
+.chat-list-item { display: flex; align-items: center; gap: 2px; border-radius: 8px; }
+.chat-list-item .chat-link { min-width: 0; flex: 1; }
+.delete-chat { flex: none; width: 30px; height: 30px; border: 0; border-radius: 7px; background: transparent; color: #71867b; font-size: 18px; }
+.delete-chat:hover { background: #f8e7e4; color: #9d483f; }
 .sidebar-bottom { margin-top: auto; border-top: 1px solid #d9e3dc; padding-top: 12px; }
 .side-action { display: flex; justify-content: space-between; width: 100%; border: 0; border-radius: 8px; background: transparent; color: #496258; padding: 10px 13px; text-align: left; font-size: 13px; }
 .side-action span { color: #82968d; }

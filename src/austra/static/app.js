@@ -39,7 +39,9 @@ function thread() {
 }
 
 function scrollBottom() {
-  byId("messages").scrollTop = byId("messages").scrollHeight;
+  const messages = byId("messages");
+  messages.scrollTop = messages.scrollHeight;
+  requestAnimationFrame(() => { messages.scrollTop = messages.scrollHeight; });
 }
 
 function bubble(text, role = "assistant") {
@@ -199,9 +201,23 @@ async function loadChats() {
   list.replaceChildren();
   if (!chats.length) add(list, "p", "No chats yet.", "connection");
   chats.forEach(chat => {
-    const button = add(list, "button", chat.title, `chat-link${chat.id === currentChatId ? " active" : ""}`);
+    const row = add(list, "div", "", "chat-list-item");
+    const button = add(row, "button", chat.title, `chat-link${chat.id === currentChatId ? " active" : ""}`);
     button.type = "button";
     button.onclick = () => showChat(chat.id);
+    const remove = add(row, "button", "×", "delete-chat");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Delete chat ${chat.title}`);
+    remove.title = "Delete chat (memory stays)";
+    remove.onclick = async () => {
+      if (!window.confirm("Delete this chat from the chat list? Its memory and approved files remain.")) return;
+      try {
+        await api(`/api/chats/${chat.id}`, { method: "DELETE" });
+        if (currentChatId === chat.id) renderWelcome();
+        await loadChats();
+        status("Chat deleted. Memory and approved files remain.");
+      } catch (error) { status(error.message, true); }
+    };
   });
 }
 
@@ -263,6 +279,10 @@ async function sendMessage() {
   busy = true;
   byId("sendButton").disabled = true;
   status("Claude is working on your request…");
+  input.value = "";
+  if (text) bubble(text, "user");
+  scrollBottom();
+  let accepted = false;
   try {
     let result;
     if (currentChatId) {
@@ -276,7 +296,7 @@ async function sendMessage() {
         method: "POST", body: JSON.stringify({ body: text || `Please read ${pendingFile.name}` })
       });
     }
-    input.value = "";
+    accepted = true;
     renderChat(result);
     if (pendingFile) {
       const form = new FormData();
@@ -294,6 +314,7 @@ async function sendMessage() {
     }
     if (!result.analysis_error) status("Claude replied.");
   } catch (error) {
+    if (!accepted) input.value = text;
     showError(error.message);
   } finally {
     busy = false;
@@ -324,6 +345,28 @@ async function showWorkspace() {
   } catch (error) { status(error.message, true); }
 }
 
+async function showInfrastructure() {
+  try {
+    const result = await api("/api/infrastructure");
+    const lines = Object.entries(result.services).map(([name, state]) => `${name}: ${state}`);
+    bubble(`Optional Compose services\n${lines.join("\n")}\n\nAsk Austra to propose a start or stop change. Approve its infrastructure draft to apply it.`);
+  } catch (error) { status(error.message, true); }
+}
+
+async function showAudit() {
+  try {
+    const events = await api("/api/audit");
+    const lines = events.map(event => {
+      const skills = event.skills_used.length ? ` · skills: ${event.skills_used.join(", ")}` : "";
+      const detail = Object.entries(event.details).map(([key, value]) => `${key}=${value}`).join(" ");
+      const source = event.chat_id ? ` · chat=${event.chat_id}` : "";
+      const draft = event.draft_id ? ` · draft=${event.draft_id}` : "";
+      return `${event.at} · ${event.actor} · ${event.action} · ${event.target_kind}/${event.target_name} · ${event.outcome}${skills}${source}${draft}${detail ? ` · ${detail}` : ""}`;
+    });
+    bubble(lines.length ? `Recent audit events\n${lines.join("\n")}` : "No audit events yet.");
+  } catch (error) { status(error.message, true); }
+}
+
 byId("newChat").onclick = () => { if (currentConfig?.authenticated) renderWelcome(); };
 byId("sendButton").onclick = sendMessage;
 byId("messageInput").onkeydown = event => {
@@ -341,6 +384,8 @@ byId("fileInput").onchange = () => {
 byId("connectionsButton").onclick = showConnections;
 byId("topConnections").onclick = showConnections;
 byId("workspaceButton").onclick = showWorkspace;
+byId("infrastructureButton").onclick = showInfrastructure;
+byId("auditButton").onclick = showAudit;
 byId("menuButton").onclick = () => byId("sidebar").classList.toggle("open");
 byId("logoutButton").onclick = async () => {
   await api("/api/logout", { method: "POST" });

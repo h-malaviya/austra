@@ -12,7 +12,9 @@ from austra.skills import load_skills
 from austra.tools import ReadTools
 
 ConnectorName = Literal["anthropic", "gmail", "slack"]
-ArtifactName = Literal["policy", "skill", "workflow", "schema", "record", "backend", "frontend"]
+ArtifactName = Literal[
+    "policy", "skill", "workflow", "schema", "record", "backend", "frontend", "infrastructure"
+]
 
 
 class Draft(BaseModel):
@@ -55,6 +57,7 @@ OUTPUT_SCHEMA = {
                             "record",
                             "backend",
                             "frontend",
+                            "infrastructure",
                         ],
                     },
                     "name": {"type": "string"},
@@ -121,6 +124,10 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
     context = {
         "conversation": [
             {"role": item["role"], "body": item["body"]} for item in chat["messages"][-16:]
+        ],
+        "short_term_memory": [
+            {"role": item["role"], "body": item["body"][:1200]}
+            for item in files.recent_memory(exclude_chat=chat_id)
         ],
         "approved_workspace_index": [
             {"kind": item["kind"], "name": item["name"], "version": item["version"]}

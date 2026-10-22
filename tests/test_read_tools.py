@@ -23,4 +23,6 @@ def test_read_tools_search_approved_files_and_audit_use(tmp_path):
     assert any(item["name"] == "quartz_quality" for item in found["data"])
     read = tools.invoke("read_artifact", {"kind": "policy", "name": "quartz_quality"})
     assert "inspect" in read["data"]["content"]
-    assert len(list((tmp_path / "audit").glob("*.json"))) == 2
+    events = files.audit_entries()
+    assert len([item for item in events if item["action"] == "agent.tool_used"]) == 2
+    assert any(item["action"] == "draft.approved" for item in events)
