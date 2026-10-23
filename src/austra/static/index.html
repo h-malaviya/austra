@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Austra · Blank workspace</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=5">
 </head>
 <body>
   <div class="app-shell">
@@ -22,7 +22,7 @@
         <div class="connection" id="connection">Checking setup…</div>
       </div>
     </aside>
-    <main class="chat-area">
+    <main class="chat-area" id="chatArea">
       <header class="topbar">
         <button class="mobile-menu icon-button" id="menuButton" type="button" aria-label="Open chats">☰</button>
         <div class="chat-heading"><strong id="chatTitle">New chat</strong><span>Skills and structures grow from your instructions</span></div>
@@ -31,17 +31,27 @@
       <div class="messages" id="messages" role="log" aria-live="polite"></div>
       <div class="composer-wrap">
         <div class="status" id="status" role="status"></div>
-        <div class="attachment-preview" id="attachmentPreview" hidden></div>
+        <div class="attachment-preview" id="attachmentPreview" aria-live="polite" hidden></div>
         <div class="composer">
           <button class="attach-button icon-button" id="attachButton" type="button" aria-label="Attach PDF, DOCX, or CSV">＋</button>
-          <input id="fileInput" type="file" accept=".pdf,.docx,.csv" hidden>
+          <input id="fileInput" type="file" accept=".pdf,.docx,.csv" multiple hidden>
           <textarea id="messageInput" rows="1" maxlength="10000" aria-label="Message Austra" placeholder="Describe your business or ask Austra to build something…"></textarea>
           <button class="send-button" id="sendButton" type="button" aria-label="Send message">➤</button>
         </div>
         <p class="composer-hint">Enter to send · Shift+Enter for a new line · Never paste API keys here</p>
       </div>
     </main>
+    <main class="connections-page" id="connectionsPage" hidden>
+      <header class="connections-header">
+        <div><span class="eyebrow">SETTINGS</span><h1>Connections</h1><p>Manage and verify the apps Austra can use.</p></div>
+        <button class="top-action" id="backToChat" type="button">← Back to chat</button>
+      </header>
+      <div class="connections-layout">
+        <nav class="connection-list" id="connectionList" aria-label="Available apps"></nav>
+        <section class="connection-detail" id="connectionDetail" aria-live="polite"></section>
+      </div>
+    </main>
   </div>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v=6" defer></script>
 </body>
 </html>

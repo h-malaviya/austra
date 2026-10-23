@@ -1,10 +1,15 @@
 """Local chat interface for an initially blank business workspace."""
 
+import asyncio
 import hashlib
 import io
 import logging
 import os
+import re
+import secrets
+import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -15,17 +20,18 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     HTTPException,
     Request,
     Response,
     UploadFile,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
-from austra.access import CONNECTORS, GUIDES, Access
+from austra.access import CONNECTORS, GUIDES, VISIBLE_FIELDS, Access
 from austra.agent import (
     AgentReply,
     AnalysisUnavailable,
@@ -33,15 +39,20 @@ from austra.agent import (
     analyze,
     verify_anthropic_key,
 )
+from austra.connectors import VERIFIERS, Verifier, exchange_gmail_code, gmail_authorization_url
 from austra.files import SECRET_PATTERN, Files
 from austra.infrastructure import Infrastructure, InfrastructureError
 from austra.skills import PLATFORM_SKILLS
 from austra.slack import event_message, verify_signature
+from austra.slack_socket import run_socket_mode
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_ATTACHMENTS = 5
+MAX_ATTACHMENT_TEXT_CHARS = 6000
 SESSION_COOKIE = "austra_session"
+OAUTH_STATE_SECONDS = 600
 
 
 class Message(BaseModel):
@@ -79,16 +90,73 @@ def _extract_attachment(filename: str, content: bytes) -> str:
     raise ValueError("Only PDF, DOCX, and CSV files are supported")
 
 
+async def _prepare_uploads(uploads: list[UploadFile]) -> list[dict[str, Any]]:
+    if len(uploads) > MAX_ATTACHMENTS:
+        raise HTTPException(status_code=400, detail=f"Attach up to {MAX_ATTACHMENTS} files at once")
+    prepared = []
+    for upload in uploads:
+        filename = (upload.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+        filename = re.sub(r"[\x00-\x1f\x7f]", " ", filename).strip()[:160]
+        extension = Path(filename).suffix.lower()
+        if not filename or extension not in {".pdf", ".docx", ".csv"}:
+            raise HTTPException(
+                status_code=400, detail="Only PDF, DOCX, and CSV files are supported"
+            )
+        content = await upload.read(MAX_ATTACHMENT_BYTES + 1)
+        await upload.close()
+        if len(content) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail="Each attachment must be 5 MB or smaller")
+        try:
+            extracted = _extract_attachment(filename, content)
+        except Exception as error:
+            raise HTTPException(status_code=400, detail=f"Could not read {filename}") from error
+        if not extracted.strip():
+            raise HTTPException(status_code=400, detail=f"{filename} has no readable text")
+        if SECRET_PATTERN.search(extracted):
+            raise HTTPException(
+                status_code=400, detail="Attachment appears to contain a credential"
+            )
+        prepared.append(
+            {
+                "id": hashlib.sha256(content).hexdigest(),
+                "name": filename,
+                "extension": extension,
+                "content": content,
+                "excerpt": extracted[:MAX_ATTACHMENT_TEXT_CHARS],
+            }
+        )
+    return prepared
+
+
 def create_app(
     root: str | Path | None = None,
     planner: Callable[[Files, Access, str], AgentReply] = analyze,
     anthro_verifier: Callable[[str], None] = verify_anthropic_key,
+    connector_verifiers: dict[str, Verifier] | None = None,
 ) -> FastAPI:
     workspace = Path(root or os.getenv("AUSTRA_WORKSPACE", "data/blank"))
     files = Files(workspace)
     access = Access(workspace)
     infrastructure = Infrastructure()
-    app = FastAPI(title="Austra")
+    verifiers = {**VERIFIERS, **(connector_verifiers or {})}
+    oauth_states: dict[str, tuple[float, str]] = {}
+    slack_socket_status = {"connected": False}
+    public_url = os.getenv("AUSTRA_PUBLIC_URL", "http://127.0.0.1:8000").rstrip("/")
+    gmail_redirect_uri = f"{public_url}/api/connections/gmail/callback"
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        task = asyncio.create_task(
+            run_socket_mode(access, files, process_socket_event, slack_socket_status)
+        )
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(title="Austra", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.middleware("http")
@@ -100,7 +168,10 @@ def create_app(
             host = request.client.host if request.client else ""
             if host not in {"127.0.0.1", "::1", "testclient"}:
                 return JSONResponse({"detail": "Local access only"}, status_code=403)
-        return await call_next(request)
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith(("/static/", "/api/")):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     def require_admin(request: Request) -> None:
         if not access.authenticated(request.cookies.get(SESSION_COOKIE)):
@@ -157,6 +228,30 @@ def create_app(
             "analysis_error": analysis_error,
         }
 
+    def submitted_chat(
+        chat_id: str | None, body: str, uploads: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        try:
+            text = Message(body=body).safe_body if body.strip() else ""
+            chat, duplicates, changed = files.submit_message(chat_id, text, uploads)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Chat not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        result = (
+            analyzed_chat(chat["id"])
+            if changed
+            else {
+                "chat": chat,
+                "drafts": files.drafts(chat["id"]),
+                "credential_requests": [],
+                "analysis_error": None,
+            }
+        )
+        result["duplicate_files"] = duplicates
+        result["unchanged"] = not changed
+        return result
+
     @app.get("/")
     def home() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
@@ -169,6 +264,11 @@ def create_app(
             "connectors": access.configured(),
             "guides": GUIDES,
             "missing": {name: access.missing(name) for name in CONNECTORS},
+            "fields": {
+                name: list(VISIBLE_FIELDS.get(name, fields)) for name, fields in CONNECTORS.items()
+            },
+            "gmail_redirect_uri": gmail_redirect_uri,
+            "slack_socket_connected": slack_socket_status["connected"],
         }
 
     @app.post("/api/setup")
@@ -224,14 +324,82 @@ def create_app(
 
     @app.post("/api/credentials/anthropic/test", dependencies=[Depends(require_admin)])
     def test_anthropic_connection() -> dict[str, bool]:
-        key = access.get("ANTHROPIC_API_KEY")
-        if not key:
-            raise HTTPException(status_code=400, detail="Enter a Claude API key first")
+        return test_connection("anthropic")
+
+    @app.post("/api/connections/{connector}/test", dependencies=[Depends(require_admin)])
+    def test_connection(connector: str) -> dict[str, bool]:
+        if connector not in CONNECTORS:
+            raise HTTPException(status_code=404, detail="Unknown connection")
+        missing = access.missing(connector)
+        if missing:
+            raise HTTPException(status_code=400, detail="Complete all connection fields first")
         try:
-            anthro_verifier(key)
+            if connector == "anthropic":
+                anthro_verifier(access.get("ANTHROPIC_API_KEY"))
+            else:
+                verifiers[connector]({name: access.get(name) for name in CONNECTORS[connector]})
         except ConnectionCheckError as error:
+            files.record_event(
+                "connection.tested", "Admin", "connector", connector, outcome="failed"
+            )
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        files.record_event("connection.tested", "Admin", "connector", connector)
         return {"connected": True}
+
+    @app.post("/api/connections/gmail/start", dependencies=[Depends(require_admin)])
+    def start_gmail_connection(request: Request) -> dict[str, str]:
+        client_id = access.get("GMAIL_CLIENT_ID")
+        if not client_id or not access.get("GMAIL_CLIENT_SECRET"):
+            raise HTTPException(status_code=400, detail="Save the Gmail OAuth client details first")
+        session = request.cookies.get(SESSION_COOKIE, "")
+        state = secrets.token_urlsafe(32)
+        oauth_states[state] = (time.monotonic() + OAUTH_STATE_SECONDS, session)
+        files.record_event("connection.authorization_started", "Admin", "connector", "gmail")
+        return {"authorization_url": gmail_authorization_url(client_id, gmail_redirect_uri, state)}
+
+    @app.get("/api/connections/gmail/callback")
+    def finish_gmail_connection(request: Request) -> RedirectResponse:
+        state = request.query_params.get("state", "")
+        pending = oauth_states.pop(state, None)
+        if not pending or pending[0] < time.monotonic() or not access.authenticated(pending[1]):
+            files.record_event(
+                "connection.authorization_failed", "unknown", "connector", "gmail", outcome="failed"
+            )
+            raise HTTPException(status_code=400, detail="Gmail authorization expired. Try again")
+        result = "denied"
+        code = request.query_params.get("code", "")
+        if code and len(code) <= 2048 and not request.query_params.get("error"):
+            try:
+                refresh_token, email = exchange_gmail_code(
+                    code,
+                    access.get("GMAIL_CLIENT_ID"),
+                    access.get("GMAIL_CLIENT_SECRET"),
+                    gmail_redirect_uri,
+                )
+                access.save(
+                    "gmail", {"GMAIL_REFRESH_TOKEN": refresh_token, "GMAIL_SENDER_EMAIL": email}
+                )
+                files.record_event("credential.updated", "Admin", "connector", "gmail")
+                files.record_event("connection.tested", "Admin", "connector", "gmail")
+                result = "connected"
+            except (ConnectionCheckError, ValueError):
+                files.record_event(
+                    "connection.authorization_failed",
+                    "Admin",
+                    "connector",
+                    "gmail",
+                    outcome="failed",
+                )
+                result = "failed"
+        else:
+            files.record_event(
+                "connection.authorization_failed", "Admin", "connector", "gmail", outcome="failed"
+            )
+        response = RedirectResponse(f"/?connection=gmail&oauth={result}", status_code=303)
+        response.set_cookie(SESSION_COOKIE, pending[1], httponly=True, samesite="strict")
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     @app.get("/api/chats", dependencies=[Depends(require_admin)])
     def list_chats() -> list[dict[str, Any]]:
@@ -279,44 +447,19 @@ def create_app(
             raise HTTPException(status_code=404, detail="Chat not found") from error
         return analyzed_chat(chat_id)
 
+    @app.post("/api/messages", dependencies=[Depends(require_admin)])
+    async def submit_message(
+        body: str = Form(default="", max_length=10000),
+        chat_id: str = Form(default=""),
+        uploads: Annotated[list[UploadFile] | None, File()] = None,
+    ) -> dict[str, Any]:
+        prepared = await _prepare_uploads(uploads or [])
+        return submitted_chat(chat_id or None, body, prepared)
+
     @app.post("/api/chats/{chat_id}/attachments", dependencies=[Depends(require_admin)])
     async def add_attachment(chat_id: str, upload: Annotated[UploadFile, File()]) -> dict[str, Any]:
-        try:
-            files.chat(chat_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="Chat not found") from error
-        content = await upload.read(MAX_ATTACHMENT_BYTES + 1)
-        await upload.close()
-        if len(content) > MAX_ATTACHMENT_BYTES:
-            raise HTTPException(status_code=413, detail="Attachment exceeds 5 MB")
-        filename = Path(upload.filename or "").name
-        try:
-            extracted = _extract_attachment(filename, content)
-        except Exception as error:
-            raise HTTPException(status_code=400, detail="Attachment could not be read") from error
-        if not extracted.strip():
-            raise HTTPException(status_code=400, detail="Attachment has no readable text")
-        if SECRET_PATTERN.search(extracted):
-            raise HTTPException(
-                status_code=400, detail="Attachment appears to contain a credential"
-            )
-        file_id = hashlib.sha256(content).hexdigest()
-        destination = workspace / "evidence" / f"{file_id}{Path(filename).suffix.lower()}"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if not destination.exists():
-            destination.write_bytes(content)
-            files.record_event(
-                "evidence.uploaded",
-                "Admin",
-                "evidence",
-                file_id,
-                chat_id=chat_id,
-                details={"type": Path(filename).suffix.lower()},
-            )
-        files.add_message(
-            chat_id, "user", f"Attachment {filename} ({file_id}):\n{extracted[:15000]}", "Admin"
-        )
-        return analyzed_chat(chat_id)
+        prepared = await _prepare_uploads([upload])
+        return submitted_chat(chat_id, "", prepared)
 
     @app.get("/api/artifacts", dependencies=[Depends(require_admin)])
     def list_artifacts() -> list[dict[str, Any]]:
@@ -367,8 +510,73 @@ def create_app(
             response.raise_for_status()
             if not response.json().get("ok"):
                 logger.warning("Slack did not accept the reply")
+                files.record_event(
+                    "connection.reply_failed",
+                    "Austra",
+                    "connector",
+                    "slack",
+                    chat_id=chat_id,
+                    outcome="failed",
+                )
+            else:
+                files.record_event(
+                    "connection.reply_sent", "Austra", "connector", "slack", chat_id=chat_id
+                )
         except (httpx.HTTPError, ValueError):
             logger.exception("Slack reply failed")
+            files.record_event(
+                "connection.reply_failed",
+                "Austra",
+                "connector",
+                "slack",
+                chat_id=chat_id,
+                outcome="failed",
+            )
+
+    def ingest_slack_event(payload: dict[str, Any]) -> tuple[str, str, str] | None:
+        allowed_team = access.get("SLACK_ALLOWED_TEAM_ID")
+        if allowed_team and payload.get("team_id") != allowed_team:
+            files.record_event(
+                "connection.event_rejected",
+                "unknown",
+                "connector",
+                "slack",
+                details={"reason": "workspace"},
+                outcome="failed",
+            )
+            raise HTTPException(status_code=403, detail="Slack workspace not allowed")
+        message = event_message(payload)
+        if message is None:
+            return None
+        body_text, sender, event_id = message
+        if SECRET_PATTERN.search(body_text):
+            return None
+        event = payload["event"]
+        channel = event.get("channel", "")
+        thread_ts = event.get("thread_ts") or event.get("ts", "")
+        if (
+            not isinstance(channel, str)
+            or not isinstance(thread_ts, str)
+            or not channel
+            or not thread_ts
+        ):
+            raise HTTPException(status_code=400, detail="Invalid Slack thread")
+        external_thread = f"{channel}:{thread_ts}"
+        chat, fresh = files.ingest_external(event_id, external_thread, body_text, sender)
+        if not fresh:
+            return None
+        files.record_event(
+            "connection.event_received", sender, "connector", "slack", chat_id=chat["id"]
+        )
+        return chat["id"], channel, thread_ts
+
+    def process_socket_event(payload: dict[str, Any]) -> None:
+        try:
+            delivery = ingest_slack_event(payload)
+        except HTTPException:
+            return
+        if delivery:
+            analyze_slack(*delivery)
 
     @app.post("/integrations/slack/events")
     async def slack_events(request: Request, background: BackgroundTasks) -> JSONResponse:
@@ -382,6 +590,14 @@ def create_app(
             request.headers.get("X-Slack-Signature", ""),
             signing_secret,
         ):
+            files.record_event(
+                "connection.event_rejected",
+                "unknown",
+                "connector",
+                "slack",
+                details={"reason": "signature"},
+                outcome="failed",
+            )
             raise HTTPException(status_code=403, detail="Invalid Slack signature")
         try:
             payload = await request.json()
@@ -391,29 +607,9 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid Slack event")
         if payload.get("type") == "url_verification":
             return JSONResponse({"challenge": payload.get("challenge", "")})
-        allowed_team = access.get("SLACK_ALLOWED_TEAM_ID")
-        if allowed_team and payload.get("team_id") != allowed_team:
-            raise HTTPException(status_code=403, detail="Slack workspace not allowed")
-        message = event_message(payload)
-        if message is None:
-            return JSONResponse({"ok": True})
-        body_text, sender, event_id = message
-        if SECRET_PATTERN.search(body_text):
-            return JSONResponse({"ok": True})
-        event = payload["event"]
-        channel = event.get("channel", "")
-        thread_ts = event.get("thread_ts") or event.get("ts", "")
-        if (
-            not isinstance(channel, str)
-            or not isinstance(thread_ts, str)
-            or not channel
-            or not thread_ts
-        ):
-            raise HTTPException(status_code=400, detail="Invalid Slack thread")
-        external_thread = f"{channel}:{thread_ts}"
-        chat, fresh = files.ingest_external(event_id, external_thread, body_text, sender)
-        if fresh:
-            background.add_task(analyze_slack, chat["id"], channel, thread_ts)
+        delivery = ingest_slack_event(payload)
+        if delivery:
+            background.add_task(analyze_slack, *delivery)
         return JSONResponse({"ok": True})
 
     return app

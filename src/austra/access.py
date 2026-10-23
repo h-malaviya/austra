@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 from pathlib import Path
 from uuid import uuid4
@@ -17,11 +18,17 @@ CONNECTORS = {
         "GMAIL_REFRESH_TOKEN",
         "GMAIL_SENDER_EMAIL",
     ),
-    "slack": ("SLACK_SIGNING_SECRET", "SLACK_BOT_TOKEN", "SLACK_ALLOWED_TEAM_ID"),
+    "slack": (
+        "SLACK_SIGNING_SECRET",
+        "SLACK_BOT_TOKEN",
+        "SLACK_ALLOWED_TEAM_ID",
+        "SLACK_APP_TOKEN",
+    ),
 }
+VISIBLE_FIELDS = {"gmail": ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET")}
 GUIDES = {
     "anthropic": {
-        "title": "Claude API",
+        "title": "Austra model",
         "url": "https://platform.claude.com/docs/en/get-api-key",
         "steps": "Create an API key in Anthropic Console and enter it here.",
     },
@@ -29,17 +36,24 @@ GUIDES = {
         "title": "Google Workspace Gmail",
         "url": "https://developers.google.com/workspace/gmail/api/auth/web-server",
         "steps": (
-            "Enable the Gmail API, create OAuth client credentials, authorize the business "
-            "mailbox with offline access, and enter its refresh token and sender address."
+            "Enable the Gmail API and create a Web application OAuth client. Add the "
+            "redirect URI shown below in Google Cloud. If the app is External and in "
+            "Testing, add your Google account under Google Auth Platform > Audience > "
+            "Test users. "
+            "Save the client ID and secret, then choose Connect with Google. "
+            "Austra verifies the mailbox without sending email."
         ),
     },
     "slack": {
         "title": "Slack bot",
         "url": "https://docs.slack.dev/app-management/quickstart-app-settings/",
         "steps": (
-            "Create an app, subscribe to app_mention and message.im events, grant the matching "
-            "bot scopes plus chat:write, install the app, and copy its Signing Secret, Bot User "
-            "OAuth Token, and workspace team ID. A reachable HTTPS event URL is also required."
+            "Enable Socket Mode and Event Subscriptions in your Slack app. Subscribe to "
+            "app_mention and message.im bot events. Grant app_mentions:read, im:history, "
+            "and chat:write bot scopes, then reinstall the app. Generate an app-level token "
+            "with connections:write under Basic Information. Save the Signing Secret, "
+            "Bot User OAuth Token, workspace team ID (starts with T), and app-level token "
+            "(starts with xapp-). Socket Mode needs no public Request URL."
         ),
     },
 }
@@ -124,6 +138,9 @@ class Access:
             for value in values.values()
         ):
             raise ValueError("Credential values must be nonempty single lines")
+        team_id = values.get("SLACK_ALLOWED_TEAM_ID")
+        if team_id is not None and not re.fullmatch(r"T[A-Z0-9]+", team_id):
+            raise ValueError("Slack workspace team ID must start with T; do not enter an app token")
         stored = self._stored()
         stored.update(values)
         temporary = self.env_path.with_name(f".env.{uuid4().hex}.tmp")

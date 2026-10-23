@@ -129,3 +129,5 @@ def test_signed_slack_event_is_added_once(tmp_path):
     chats = client.get("/api/chats").json()
     assert len(chats) == 1
     assert len(client.get(f"/api/chats/{chats[0]['id']}").json()["chat"]["messages"]) == 2
+    audit = client.get("/api/audit").json()
+    assert len([entry for entry in audit if entry["action"] == "connection.event_received"]) == 1
