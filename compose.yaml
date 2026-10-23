@@ -4,12 +4,13 @@ services:
   app:
     build: .
     ports:
-      - "127.0.0.1:${AUSTRA_PORT:-8001}:8000"
+      - "127.0.0.1:${AUSTRA_PORT:-8000}:8000"
     environment:
       AUSTRA_WORKSPACE: /data/blank
       AUSTRA_COMPOSE_FILE: /app/compose.yaml
       AUSTRA_COMPOSE_PROJECT: austra
       AUSTRA_DOCKER_PROXY: "1"
+      AUSTRA_PUBLIC_URL: "http://127.0.0.1:${AUSTRA_PORT:-8000}"
     volumes:
       - ./data/blank:/data/blank
       - ./compose.yaml:/app/compose.yaml:ro

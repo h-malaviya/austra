@@ -83,8 +83,13 @@ button:disabled { cursor: wait; opacity: .55; }
 .composer-wrap { width: min(820px, 100%); margin: 0 auto; padding: 11px 24px 16px; }
 .status { min-height: 18px; padding: 0 8px 5px; color: #667f6c; font-size: 12px; }
 .status.error { color: #a24942; }
-.attachment-preview { margin: 0 0 8px; padding: 9px 12px; border: 1px solid #dbe7db; border-radius: 8px; color: #42654c; background: #f6faf5; font-size: 12px; }
-.attachment-preview button { margin-left: 12px; border: 0; background: none; color: #99635f; text-decoration: underline; }
+.attachment-preview { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 8px; }
+.attachment-chip { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 7px 9px; border: 1px solid #dbe7db; border-radius: 9px; color: #42654c; background: #f6faf5; font-size: 12px; }
+.attachment-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-chip small { color: #789082; white-space: nowrap; }
+.attachment-chip button { display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 5px; background: transparent; color: #80534c; font-size: 18px; }
+.attachment-chip button:hover { background: #f5e6e2; }
+.sent-attachment { display: inline-block; margin: 8px 6px 0 0; padding: 6px 9px; border: 1px solid #cbded0; border-radius: 7px; background: #f5faf5; color: #42654c; font-size: 12px; }
 .composer { display: flex; align-items: end; gap: 7px; padding: 8px; border: 1px solid #d5e1d7; border-radius: 15px; background: #fff; box-shadow: 0 5px 20px #1f513d0e; }
 .composer:focus-within { border-color: #89ac95; box-shadow: 0 0 0 3px #dcefe0; }
 .composer textarea { flex: 1; max-height: 160px; min-height: 36px; padding: 8px 2px; border: 0; outline: 0; resize: none; color: #27382b; background: transparent; font-size: 14px; line-height: 1.45; }
@@ -95,6 +100,38 @@ button:disabled { cursor: wait; opacity: .55; }
 .send-button { display: grid; place-items: center; width: 36px; height: 36px; border: 0; border-radius: 10px; background: #1f6949; color: #fff; font-size: 16px; }
 .send-button:hover, .primary:hover { background: #155d3d; }
 .composer-hint { margin: 8px 3px 0; color: #9aab9d; text-align: center; font-size: 10px; }
+.thinking-bubble { min-width: 158px; }
+.thinking-label { color: #607768; font-size: 12px; }
+.thinking-dots { display: inline-flex; gap: 3px; margin-left: 8px; vertical-align: middle; }
+.thinking-dots i { width: 5px; height: 5px; border-radius: 50%; background: #6c9a78; animation: think-pulse 1s infinite ease-in-out; }
+.thinking-dots i:nth-child(2) { animation-delay: .15s; }
+.thinking-dots i:nth-child(3) { animation-delay: .3s; }
+@keyframes think-pulse { 0%, 60%, 100% { opacity: .25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
+.connections-page { display: flex; flex: 1; min-width: 0; flex-direction: column; overflow: auto; background: #fff; }
+.connections-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 42px clamp(22px, 5vw, 72px) 28px; border-bottom: 1px solid #e7eee8; }
+.connections-header h1 { margin: 5px 0 4px; font-size: 28px; letter-spacing: -.04em; }
+.connections-header p { margin: 0; color: #71867a; font-size: 13px; }
+.eyebrow { color: #6f977b; font-size: 10px; font-weight: 750; letter-spacing: .13em; }
+.connections-layout { display: grid; grid-template-columns: minmax(190px, 260px) minmax(0, 630px); gap: 26px; padding: 30px clamp(22px, 5vw, 72px); }
+.connection-list { display: grid; align-content: start; gap: 8px; }
+.connection-option { display: grid; gap: 4px; width: 100%; padding: 15px; border: 1px solid #e2ebe3; border-radius: 11px; background: #fff; color: #39594a; text-align: left; }
+.connection-option.active { border-color: #8cb49a; background: #f1f8f2; }
+.connection-option small { color: #84968a; font-size: 11px; }
+.connection-detail { min-width: 0; padding: 25px 28px; border: 1px solid #e0eae1; border-radius: 14px; background: #fff; box-shadow: 0 7px 30px #183c260b; }
+.connection-detail h2 { margin: 8px 0; font-size: 22px; }
+.connection-description { max-width: 540px; color: #62796a; font-size: 13px; line-height: 1.6; }
+.redirect-label { margin-top: 18px; color: #405f4a; font-size: 11px; font-weight: 700; }
+.redirect-uri { display: block; margin-top: 7px; padding: 10px 12px; overflow-wrap: anywhere; border: 1px solid #dfe9e1; border-radius: 8px; background: #f7faf7; color: #315d42; font-size: 12px; }
+.connection-form { display: grid; gap: 16px; margin-top: 24px; }
+.connection-form label { display: grid; gap: 7px; color: #405f4a; font-size: 11px; font-weight: 700; letter-spacing: .03em; }
+.connection-form label small { color: #789082; font-size: 11px; font-weight: 400; letter-spacing: 0; }
+.connection-form input { width: 100%; padding: 12px; border: 1px solid #d6e4d9; border-radius: 8px; background: #fbfdfb; outline-color: #75a887; font-size: 13px; }
+.connection-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.connection-actions .primary { margin: 0; }
+.connection-feedback { min-height: 20px; margin-top: 18px; color: #32754b; font-size: 12px; }
+.connection-feedback.error { color: #a24942; }
+.connection-feedback.loading::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 7px; border: 2px solid #c8dfce; border-top-color: #36804c; border-radius: 50%; animation: connection-spin .8s linear infinite; vertical-align: -2px; }
+@keyframes connection-spin { to { transform: rotate(360deg); } }
 .dialog-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 16px; background: #1c3024a6; }
 .dialog { position: relative; width: min(420px, 100%); max-height: min(85dvh, 800px); overflow: auto; padding: 27px; border-radius: 16px; background: white; box-shadow: 0 20px 70px #0e251a3d; }
 .wide-dialog { width: min(580px, 100%); }
@@ -117,8 +154,12 @@ button:disabled { cursor: wait; opacity: .55; }
   .sidebar.open { transform: translateX(0); }
   .mobile-menu { display: grid; }
   .topbar { padding: 10px 15px; }
-  .top-action { display: none; }
+  .topbar .top-action { display: none; }
   .messages { padding: 22px 16px; }
   .composer-wrap { padding: 9px 13px 14px; }
   .bubble { max-width: 93%; }
+  .connections-header { padding: 24px 18px; }
+  .connections-layout { grid-template-columns: 1fr; gap: 16px; padding: 20px 18px; }
+  .connection-list { grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); }
+  .connection-detail { padding: 21px 18px; }
 }

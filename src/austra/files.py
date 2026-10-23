@@ -66,29 +66,54 @@ class Files:
         return sorted(result, key=lambda item: item["updated_at"], reverse=True)
 
     def create_chat(
-        self, message: str, sender: str, source: str = "ui", external_thread: str = ""
+        self,
+        message: str,
+        sender: str,
+        source: str = "ui",
+        external_thread: str = "",
+        *,
+        title: str | None = None,
+        display_body: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             timestamp = _now()
             chat = {
                 "id": uuid4().hex,
-                "title": message[:80],
+                "title": (title or message)[:80],
                 "source": source,
                 "external_thread": external_thread,
                 "created_at": timestamp,
                 "updated_at": timestamp,
                 "messages": [],
             }
-            self._add_message(chat, "user", message, sender)
+            self._add_message(
+                chat,
+                "user",
+                message,
+                sender,
+                display_body=display_body,
+                attachments=attachments,
+            )
             self.record_event("chat.created", sender, "chat", chat["id"], chat_id=chat["id"])
             return chat
 
     def _add_message(
-        self, chat: dict[str, Any], role: str, body: str, sender: str
+        self,
+        chat: dict[str, Any],
+        role: str,
+        body: str,
+        sender: str,
+        *,
+        display_body: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        chat["messages"].append(
-            {"id": uuid4().hex, "role": role, "body": body, "sender": sender, "at": _now()}
-        )
+        message = {"id": uuid4().hex, "role": role, "body": body, "sender": sender, "at": _now()}
+        if display_body is not None:
+            message["display_body"] = display_body
+        if attachments:
+            message["attachments"] = attachments
+        chat["messages"].append(message)
         chat["updated_at"] = _now()
         _save(self._chat_path(chat["id"]), chat)
         self._save_memory(chat)
@@ -134,11 +159,89 @@ class Files:
             if source_chat == exclude_chat:
                 continue
             entries.extend(
-                {"role": item["role"], "body": item["body"], "at": item["at"]}
+                {
+                    "role": item["role"],
+                    "body": item.get("display_body", item["body"]),
+                    "at": item["at"],
+                }
                 for item in memory["messages"]
-                if not item["body"].startswith("Attachment ")
+                if item.get("display_body", item["body"])
+                and not item["body"].startswith("Attachment ")
             )
         return sorted(entries, key=lambda item: item["at"])[-12:]
+
+    def submit_message(
+        self, chat_id: str | None, text: str, uploads: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], list[str], bool]:
+        with self._lock:
+            chat = self.chat(chat_id) if chat_id else None
+            known = set()
+            if chat:
+                for message in chat["messages"]:
+                    known.update(item["id"] for item in message.get("attachments", []))
+                    known.update(re.findall(r"Attachment .+? \(([0-9a-f]{64})\):", message["body"]))
+            unique = []
+            duplicates = []
+            for upload in uploads:
+                if upload["id"] in known:
+                    duplicates.append(upload["name"])
+                else:
+                    unique.append(upload)
+                    known.add(upload["id"])
+            if not text and not unique:
+                if chat:
+                    return chat, duplicates, False
+                raise ValueError("Enter a message or attach a new file")
+
+            attachment_details = [
+                {"id": item["id"], "name": item["name"], "size": len(item["content"])}
+                for item in unique
+            ]
+            parts = [text] if text else []
+            parts.extend(
+                f"Attachment {item['name']} ({item['id']}):\n{item['excerpt']}" for item in unique
+            )
+            message_body = "\n\n".join(parts)
+            for item in unique:
+                destination = self.root / "evidence" / item["id"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if not destination.exists() and not any(destination.parent.glob(f"{item['id']}.*")):
+                    destination.write_bytes(item["content"])
+                    self.record_event(
+                        "evidence.uploaded",
+                        "Admin",
+                        "evidence",
+                        item["id"],
+                        chat_id=chat_id,
+                        details={"type": item["extension"]},
+                    )
+
+            if chat:
+                chat = self._add_message(
+                    chat,
+                    "user",
+                    message_body,
+                    "Admin",
+                    display_body=text,
+                    attachments=attachment_details,
+                )
+                self.record_event(
+                    "chat.message_added", "Admin", "chat", chat["id"], chat_id=chat["id"]
+                )
+            else:
+                title = text or f"Uploaded {unique[0]['name']}"
+                chat = self.create_chat(
+                    message_body,
+                    "Admin",
+                    title=title,
+                    display_body=text,
+                    attachments=attachment_details,
+                )
+            for item in unique:
+                self.record_event(
+                    "evidence.attached", "Admin", "evidence", item["id"], chat_id=chat["id"]
+                )
+            return chat, duplicates, True
 
     def external_chat(self, thread: str) -> dict[str, Any] | None:
         for summary in self.chats():

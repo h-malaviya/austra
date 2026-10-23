@@ -29,4 +29,6 @@ def test_credentials_reject_arbitrary_names_and_multiline_values(tmp_path):
         access.save("gmail", {"UNEXPECTED": "value"})
     with pytest.raises(ValueError, match="single lines"):
         access.save("slack", {"SLACK_SIGNING_SECRET": "one\ntwo"})
+    with pytest.raises(ValueError, match="team ID"):
+        access.save("slack", {"SLACK_ALLOWED_TEAM_ID": "xapp-example-token"})
     assert not (tmp_path / ".env").exists()

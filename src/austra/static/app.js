@@ -1,7 +1,11 @@
 let currentChatId = null;
 let currentConfig = null;
-let pendingFile = null;
+let pendingFiles = [];
+let fileSelectionBusy = false;
 let busy = false;
+let selectedConnector = "anthropic";
+const MAX_ATTACHMENTS = 5;
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
 const byId = id => document.getElementById(id);
 
@@ -48,13 +52,27 @@ function bubble(text, role = "assistant") {
   const row = add(thread(), "div", "", `message-row ${role}`);
   const item = add(row, "div", "", "bubble");
   if (role === "assistant") add(item, "div", "Austra", "assistant-label");
-  add(item, "p", text, "assistant-text");
+  if (text) add(item, "p", text, "assistant-text");
   scrollBottom();
   return item;
 }
 
+function thinkingBubble() {
+  const row = add(thread(), "div", "", "message-row assistant thinking-row");
+  const item = add(row, "div", "", "bubble thinking-bubble");
+  add(item, "div", "Austra", "assistant-label");
+  const label = add(item, "span", "Austra is thinking", "thinking-label");
+  label.setAttribute("role", "status");
+  const dots = add(item, "span", "", "thinking-dots");
+  dots.setAttribute("aria-hidden", "true");
+  for (let index = 0; index < 3; index += 1) add(dots, "i");
+  scrollBottom();
+  return row;
+}
+
 function renderWelcome() {
   currentChatId = null;
+  clearPendingFiles();
   byId("chatTitle").textContent = "New chat";
   byId("messages").replaceChildren();
   const welcome = add(byId("messages"), "div", "", "welcome");
@@ -64,15 +82,80 @@ function renderWelcome() {
   thread();
 }
 
+function renderPendingFiles() {
+  const preview = byId("attachmentPreview");
+  preview.replaceChildren();
+  preview.hidden = pendingFiles.length === 0;
+  pendingFiles.forEach(({ file, digest }) => {
+    const chip = add(preview, "div", "", "attachment-chip");
+    add(chip, "span", `📎 ${file.name}`);
+    add(chip, "small", `${(file.size / 1024).toFixed(0)} KB`);
+    const remove = add(chip, "button", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Remove ${file.name}`);
+    remove.onclick = () => {
+      pendingFiles = pendingFiles.filter(item => item.digest !== digest);
+      renderPendingFiles();
+    };
+  });
+}
+
+function clearPendingFiles() {
+  pendingFiles = [];
+  byId("fileInput").value = "";
+  renderPendingFiles();
+}
+
+async function addPendingFiles(files) {
+  if (busy || fileSelectionBusy) return;
+  fileSelectionBusy = true;
+  byId("sendButton").disabled = true;
+  let duplicates = 0;
+  try {
+    for (const file of files) {
+      if (pendingFiles.length >= MAX_ATTACHMENTS) {
+        status(`Attach up to ${MAX_ATTACHMENTS} files at once.`, true);
+        break;
+      }
+      if (!/\.(pdf|docx|csv)$/i.test(file.name)) {
+        status("Only PDF, DOCX, and CSV files are supported.", true);
+        continue;
+      }
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        status(`${file.name} exceeds 5 MB.`, true);
+        continue;
+      }
+      const bytes = await file.arrayBuffer();
+      const hash = crypto.subtle
+        ? Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)))
+            .map(value => value.toString(16).padStart(2, "0")).join("")
+        : `${file.name}:${file.size}:${file.lastModified}`;
+      if (pendingFiles.some(item => item.digest === hash)) {
+        duplicates += 1;
+        continue;
+      }
+      pendingFiles.push({ file, digest: hash });
+    }
+    renderPendingFiles();
+    if (duplicates) status(`${duplicates} duplicate file${duplicates === 1 ? "" : "s"} skipped.`);
+  } catch (error) {
+    status(`Could not read the selected file: ${error.message}`, true);
+  } finally {
+    fileSelectionBusy = false;
+    byId("sendButton").disabled = busy;
+    byId("fileInput").value = "";
+  }
+}
+
 async function refreshConfig() {
   currentConfig = await api("/api/config");
   byId("connection").textContent = currentConfig.connectors.anthropic
-    ? "Claude key saved · checking" : "Claude setup needed";
+    ? "Austra model saved · checking" : "Austra model setup needed";
   byId("connection").classList.remove("ready");
 }
 
 function connectionStatus(connected) {
-  byId("connection").textContent = connected ? "Claude connected" : "Claude connection failed";
+  byId("connection").textContent = connected ? "Austra model connected" : "Austra model connection failed";
   byId("connection").classList.toggle("ready", connected);
 }
 
@@ -81,87 +164,24 @@ function showError(message) {
   window.alert(message);
 }
 
-async function testSavedClaude() {
+async function testSavedModel() {
   try {
-    await api("/api/credentials/anthropic/test", { method: "POST" });
+    await api("/api/connections/anthropic/test", { method: "POST" });
     connectionStatus(true);
-    status("Claude connection verified.");
+    status("Austra model connection verified.");
   } catch (error) {
     connectionStatus(false);
-    showError(error.message);
+    status(error.message, true);
     securePrompt("anthropic");
   }
 }
 
 function securePrompt(connector) {
-  const guide = currentConfig.guides[connector];
-  const missing = connector === "anthropic"
-    ? ["ANTHROPIC_API_KEY"] : currentConfig.missing[connector];
-  const card = bubble(`Connect ${guide.title}. ${guide.steps}`);
-  const link = add(card, "a", "Open official setup guide ↗", "guide-link");
-  link.href = guide.url;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  if (!missing.length) {
-    add(card, "p", "Already configured.");
-    return;
-  }
-  if (connector === "anthropic" && currentConfig.connectors.anthropic) {
-    add(card, "p", "A key is saved. Enter a new key here to replace it, or test the saved key.");
-    const test = add(card, "button", "Test saved connection", "inline-button");
-    test.type = "button";
-    test.onclick = async () => {
-      try {
-        await api("/api/credentials/anthropic/test", { method: "POST" });
-        connectionStatus(true);
-        status("Claude connection verified.");
-      } catch (error) {
-        connectionStatus(false);
-        showError(error.message);
-      }
-    };
-  }
-  const inputs = new Map();
-  missing.forEach(name => {
-    add(card, "label", name, "secure-label");
-    const input = add(card, "input", "", "secure-input");
-    input.type = name.endsWith("EMAIL") || name.endsWith("TEAM_ID") ? "text" : "password";
-    input.autocomplete = "off";
-    inputs.set(name, input);
-  });
-  const save = add(card, "button", "Save privately", "inline-button");
-  save.type = "button";
-  save.onclick = async () => {
-    const values = Object.fromEntries([...inputs].map(([name, input]) => [name, input.value.trim()]));
-    if (Object.values(values).some(value => !value)) {
-      showError("Complete each connection value before saving.");
-      return;
-    }
-    try {
-      save.disabled = true;
-      save.textContent = connector === "anthropic" ? "Testing connection…" : "Saving…";
-      await api(`/api/credentials/${connector}`, {
-        method: "POST", body: JSON.stringify({ values })
-      });
-      inputs.forEach(input => { input.value = ""; input.remove(); });
-      save.remove();
-      await refreshConfig();
-      if (connector === "anthropic") connectionStatus(true);
-      status(`${guide.title} ${connector === "anthropic" ? "connection verified and key" : "credentials"} saved privately.`);
-      if (connector === "anthropic" && currentChatId) {
-        status("Claude is continuing your chat…");
-        const result = await api(`/api/chats/${currentChatId}/retry`, { method: "POST" });
-        renderChat(result);
-        if (!result.analysis_error) status("Claude replied.");
-      }
-    } catch (error) {
-      showError(error.message);
-    } finally {
-      save.disabled = false;
-      save.textContent = "Save privately";
-    }
-  };
-  scrollBottom();
+  if (!currentConfig.guides[connector]) return;
+  const card = bubble(`${currentConfig.guides[connector].title} needs a connection.`);
+  const button = add(card, "button", "Open Connections", "inline-button");
+  button.type = "button";
+  button.onclick = () => showConnections(connector);
 }
 
 function accessPrompt(setup) {
@@ -186,7 +206,8 @@ function accessPrompt(setup) {
       renderWelcome();
       await loadChats();
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
-      else await testSavedClaude();
+      else await testSavedModel();
+      showGmailOauthResult();
     } catch (error) {
       status(error.message, true);
     }
@@ -250,7 +271,12 @@ function renderChat(result) {
   currentChatId = chat.id;
   byId("chatTitle").textContent = chat.title;
   byId("messages").replaceChildren();
-  chat.messages.forEach(message => bubble(message.body, message.role));
+  chat.messages.forEach(message => {
+    const item = bubble(message.display_body ?? message.body, message.role);
+    (message.attachments || []).forEach(file => {
+      add(item, "div", `📎 ${file.name}`, "sent-attachment");
+    });
+  });
   (result.drafts || []).forEach(renderDraft);
   (result.credential_requests || []).forEach(name => {
     if (!currentConfig.connectors[name]) securePrompt(name);
@@ -262,76 +288,258 @@ function renderChat(result) {
 
 async function showChat(chatId) {
   try {
+    if (chatId !== currentChatId) clearPendingFiles();
+    showChatView();
     renderChat(await api(`/api/chats/${chatId}`));
     byId("sidebar").classList.remove("open");
   } catch (error) { status(error.message, true); }
 }
 
 async function sendMessage() {
-  if (busy || !currentConfig?.authenticated) return;
+  if (busy || fileSelectionBusy || !currentConfig?.authenticated) return;
   const input = byId("messageInput");
   const text = input.value.trim();
-  if (!text && !pendingFile) return;
+  const selectedFiles = [...pendingFiles];
+  if (!text && !selectedFiles.length) return;
   if (/sk-ant-|xox[baprs]-|-----BEGIN .*PRIVATE KEY-----/i.test(text)) {
     status("Use Connections to enter credentials privately.", true);
     return;
   }
   busy = true;
   byId("sendButton").disabled = true;
-  status("Claude is working on your request…");
+  byId("sendButton").textContent = "…";
+  byId("messages").setAttribute("aria-busy", "true");
+  status("Austra is working on your request…");
   input.value = "";
-  if (text) bubble(text, "user");
+  clearPendingFiles();
+  const optimistic = bubble(text, "user");
+  selectedFiles.forEach(({ file }) => add(optimistic, "div", `📎 ${file.name}`, "sent-attachment"));
+  const thinking = thinkingBubble();
   scrollBottom();
-  let accepted = false;
   try {
-    let result;
-    if (currentChatId) {
-      result = text
-        ? await api(`/api/chats/${currentChatId}/messages`, {
-          method: "POST", body: JSON.stringify({ body: text })
-        })
-        : await api(`/api/chats/${currentChatId}`);
-    } else {
-      result = await api("/api/chats", {
-        method: "POST", body: JSON.stringify({ body: text || `Please read ${pendingFile.name}` })
-      });
-    }
-    accepted = true;
+    const form = new FormData();
+    form.append("body", text);
+    if (currentChatId) form.append("chat_id", currentChatId);
+    selectedFiles.forEach(({ file }) => form.append("uploads", file, file.name));
+    const response = await fetch("/api/messages", {
+      method: "POST", credentials: "same-origin", body: form
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "Send failed");
     renderChat(result);
-    if (pendingFile) {
-      const form = new FormData();
-      form.append("upload", pendingFile);
-      const response = await fetch(`/api/chats/${currentChatId}/attachments`, {
-        method: "POST", credentials: "same-origin", body: form
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Attachment failed");
-      result = data;
-      renderChat(data);
-      pendingFile = null;
-      byId("fileInput").value = "";
-      byId("attachmentPreview").hidden = true;
-    }
-    if (!result.analysis_error) status("Claude replied.");
+    if (result.duplicate_files?.length) {
+      status(`${result.duplicate_files.length} duplicate file${result.duplicate_files.length === 1 ? "" : "s"} skipped.`);
+    } else if (!result.analysis_error) status("Austra replied.");
   } catch (error) {
-    if (!accepted) input.value = text;
+    thinking.remove();
+    optimistic.parentElement.remove();
+    input.value = text;
+    pendingFiles = selectedFiles;
+    renderPendingFiles();
     showError(error.message);
   } finally {
     busy = false;
     byId("sendButton").disabled = false;
+    byId("sendButton").textContent = "➤";
+    byId("messages").removeAttribute("aria-busy");
     input.focus();
   }
 }
 
-function showConnections() {
-  if (!currentConfig?.authenticated) return;
-  const card = bubble("Choose a connection. Values are saved in a private local .env file and never added to chat.");
-  const actions = add(card, "div", "", "card-actions");
-  Object.keys(currentConfig.guides).forEach(name => {
-    const button = add(actions, "button", currentConfig.guides[name].title);
+function showChatView() {
+  byId("connectionsPage").hidden = true;
+  byId("chatArea").hidden = false;
+  byId("sidebar").classList.remove("open");
+  scrollBottom();
+}
+
+function connectionFeedback(text, error = false, loading = false) {
+  const feedback = byId("connectionFeedback");
+  feedback.textContent = text;
+  feedback.className = `connection-feedback${error ? " error" : ""}${loading ? " loading" : ""}`;
+}
+
+function renderConnectionList() {
+  const list = byId("connectionList");
+  list.replaceChildren();
+  Object.entries(currentConfig.guides).forEach(([name, guide]) => {
+    const button = add(list, "button", "", `connection-option${name === selectedConnector ? " active" : ""}`);
     button.type = "button";
-    button.onclick = () => securePrompt(name);
+    add(button, "strong", guide.title);
+    add(button, "small", currentConfig.connectors[name] ? "Saved" : "Setup needed");
+    button.onclick = () => { selectedConnector = name; renderConnectionList(); renderConnectionDetail(); };
   });
+}
+
+async function testConnection(connector) {
+  const button = byId("testConnection");
+  button.disabled = true;
+  button.textContent = "Testing…";
+  connectionFeedback("Testing connection…", false, true);
+  try {
+    await api(`/api/connections/${connector}/test`, { method: "POST" });
+    if (connector === "anthropic") connectionStatus(true);
+    if (connector === "slack") {
+      await refreshConfig();
+      renderConnectionList();
+      renderConnectionDetail();
+      connectionFeedback(currentConfig.slack_socket_connected
+        ? "Slack credentials verified. Socket Mode is connected and ready for messages."
+        : "Slack credentials verified. Enable Socket Mode and wait for Austra to connect, then refresh status.");
+    } else {
+      connectionFeedback("Connection verified successfully.");
+    }
+  } catch (error) {
+    if (connector === "anthropic") connectionStatus(false);
+    connectionFeedback(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Test connection";
+  }
+}
+
+async function beginGmailConnect() {
+  const button = byId("connectGmail");
+  button.disabled = true;
+  button.textContent = "Opening Google…";
+  connectionFeedback("Opening Google authorization…", false, true);
+  try {
+    const result = await api("/api/connections/gmail/start", { method: "POST" });
+    window.location.assign(result.authorization_url);
+  } catch (error) {
+    connectionFeedback(error.message, true);
+    button.disabled = false;
+    button.textContent = "Connect with Google";
+  }
+}
+
+function renderConnectionDetail() {
+  const connector = selectedConnector;
+  const guide = currentConfig.guides[connector];
+  const detail = byId("connectionDetail");
+  detail.replaceChildren();
+  add(detail, "span", currentConfig.connectors[connector] ? "CREDENTIALS SAVED" : "SETUP NEEDED", "eyebrow");
+  add(detail, "h2", guide.title);
+  add(detail, "p", guide.steps, "connection-description");
+  const link = add(detail, "a", "Open official setup guide ↗", "guide-link");
+  link.href = guide.url;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  if (connector === "gmail") {
+    add(detail, "div", "Authorized redirect URI", "redirect-label");
+    add(detail, "code", currentConfig.gmail_redirect_uri, "redirect-uri");
+  }
+  if (connector === "slack") {
+    add(detail, "p", currentConfig.slack_socket_connected
+      ? "Socket Mode connected · Austra can receive Slack events"
+      : "Socket Mode disconnected · enable it in Slack and save an app-level token",
+    "connection-description");
+    const refresh = add(detail, "button", "Refresh Socket Mode status", "top-action");
+    refresh.type = "button";
+    refresh.onclick = async () => {
+      await refreshConfig();
+      renderConnectionDetail();
+    };
+  }
+  const form = add(detail, "form", "", "connection-form");
+  const inputs = new Map();
+  const fields = currentConfig.fields?.[connector];
+  if (!Array.isArray(fields)) {
+    add(detail, "p", "Connection settings are out of date. Reload Austra to continue.", "connection-feedback error");
+    const reload = add(detail, "button", "Reload Austra", "top-action");
+    reload.type = "button";
+    reload.onclick = () => window.location.reload();
+    return;
+  }
+  fields.forEach(name => {
+    const label = add(form, "label", name.replaceAll("_", " "));
+    const input = add(label, "input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.placeholder = currentConfig.missing[connector].includes(name)
+      ? (name === "SLACK_ALLOWED_TEAM_ID" ? "Workspace ID starting with T" : "Enter value")
+      : "Saved privately · enter to replace";
+    input.setAttribute("aria-label", name);
+    if (name === "SLACK_ALLOWED_TEAM_ID") {
+      add(label, "small", "Use the workspace ID starting with T, not an xapp- token.");
+    }
+    if (name === "SLACK_APP_TOKEN") {
+      add(label, "small", "App-level token with connections:write, starting with xapp-.");
+    }
+    inputs.set(name, input);
+  });
+  const actions = add(form, "div", "", "connection-actions");
+  const save = add(actions, "button", "Save credentials", "primary");
+  save.type = "submit";
+  if (connector === "gmail") {
+    save.textContent = "Save OAuth client";
+    const connect = add(actions, "button", "Connect with Google", "top-action");
+    connect.type = "button";
+    connect.id = "connectGmail";
+    const oauthReady = !currentConfig.missing.gmail.includes("GMAIL_CLIENT_ID")
+      && !currentConfig.missing.gmail.includes("GMAIL_CLIENT_SECRET");
+    connect.disabled = !oauthReady;
+    if (!oauthReady) connect.title = "Save the OAuth client details first";
+    connect.onclick = beginGmailConnect;
+  }
+  const test = add(actions, "button", "Test connection", "top-action");
+  test.type = "button";
+  test.id = "testConnection";
+  if (connector === "gmail" && !currentConfig.connectors.gmail) {
+    test.disabled = true;
+    test.title = "Connect with Google first";
+  }
+  test.onclick = () => testConnection(connector);
+  const feedback = add(detail, "div", "", "connection-feedback");
+  feedback.id = "connectionFeedback";
+  feedback.setAttribute("role", "status");
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const values = Object.fromEntries([...inputs].filter(([, input]) => input.value.trim())
+      .map(([name, input]) => [name, input.value.trim()]));
+    if (!Object.keys(values).length) {
+      connectionFeedback("Enter a value to save or use Test connection.", true);
+      return;
+    }
+    save.disabled = true;
+    save.textContent = "Saving…";
+    connectionFeedback("Saving credentials privately…", false, true);
+    try {
+      await api(`/api/credentials/${connector}`, { method: "POST", body: JSON.stringify({ values }) });
+      await refreshConfig();
+      renderConnectionList();
+      renderConnectionDetail();
+      connectionFeedback(currentConfig.connectors[connector]
+        ? "Credentials saved. Testing connection…"
+        : (connector === "gmail" ? "OAuth client saved. Choose Connect with Google." : "Saved. Complete the remaining fields to test."));
+      if (currentConfig.connectors[connector]) await testConnection(connector);
+    } catch (error) {
+      connectionFeedback(error.message, true);
+      save.disabled = false;
+      save.textContent = "Save credentials";
+    }
+  };
+}
+
+function showGmailOauthResult() {
+  const query = new URLSearchParams(window.location.search);
+  if (query.get("connection") !== "gmail" || !query.has("oauth")) return;
+  showConnections("gmail");
+  connectionFeedback(query.get("oauth") === "connected"
+    ? "Gmail connected and mailbox verified."
+    : "Gmail authorization was not completed. Choose Connect with Google to try again.",
+  query.get("oauth") !== "connected");
+  window.history.replaceState(null, "", "/");
+}
+
+function showConnections(connector = "anthropic") {
+  if (!currentConfig?.authenticated) return;
+  selectedConnector = currentConfig.guides[connector] ? connector : "anthropic";
+  byId("chatArea").hidden = true;
+  byId("connectionsPage").hidden = false;
+  byId("sidebar").classList.remove("open");
+  renderConnectionList();
+  renderConnectionDetail();
 }
 
 async function showWorkspace() {
@@ -367,7 +575,7 @@ async function showAudit() {
   } catch (error) { status(error.message, true); }
 }
 
-byId("newChat").onclick = () => { if (currentConfig?.authenticated) renderWelcome(); };
+byId("newChat").onclick = () => { if (currentConfig?.authenticated) { showChatView(); renderWelcome(); } };
 byId("sendButton").onclick = sendMessage;
 byId("messageInput").onkeydown = event => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -376,13 +584,10 @@ byId("messageInput").onkeydown = event => {
   }
 };
 byId("attachButton").onclick = () => byId("fileInput").click();
-byId("fileInput").onchange = () => {
-  pendingFile = byId("fileInput").files[0] || null;
-  byId("attachmentPreview").textContent = pendingFile ? `📎 ${pendingFile.name}` : "";
-  byId("attachmentPreview").hidden = !pendingFile;
-};
-byId("connectionsButton").onclick = showConnections;
-byId("topConnections").onclick = showConnections;
+byId("fileInput").onchange = event => addPendingFiles([...event.target.files]);
+byId("connectionsButton").onclick = () => showConnections();
+byId("topConnections").onclick = () => showConnections();
+byId("backToChat").onclick = showChatView;
 byId("workspaceButton").onclick = showWorkspace;
 byId("infrastructureButton").onclick = showInfrastructure;
 byId("auditButton").onclick = showAudit;
@@ -391,6 +596,7 @@ byId("logoutButton").onclick = async () => {
   await api("/api/logout", { method: "POST" });
   await refreshConfig();
   currentChatId = null;
+  showChatView();
   accessPrompt(false);
 };
 
@@ -403,7 +609,8 @@ async function start() {
       renderWelcome();
       await loadChats();
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
-      else await testSavedClaude();
+      else await testSavedModel();
+      showGmailOauthResult();
     }
   } catch (error) { status(error.message, true); }
 }

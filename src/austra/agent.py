@@ -1,4 +1,4 @@
-"""Claude planning over user supplied facts and approved workspace files."""
+"""Austra planning over user supplied facts and approved workspace files."""
 
 import json
 from typing import Any, Literal
@@ -94,8 +94,8 @@ def verify_anthropic_key(key: str) -> None:
         messages = {
             401: "Anthropic rejected this API key. Check it in Anthropic Console and try again.",
             402: "Anthropic billing needs attention. Check your Anthropic Console account.",
-            403: "This API key cannot access Claude Sonnet 5. Check workspace permissions.",
-            404: "Claude Sonnet 5 is unavailable for this API key.",
+            403: "This API key cannot access Austra's model. Check workspace permissions.",
+            404: "Austra's model is unavailable for this API key.",
             429: "Anthropic has limited this account. Check its usage or try again later.",
         }
         message = messages.get(
@@ -114,8 +114,8 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
     if not key:
         return AgentReply(
             reply=(
-                "I can save this conversation, but I need a Claude API key before I can "
-                "build skills and business structures from it. Open the private setup prompt."
+                "I can save this conversation, but I need an Anthropic API key before I can "
+                "build skills and business structures from it. Open Connections."
             ),
             credential_requests=["anthropic"],
         )
@@ -156,10 +156,10 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
                 messages.append({"role": "user", "content": "Return the final structured answer."})
                 break
             if research.stop_reason != "tool_use":
-                raise AnalysisUnavailable("Claude research did not finish")
+                raise AnalysisUnavailable("Austra research did not finish")
             calls = [block for block in research.content if block.type == "tool_use"]
             if not calls:
-                raise AnalysisUnavailable("Claude requested a tool without a call")
+                raise AnalysisUnavailable("Austra requested a tool without a call")
             results = []
             for call in calls:
                 try:
@@ -189,10 +189,10 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
             output_config={"format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
         )
         if response.stop_reason != "end_turn":
-            raise AnalysisUnavailable("Claude did not finish its response")
+            raise AnalysisUnavailable("Austra did not finish its response")
         blocks = [block.text for block in response.content if block.type == "text"]
         if len(blocks) != 1:
-            raise AnalysisUnavailable("Claude returned an unexpected response")
+            raise AnalysisUnavailable("Austra returned an unexpected response")
         return AgentReply.model_validate_json(blocks[0])
     except AnalysisUnavailable:
         raise
@@ -207,14 +207,14 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
             ) from error
         if error.status_code == 403:
             raise AnalysisUnavailable(
-                "The saved API key cannot access Claude Sonnet 5. Check workspace permissions."
+                "The saved API key cannot access Austra's model. Check workspace permissions."
             ) from error
         raise AnalysisUnavailable(
-            f"Claude request failed (HTTP {error.status_code}). Try again."
+            f"Austra request failed (HTTP {error.status_code}). Try again."
         ) from error
     except APIConnectionError as error:
         raise AnalysisUnavailable(
-            "Could not reach Anthropic. Check your internet connection."
+            "Could not reach Austra's model provider. Check your internet connection."
         ) from error
     except Exception as error:
-        raise AnalysisUnavailable("Claude could not analyze this chat") from error
+        raise AnalysisUnavailable("Austra could not analyze this chat") from error
