@@ -1,4 +1,6 @@
 import hashlib
+import threading
+import time
 
 from fastapi.testclient import TestClient
 
@@ -93,9 +95,62 @@ def test_invalid_attachment_batch_does_not_create_chat_or_evidence(tmp_path):
         data={"body": "Review files"},
         files=[
             ("uploads", ("good.csv", b"item\none", "text/csv")),
-            ("uploads", ("bad.txt", b"unsupported", "text/plain")),
+            ("uploads", ("bad.exe", b"unsupported", "application/octet-stream")),
         ],
     )
     assert response.status_code == 400
     assert client.get("/api/chats").json() == []
     assert not (tmp_path / "evidence").exists()
+
+
+def test_attachment_stays_downloadable_in_chat_and_audit(tmp_path):
+    client = TestClient(
+        create_app(tmp_path, planner=lambda _files, _access, _chat: AgentReply(reply="Received"))
+    )
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    content = b"item,quantity\nquartz,3"
+    result = client.post(
+        "/api/messages", files={"uploads": ("stock.csv", content, "text/csv")}
+    ).json()
+    chat_id = result["chat"]["id"]
+    user_message = result["chat"]["messages"][0]
+    digest = user_message["attachments"][0]["id"]
+    url = f"/api/chats/{chat_id}/attachments/{digest}"
+
+    assert client.get(f"/api/chats/{chat_id}").json()["chat"]["messages"][0]["attachments"]
+    assert client.get(url).content == content
+    assert client.delete(f"/api/chats/{chat_id}").status_code == 200
+    assert client.get(url).status_code == 404
+    assert client.get(f"/api/audit/chats/{chat_id}/attachments/{digest}").content == content
+
+
+def test_background_message_reports_running_time_and_completion(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+
+    def planner(_files, _access, _chat):
+        started.set()
+        assert release.wait(5)
+        return AgentReply(reply="Finished processing")
+
+    client = TestClient(create_app(tmp_path, planner=planner))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    response = client.post("/api/messages/background", data={"body": "Review this"})
+    assert response.status_code == 202
+    job = response.json()["job"]
+    assert started.wait(2)
+    assert job["status"] == "running"
+    assert client.get("/api/jobs").json()[0]["chat_id"] == response.json()["chat"]["id"]
+    assert client.get(f"/api/jobs/{job['id']}").json()["elapsed_seconds"] >= 0
+    release.set()
+    for _ in range(100):
+        result = client.get(f"/api/jobs/{job['id']}").json()
+        if result["status"] == "completed":
+            break
+        time.sleep(0.02)
+    assert result["status"] == "completed"
+    assert client.get("/api/jobs").json() == []
+    assert (
+        client.get(f"/api/chats/{job['chat_id']}").json()["chat"]["messages"][-1]["body"]
+        == "Finished processing"
+    )

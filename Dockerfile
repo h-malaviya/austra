@@ -2,6 +2,9 @@ FROM docker:29-cli AS docker_cli
 
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker_cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose

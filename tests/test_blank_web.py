@@ -5,7 +5,8 @@ import time
 
 from fastapi.testclient import TestClient
 
-from austra.agent import AgentReply, ConnectionCheckError, Draft
+from austra.agent import AgentReply, ConnectionCheckError, Draft, RecordChange
+from austra.files import Files
 from austra.web import create_app
 
 
@@ -21,6 +22,29 @@ def planner(_files, _access, _chat_id):
             )
         ],
     )
+
+
+def test_model_title_and_long_message(tmp_path):
+    client = TestClient(
+        create_app(
+            tmp_path,
+            planner=lambda _files, _access, _chat: AgentReply(
+                reply="Done", title="Purchase order corrections"
+            ),
+        )
+    )
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    body = "Purchase order details " + "x" * (30000 - len("Purchase order details "))
+    created = client.post("/api/messages", data={"body": body})
+    assert created.status_code == 200
+    assert created.json()["chat"]["title"] == "Purchase order corrections"
+    assert created.json()["chat"]["messages"][0]["body"] == body
+    chat_id = created.json()["chat"]["id"]
+    continued = client.post(f"/api/chats/{chat_id}/messages", json={"body": "Another request"})
+    assert continued.json()["chat"]["title"] == "Purchase order corrections"
+    longer = client.post("/api/messages", data={"body": body + "x"})
+    assert longer.status_code == 200
+    assert longer.json()["chat"]["messages"][0]["body"] == body + "x"
 
 
 def test_first_run_chat_review_and_authentication(tmp_path):
@@ -40,6 +64,46 @@ def test_first_run_chat_review_and_authentication(tmp_path):
     assert approved.status_code == 200
     assert (tmp_path / "approved/policy/first_rule/v1.md").exists()
     assert client.get(f"/api/chats/{chat_id}").json()["chat"]["messages"][0]["role"] == "user"
+
+
+def test_admin_chat_can_remove_records_without_separate_approval(tmp_path):
+    files = Files(tmp_path)
+    source = files.create_chat("Add stock", "Admin")
+    files.apply_agent_drafts(
+        source["id"],
+        [
+            {
+                "kind": "schema",
+                "name": "stock_lot",
+                "summary": "Stock lot",
+                "content": '{"type":"object","properties":{"quantity":{"type":"number"}}}',
+            },
+            {
+                "kind": "record",
+                "name": "stock_lot",
+                "summary": "Stock lot",
+                "content": '{"quantity":12}',
+            },
+        ],
+        ["foundation"],
+    )
+
+    def remove_records(_files, _access, _chat_id):
+        return AgentReply(
+            reply="Removing the records added by mistake.",
+            record_changes=[RecordChange(action="delete", scope="all", reason="Added by mistake")],
+        )
+
+    client = TestClient(create_app(tmp_path, planner=remove_records))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    response = client.post("/api/chats", json={"body": "Remove all records added by mistake"})
+
+    assert response.status_code == 201
+    assert "Removed 1 business record" in response.json()["chat"]["messages"][-1]["body"]
+    assert client.get("/api/records").json() == []
+    archived = client.get("/api/audit/records").json()
+    assert len(archived) == 1
+    assert archived[0]["deleted_at"]
 
 
 def test_private_credential_endpoint_and_secret_free_responses(tmp_path):
