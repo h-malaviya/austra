@@ -3,9 +3,12 @@ let currentConfig = null;
 let pendingFiles = [];
 let fileSelectionBusy = false;
 let busy = false;
+let activeJobIds = new Set();
+let processPollTimer = null;
 let selectedConnector = "anthropic";
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const CHAT_TITLE_PREVIEW_CHARS = 22;
 
 const byId = id => document.getElementById(id);
 
@@ -33,6 +36,41 @@ function status(text, error = false) {
   byId("status").className = error ? "status error" : "status";
 }
 
+async function refreshProcesses() {
+  if (!currentConfig?.authenticated) return;
+  const jobs = await api("/api/jobs");
+  const panel = byId("activeProcesses");
+  panel.replaceChildren();
+  jobs.forEach(job => {
+    add(panel, "div", `${job.chat_title}: ${job.stage} · ${job.elapsed_seconds}s elapsed`, "process-row");
+  });
+  panel.hidden = jobs.length === 0;
+  const finishedCurrent = [...activeJobIds].some(id => !jobs.some(job => job.id === id));
+  activeJobIds = new Set(jobs.map(job => job.id));
+  if (finishedCurrent && currentChatId && !busy) await showChat(currentChatId);
+}
+
+function startProcessPolling() {
+  if (processPollTimer) return;
+  refreshProcesses().catch(error => status(error.message, true));
+  processPollTimer = setInterval(() => {
+    refreshProcesses().catch(error => status(error.message, true));
+  }, 2000);
+}
+
+async function waitForJob(job) {
+  while (true) {
+    const state = await api(`/api/jobs/${job.id}`);
+    await refreshProcesses();
+    if (state.status !== "running") {
+      if (currentChatId === job.chat_id) await showChat(job.chat_id);
+      if (state.error) showError(state.error);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+}
+
 function thread() {
   let item = byId("thread");
   if (!item) {
@@ -52,7 +90,10 @@ function bubble(text, role = "assistant") {
   const row = add(thread(), "div", "", `message-row ${role}`);
   const item = add(row, "div", "", "bubble");
   if (role === "assistant") add(item, "div", "Austra", "assistant-label");
-  if (text) add(item, "p", text, "assistant-text");
+  if (text) {
+    if (role === "assistant") renderMarkdown(item, text);
+    else add(item, "p", text, "assistant-text");
+  }
   scrollBottom();
   return item;
 }
@@ -60,9 +101,8 @@ function bubble(text, role = "assistant") {
 function thinkingBubble() {
   const row = add(thread(), "div", "", "message-row assistant thinking-row");
   const item = add(row, "div", "", "bubble thinking-bubble");
-  add(item, "div", "Austra", "assistant-label");
-  const label = add(item, "span", "Austra is thinking", "thinking-label");
-  label.setAttribute("role", "status");
+  item.setAttribute("role", "status");
+  item.setAttribute("aria-label", "Austra is working");
   const dots = add(item, "span", "", "thinking-dots");
   dots.setAttribute("aria-hidden", "true");
   for (let index = 0; index < 3; index += 1) add(dots, "i");
@@ -106,6 +146,27 @@ function clearPendingFiles() {
   renderPendingFiles();
 }
 
+function resizeMessageInput() {
+  const input = byId("messageInput");
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, parseFloat(getComputedStyle(input).maxHeight))}px`;
+  input.style.overflowY = input.scrollHeight > input.clientHeight ? "auto" : "hidden";
+}
+
+function chatTitlePreview(title) {
+  const characters = Array.from(title);
+  return characters.length > CHAT_TITLE_PREVIEW_CHARS
+    ? `${characters.slice(0, CHAT_TITLE_PREVIEW_CHARS).join("").trimEnd()}…`
+    : title;
+}
+
+function closeChatMenus() {
+  byId("chatList").querySelectorAll(".chat-menu").forEach(menu => {
+    menu.hidden = true;
+    menu.previousElementSibling.setAttribute("aria-expanded", "false");
+  });
+}
+
 async function addPendingFiles(files) {
   if (busy || fileSelectionBusy) return;
   fileSelectionBusy = true;
@@ -117,8 +178,8 @@ async function addPendingFiles(files) {
         status(`Attach up to ${MAX_ATTACHMENTS} files at once.`, true);
         break;
       }
-      if (!/\.(pdf|docx|csv)$/i.test(file.name)) {
-        status("Only PDF, DOCX, and CSV files are supported.", true);
+      if (!/\.(pdf|docx|csv|txt|md|xlsx)$/i.test(file.name)) {
+        status("Attach a PDF, DOCX, CSV, TXT, MD, or XLSX file.", true);
         continue;
       }
       if (file.size > MAX_ATTACHMENT_BYTES) {
@@ -205,6 +266,7 @@ function accessPrompt(setup) {
       await refreshConfig();
       renderWelcome();
       await loadChats();
+      startProcessPolling();
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
       else await testSavedModel();
       showGmailOauthResult();
@@ -223,24 +285,50 @@ async function loadChats() {
   if (!chats.length) add(list, "p", "No chats yet.", "connection");
   chats.forEach(chat => {
     const row = add(list, "div", "", "chat-list-item");
-    const button = add(row, "button", chat.title, `chat-link${chat.id === currentChatId ? " active" : ""}`);
+    const button = add(row, "button", chatTitlePreview(chat.title), `chat-link${chat.id === currentChatId ? " active" : ""}`);
     button.type = "button";
+    button.title = chat.title;
+    button.setAttribute("aria-label", chat.title);
     button.onclick = () => showChat(chat.id);
-    const remove = add(row, "button", "×", "delete-chat");
+    const more = add(row, "button", "⋯", "chat-menu-trigger");
+    more.type = "button";
+    more.title = "Chat options";
+    more.setAttribute("aria-label", `Options for ${chat.title}`);
+    more.setAttribute("aria-expanded", "false");
+    const menu = add(row, "div", "", "chat-menu");
+    menu.hidden = true;
+    more.onclick = event => {
+      event.stopPropagation();
+      const opening = menu.hidden;
+      closeChatMenus();
+      menu.hidden = !opening;
+      more.setAttribute("aria-expanded", String(opening));
+      if (opening) {
+        menu.classList.toggle("above",
+          row.getBoundingClientRect().bottom + menu.offsetHeight > list.getBoundingClientRect().bottom);
+      }
+    };
+    const remove = add(menu, "button", "Delete chat", "chat-menu-delete");
     remove.type = "button";
     remove.setAttribute("aria-label", `Delete chat ${chat.title}`);
-    remove.title = "Delete chat (memory stays)";
     remove.onclick = async () => {
-      if (!window.confirm("Delete this chat from the chat list? Its memory and approved files remain.")) return;
+      if (!window.confirm("Delete this chat from the list? An audit copy will remain.")) return;
       try {
         await api(`/api/chats/${chat.id}`, { method: "DELETE" });
         if (currentChatId === chat.id) renderWelcome();
         await loadChats();
-        status("Chat deleted. Memory and approved files remain.");
+        status("Chat removed from the list. Its audit copy remains.");
       } catch (error) { status(error.message, true); }
     };
   });
 }
+
+document.addEventListener("click", event => {
+  if (!event.target.closest(".chat-list-item")) closeChatMenus();
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") closeChatMenus();
+});
 
 function renderDraft(item) {
   const card = add(thread(), "div", "", "review-card");
@@ -274,10 +362,12 @@ function renderChat(result) {
   chat.messages.forEach(message => {
     const item = bubble(message.display_body ?? message.body, message.role);
     (message.attachments || []).forEach(file => {
-      add(item, "div", `📎 ${file.name}`, "sent-attachment");
+      const link = add(item, "a", `📎 ${file.name}`, "sent-attachment");
+      link.href = `/api/chats/${chat.id}/attachments/${file.id}`;
+      link.download = file.name;
     });
   });
-  (result.drafts || []).forEach(renderDraft);
+  (result.drafts || []).filter(item => !["schema", "record"].includes(item.kind)).forEach(renderDraft);
   (result.credential_requests || []).forEach(name => {
     if (!currentConfig.connectors[name]) securePrompt(name);
   });
@@ -309,8 +399,9 @@ async function sendMessage() {
   byId("sendButton").disabled = true;
   byId("sendButton").textContent = "…";
   byId("messages").setAttribute("aria-busy", "true");
-  status("Austra is working on your request…");
+  status("");
   input.value = "";
+  resizeMessageInput();
   clearPendingFiles();
   const optimistic = bubble(text, "user");
   selectedFiles.forEach(({ file }) => add(optimistic, "div", `📎 ${file.name}`, "sent-attachment"));
@@ -321,19 +412,25 @@ async function sendMessage() {
     form.append("body", text);
     if (currentChatId) form.append("chat_id", currentChatId);
     selectedFiles.forEach(({ file }) => form.append("uploads", file, file.name));
-    const response = await fetch("/api/messages", {
+    const response = await fetch("/api/messages/background", {
       method: "POST", credentials: "same-origin", body: form
     });
     const result = await response.json();
     if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "Send failed");
     renderChat(result);
+    if (result.job) {
+      activeJobIds.add(result.job.id);
+      await refreshProcesses();
+      waitForJob(result.job).catch(error => showError(error.message));
+    }
     if (result.duplicate_files?.length) {
       status(`${result.duplicate_files.length} duplicate file${result.duplicate_files.length === 1 ? "" : "s"} skipped.`);
-    } else if (!result.analysis_error) status("Austra replied.");
+    } else if (!result.analysis_error) status("");
   } catch (error) {
     thinking.remove();
     optimistic.parentElement.remove();
     input.value = text;
+    resizeMessageInput();
     pendingFiles = selectedFiles;
     renderPendingFiles();
     showError(error.message);
@@ -542,36 +639,11 @@ function showConnections(connector = "anthropic") {
   renderConnectionDetail();
 }
 
-async function showWorkspace() {
-  try {
-    const [artifacts, records] = await Promise.all([api("/api/artifacts"), api("/api/records")]);
-    const files = artifacts.map(item => `${item.kind}/${item.name} · version ${item.version}`);
-    const saved = records.map(item => `record/${item.schema} · ${item.id.slice(0, 8)}`);
-    bubble(files.length || saved.length
-      ? [...files, ...saved].join("\n")
-      : "The business workspace is empty. Describe a rule or process in chat to draft its first file.");
-  } catch (error) { status(error.message, true); }
-}
-
 async function showInfrastructure() {
   try {
     const result = await api("/api/infrastructure");
     const lines = Object.entries(result.services).map(([name, state]) => `${name}: ${state}`);
     bubble(`Optional Compose services\n${lines.join("\n")}\n\nAsk Austra to propose a start or stop change. Approve its infrastructure draft to apply it.`);
-  } catch (error) { status(error.message, true); }
-}
-
-async function showAudit() {
-  try {
-    const events = await api("/api/audit");
-    const lines = events.map(event => {
-      const skills = event.skills_used.length ? ` · skills: ${event.skills_used.join(", ")}` : "";
-      const detail = Object.entries(event.details).map(([key, value]) => `${key}=${value}`).join(" ");
-      const source = event.chat_id ? ` · chat=${event.chat_id}` : "";
-      const draft = event.draft_id ? ` · draft=${event.draft_id}` : "";
-      return `${event.at} · ${event.actor} · ${event.action} · ${event.target_kind}/${event.target_name} · ${event.outcome}${skills}${source}${draft}${detail ? ` · ${detail}` : ""}`;
-    });
-    bubble(lines.length ? `Recent audit events\n${lines.join("\n")}` : "No audit events yet.");
   } catch (error) { status(error.message, true); }
 }
 
@@ -583,14 +655,13 @@ byId("messageInput").onkeydown = event => {
     sendMessage();
   }
 };
+byId("messageInput").oninput = resizeMessageInput;
 byId("attachButton").onclick = () => byId("fileInput").click();
 byId("fileInput").onchange = event => addPendingFiles([...event.target.files]);
 byId("connectionsButton").onclick = () => showConnections();
 byId("topConnections").onclick = () => showConnections();
 byId("backToChat").onclick = showChatView;
-byId("workspaceButton").onclick = showWorkspace;
 byId("infrastructureButton").onclick = showInfrastructure;
-byId("auditButton").onclick = showAudit;
 byId("menuButton").onclick = () => byId("sidebar").classList.toggle("open");
 byId("logoutButton").onclick = async () => {
   await api("/api/logout", { method: "POST" });
@@ -608,6 +679,7 @@ async function start() {
     else {
       renderWelcome();
       await loadChats();
+      startProcessPolling();
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
       else await testSavedModel();
       showGmailOauthResult();

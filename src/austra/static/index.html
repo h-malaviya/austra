@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Austra · Blank workspace</title>
-  <link rel="stylesheet" href="/static/app.css?v=5">
+  <link rel="stylesheet" href="/static/app.css?v=11">
 </head>
 <body>
   <div class="app-shell">
@@ -14,9 +14,7 @@
       <div class="sidebar-label">YOUR CHATS</div>
       <nav class="chat-list" id="chatList" aria-label="Previous chats"></nav>
       <div class="sidebar-bottom">
-        <button class="side-action" id="workspaceButton" type="button">Approved workspace <span>↗</span></button>
         <button class="side-action" id="infrastructureButton" type="button">Infrastructure <span>↗</span></button>
-        <button class="side-action" id="auditButton" type="button">Audit log <span>↗</span></button>
         <button class="side-action" id="connectionsButton" type="button">Connections <span>↗</span></button>
         <button class="side-action" id="logoutButton" type="button">Sign out <span>↗</span></button>
         <div class="connection" id="connection">Checking setup…</div>
@@ -31,11 +29,12 @@
       <div class="messages" id="messages" role="log" aria-live="polite"></div>
       <div class="composer-wrap">
         <div class="status" id="status" role="status"></div>
+        <div class="active-processes" id="activeProcesses" role="status" aria-live="polite" hidden></div>
         <div class="attachment-preview" id="attachmentPreview" aria-live="polite" hidden></div>
         <div class="composer">
-          <button class="attach-button icon-button" id="attachButton" type="button" aria-label="Attach PDF, DOCX, or CSV">＋</button>
-          <input id="fileInput" type="file" accept=".pdf,.docx,.csv" multiple hidden>
-          <textarea id="messageInput" rows="1" maxlength="10000" aria-label="Message Austra" placeholder="Describe your business or ask Austra to build something…"></textarea>
+          <button class="attach-button icon-button" id="attachButton" type="button" aria-label="Attach a business document or spreadsheet">＋</button>
+          <input id="fileInput" type="file" accept=".pdf,.docx,.csv,.txt,.md,.xlsx" multiple hidden>
+          <textarea id="messageInput" rows="1" aria-label="Message Austra" placeholder="Describe your business or ask Austra to build something…"></textarea>
           <button class="send-button" id="sendButton" type="button" aria-label="Send message">➤</button>
         </div>
         <p class="composer-hint">Enter to send · Shift+Enter for a new line · Never paste API keys here</p>
@@ -52,6 +51,7 @@
       </div>
     </main>
   </div>
-  <script src="/static/app.js?v=6" defer></script>
+  <script src="/static/markdown.js?v=8" defer></script>
+  <script src="/static/app.js?v=12" defer></script>
 </body>
 </html>

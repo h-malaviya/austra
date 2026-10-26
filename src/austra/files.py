@@ -20,6 +20,7 @@ ArtifactKind = Literal[
 KINDS = ("policy", "skill", "workflow", "schema", "record", "backend", "frontend", "infrastructure")
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 SECRET_PATTERN = re.compile(r"sk-ant-|xox[baprs]-|-----BEGIN .*PRIVATE KEY-----", re.IGNORECASE)
+LEGACY_ATTACHMENT = re.compile(r"Attachment (.+?) \(([0-9a-f]{64})\):")
 EXTENSIONS = {"schema": ".json", "record": ".json", "backend": ".py", "frontend": ".js"}
 
 
@@ -45,16 +46,95 @@ class Files:
             raise KeyError("Chat not found")
         return self.root / "chats" / f"{chat_id}.json"
 
-    def chat(self, chat_id: str) -> dict[str, Any]:
+    def _read_chat(self, chat_id: str) -> dict[str, Any]:
         try:
-            return json.loads(self._chat_path(chat_id).read_text(encoding="utf-8"))
+            chat = json.loads(self._chat_path(chat_id).read_text(encoding="utf-8"))
         except FileNotFoundError as error:
             raise KeyError("Chat not found") from error
+        if chat.get("deleted_at"):
+            raise KeyError("Chat not found")
+        return chat
+
+    def chat(self, chat_id: str) -> dict[str, Any]:
+        chat = self._read_chat(chat_id)
+        chat["messages"] = [item for item in chat["messages"] if not item.get("deleted_at")]
+        return self._with_legacy_attachments(chat)
+
+    def audit_chat(self, chat_id: str) -> dict[str, Any]:
+        try:
+            chat = json.loads(self._chat_path(chat_id).read_text(encoding="utf-8"))
+        except FileNotFoundError as error:
+            memory_path = self.root / "memory" / "short_term" / f"{chat_id}.json"
+            deletion = next(
+                (
+                    item
+                    for item in self.audit_entries()
+                    if item["action"] == "chat.deleted" and item.get("chat_id") == chat_id
+                ),
+                None,
+            )
+            if not memory_path.is_file() or deletion is None:
+                raise KeyError("Chat not found") from error
+            memory = json.loads(memory_path.read_text(encoding="utf-8"))
+            chat = {
+                "id": chat_id,
+                "title": "Deleted chat",
+                "source": "legacy",
+                "updated_at": memory["updated_at"],
+                "deleted_at": deletion["at"],
+                "messages": memory["messages"],
+            }
+        return self._with_legacy_attachments(chat)
+
+    def _with_legacy_attachments(self, chat: dict[str, Any]) -> dict[str, Any]:
+        for message in chat["messages"]:
+            if message.get("attachments"):
+                continue
+            legacy = []
+            for name, digest in LEGACY_ATTACHMENT.findall(message["body"]):
+                path = self._evidence_path(digest)
+                if path:
+                    legacy.append({"id": digest, "name": name, "size": path.stat().st_size})
+            if legacy:
+                message["attachments"] = legacy
+                message.setdefault("display_body", "")
+        return chat
+
+    def _evidence_path(self, digest: str) -> Path | None:
+        folder = self.root / "evidence"
+        exact = folder / digest
+        if exact.is_file():
+            return exact
+        return next((path for path in folder.glob(f"{digest}.*") if path.is_file()), None)
+
+    def attachment(
+        self, chat_id: str, attachment_id: str, *, audit: bool = False
+    ) -> tuple[Path, str]:
+        if not re.fullmatch(r"[0-9a-f]{64}", attachment_id):
+            raise KeyError("Attachment not found")
+        chat = self.audit_chat(chat_id) if audit else self.chat(chat_id)
+        match = next(
+            (
+                attachment
+                for message in chat["messages"]
+                for attachment in message.get("attachments", [])
+                if attachment["id"] == attachment_id
+            ),
+            None,
+        )
+        if match is None:
+            raise KeyError("Attachment not found")
+        path = self._evidence_path(attachment_id)
+        if path is None:
+            raise KeyError("Attachment not found")
+        return path, match["name"]
 
     def chats(self) -> list[dict[str, Any]]:
         result = []
         for path in (self.root / "chats").glob("*.json"):
             entry = json.loads(path.read_text(encoding="utf-8"))
+            if entry.get("deleted_at"):
+                continue
             result.append(
                 {
                     "id": entry["id"],
@@ -85,6 +165,7 @@ class Files:
                 "external_thread": external_thread,
                 "created_at": timestamp,
                 "updated_at": timestamp,
+                "deleted_at": None,
                 "messages": [],
             }
             self._add_message(
@@ -126,23 +207,30 @@ class Files:
             {
                 "source_chat": chat["id"],
                 "updated_at": chat["updated_at"],
+                "deleted_at": chat.get("deleted_at"),
                 "messages": chat["messages"],
             },
         )
 
     def add_message(self, chat_id: str, role: str, body: str, sender: str) -> dict[str, Any]:
         with self._lock:
-            chat = self._add_message(self.chat(chat_id), role, body, sender)
+            chat = self._add_message(self._read_chat(chat_id), role, body, sender)
             self.record_event("chat.message_added", sender, "chat", chat_id, chat_id=chat_id)
             return chat
 
+    def set_chat_title(self, chat_id: str, title: str) -> None:
+        with self._lock:
+            chat = self._read_chat(chat_id)
+            chat["title"] = title.strip()
+            chat["title_generated"] = True
+            _save(self._chat_path(chat_id), chat)
+
     def delete_chat(self, chat_id: str) -> None:
         with self._lock:
-            path = self._chat_path(chat_id)
-            if not path.exists():
-                raise KeyError("Chat not found")
-            self._save_memory(self.chat(chat_id))
-            path.unlink()
+            chat = self._read_chat(chat_id)
+            chat["deleted_at"] = _now()
+            _save(self._chat_path(chat_id), chat)
+            self._save_memory(chat)
             self.record_event("chat.deleted", "Admin", "chat", chat_id, chat_id=chat_id)
 
     def recent_memory(self, exclude_chat: str | None = None) -> list[dict[str, str]]:
@@ -158,6 +246,13 @@ class Files:
             source_chat = memory.get("source_chat", memory.get("id"))
             if source_chat == exclude_chat:
                 continue
+            if (
+                memory.get("deleted_at")
+                or not isinstance(source_chat, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", source_chat)
+                or not self._chat_path(source_chat).exists()
+            ):
+                continue
             entries.extend(
                 {
                     "role": item["role"],
@@ -165,6 +260,7 @@ class Files:
                     "at": item["at"],
                 }
                 for item in memory["messages"]
+                if not item.get("deleted_at")
                 if item.get("display_body", item["body"])
                 and not item["body"].startswith("Attachment ")
             )
@@ -174,10 +270,12 @@ class Files:
         self, chat_id: str | None, text: str, uploads: list[dict[str, Any]]
     ) -> tuple[dict[str, Any], list[str], bool]:
         with self._lock:
-            chat = self.chat(chat_id) if chat_id else None
+            chat = self._read_chat(chat_id) if chat_id else None
             known = set()
             if chat:
                 for message in chat["messages"]:
+                    if message.get("deleted_at"):
+                        continue
                     known.update(item["id"] for item in message.get("attachments", []))
                     known.update(re.findall(r"Attachment .+? \(([0-9a-f]{64})\):", message["body"]))
             unique = []
@@ -190,7 +288,7 @@ class Files:
                     known.add(upload["id"])
             if not text and not unique:
                 if chat:
-                    return chat, duplicates, False
+                    return self.chat(chat["id"]), duplicates, False
                 raise ValueError("Enter a message or attach a new file")
 
             attachment_details = [
@@ -215,6 +313,11 @@ class Files:
                         chat_id=chat_id,
                         details={"type": item["extension"]},
                     )
+                if item.get("text"):
+                    text_path = self.root / "evidence_text" / f"{item['id']}.txt"
+                    text_path.parent.mkdir(parents=True, exist_ok=True)
+                    if not text_path.exists():
+                        text_path.write_text(item["text"], encoding="utf-8")
 
             if chat:
                 chat = self._add_message(
@@ -241,7 +344,7 @@ class Files:
                 self.record_event(
                     "evidence.attached", "Admin", "evidence", item["id"], chat_id=chat["id"]
                 )
-            return chat, duplicates, True
+            return self.chat(chat["id"]), duplicates, True
 
     def external_chat(self, thread: str) -> dict[str, Any] | None:
         for summary in self.chats():
@@ -280,7 +383,7 @@ class Files:
                 if kind not in KINDS or not NAME_PATTERN.fullmatch(name):
                     raise ValueError("Invalid artifact kind or name")
                 content = draft["content"].strip()
-                if not content or len(content) > 30000:
+                if not content or len(content.encode("utf-8")) > 1_000_000:
                     raise ValueError("Invalid artifact content")
                 if SECRET_PATTERN.search(content):
                     raise ValueError("Draft appears to contain a credential")
@@ -352,11 +455,48 @@ class Files:
             if chat_id is None or item["chat_id"] == chat_id
         ]
 
+    def apply_agent_drafts(
+        self, chat_id: str, drafts: list[dict[str, str]], skills_used: list[str]
+    ) -> list[dict[str, Any]]:
+        saved = []
+        for draft in sorted(drafts, key=lambda item: item["kind"] != "schema"):
+            if draft["kind"] == "record":
+                values = json.loads(draft["content"])
+                if any(
+                    record["schema"] == draft["name"] and record["values"] == values
+                    for record in self.records()
+                ):
+                    continue
+            if draft["kind"] == "schema" and any(
+                item["kind"] == "schema"
+                and item["name"] == draft["name"]
+                and item["content"].strip() == draft["content"].strip()
+                for item in self.approved()
+            ):
+                continue
+            if draft["kind"] == "schema":
+                candidate = json.loads(draft["content"])
+                try:
+                    for record in self.records():
+                        if record["schema"] == draft["name"]:
+                            Draft202012Validator(candidate).validate(record["values"])
+                except ValidationError as error:
+                    raise ValueError(
+                        "Schema change conflicts with existing business records"
+                    ) from error
+            item = self.add_drafts(chat_id, [draft], skills_used=skills_used)[0]
+            if item["kind"] in {"schema", "record"}:
+                item = self.review(item["id"], "approved", actor="Austra")
+            saved.append(item)
+        return saved
+
     def review(
         self,
         draft_id: str,
         decision: Literal["approved", "rejected"],
         infrastructure: Any = None,
+        *,
+        actor: str = "Admin",
     ) -> dict[str, Any]:
         if not re.fullmatch(r"[0-9a-f]{32}", draft_id):
             raise KeyError("Draft not found")
@@ -382,7 +522,7 @@ class Files:
                     except InfrastructureError:
                         self.record_event(
                             "infrastructure.failed",
-                            "Admin",
+                            actor,
                             "infrastructure",
                             draft["name"],
                             chat_id=draft["chat_id"],
@@ -394,7 +534,7 @@ class Files:
                         raise
                     self.record_event(
                         "infrastructure.changed",
-                        "Admin",
+                        actor,
                         "infrastructure",
                         draft["name"],
                         chat_id=draft["chat_id"],
@@ -435,12 +575,14 @@ class Files:
                         draft["content"] + "\n", encoding="utf-8"
                     )
                     draft["version"] = version
+                    if draft["kind"] == "policy":
+                        (folder / "retired.json").unlink(missing_ok=True)
             draft["status"] = decision
             draft["reviewed_at"] = _now()
             _save(path, draft)
             self.record_event(
                 f"draft.{decision}",
-                "Admin",
+                actor,
                 draft["kind"],
                 draft["name"],
                 chat_id=draft["chat_id"],
@@ -453,6 +595,8 @@ class Files:
     def approved(self) -> list[dict[str, Any]]:
         items = []
         for folder in (self.root / "approved").glob("*/*"):
+            if folder.parent.name == "policy" and (folder / "retired.json").exists():
+                continue
             extension = EXTENSIONS.get(folder.parent.name, ".md")
             files = sorted(
                 (file for file in folder.glob(f"v*{extension}") if file.stem[1:].isdigit()),
@@ -470,6 +614,80 @@ class Files:
                 )
         return sorted(items, key=lambda item: (item["kind"], item["name"]))
 
+    def save_policy(self, chat_id: str, name: str, content: str, reason: str) -> dict[str, Any]:
+        """Activate an administrator's explicit Markdown rule as a versioned policy."""
+        with self._lock:
+            self._read_chat(chat_id)
+            if not NAME_PATTERN.fullmatch(name):
+                raise ValueError("Invalid policy name")
+            content = content.strip()
+            if not content or len(content.encode("utf-8")) > 1_000_000:
+                raise ValueError("Invalid policy content")
+            if SECRET_PATTERN.search(content):
+                raise ValueError("Policy appears to contain a credential")
+            folder = self.root / "approved" / "policy" / name
+            versions = [
+                int(path.stem[1:]) for path in folder.glob("v*.md") if path.stem[1:].isdigit()
+            ]
+            current = folder / f"v{max(versions)}.md" if versions else None
+            if current and current.read_text(encoding="utf-8").strip() == content:
+                retired = folder / "retired.json"
+                if retired.exists():
+                    retired.unlink()
+                    self.record_event(
+                        "policy.activated",
+                        "Admin",
+                        "policy",
+                        name,
+                        chat_id=chat_id,
+                        details={"version": str(max(versions)), "reason": reason},
+                    )
+                return {
+                    "kind": "policy",
+                    "name": name,
+                    "version": max(versions),
+                    "content": content,
+                }
+            version = max(versions, default=0) + 1
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"v{version}.md").write_text(content + "\n", encoding="utf-8")
+            (folder / "retired.json").unlink(missing_ok=True)
+            self.record_event(
+                "policy.activated",
+                "Admin",
+                "policy",
+                name,
+                chat_id=chat_id,
+                details={"version": str(version), "reason": reason},
+            )
+            return {"kind": "policy", "name": name, "version": version, "content": content}
+
+    def retire_policy(self, chat_id: str, name: str, reason: str) -> None:
+        with self._lock:
+            self._read_chat(chat_id)
+            if not NAME_PATTERN.fullmatch(name):
+                raise ValueError("Invalid policy name")
+            if not any(
+                item["kind"] == "policy" and item["name"] == name for item in self.approved()
+            ):
+                raise ValueError("Active policy not found")
+            _save(
+                self.root / "approved" / "policy" / name / "retired.json",
+                {
+                    "retired_at": _now(),
+                    "chat_id": chat_id,
+                    "reason": reason,
+                },
+            )
+            self.record_event(
+                "policy.retired",
+                "Admin",
+                "policy",
+                name,
+                chat_id=chat_id,
+                details={"reason": reason},
+            )
+
     def _validate_record(self, name: str, values: dict[str, Any]) -> int:
         schemas = [
             item for item in self.approved() if item["kind"] == "schema" and item["name"] == name
@@ -483,14 +701,267 @@ class Files:
             raise ValueError("Record does not match its approved schema") from error
         return current["version"]
 
-    def records(self) -> list[dict[str, Any]]:
+    def records(self, *, include_deleted: bool = False) -> list[dict[str, Any]]:
         return sorted(
             (
-                json.loads(path.read_text(encoding="utf-8"))
+                record
                 for path in (self.root / "records").glob("*/*.json")
+                if (record := json.loads(path.read_text(encoding="utf-8")))
+                and (include_deleted or not record.get("deleted_at"))
             ),
             key=lambda item: item["approved_at"],
         )
+
+    def update_record(
+        self, chat_id: str, record_id: str, values: dict[str, Any], reason: str
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._read_chat(chat_id)
+            if not re.fullmatch(r"[0-9a-f]{32}", record_id):
+                raise ValueError("Invalid record ID")
+            record = next((item for item in self.records() if item["id"] == record_id), None)
+            if record is None:
+                raise ValueError("Active record not found")
+            if SECRET_PATTERN.search(json.dumps(values, ensure_ascii=False)):
+                raise ValueError("Record contains a credential")
+            version = self._validate_record(record["schema"], values)
+            if values == record["values"]:
+                return record
+            revision_id = uuid4().hex
+            _save(
+                self.root / "record_history" / record["schema"] / record_id / f"{revision_id}.json",
+                record,
+            )
+            record["values"] = values
+            record["schema_version"] = version
+            record["updated_at"] = _now()
+            record["updated_by"] = "Admin"
+            record["updated_from_chat"] = chat_id
+            _save(self.root / "records" / record["schema"] / f"{record_id}.json", record)
+            self.record_event(
+                "record.updated",
+                "Admin",
+                "record",
+                record_id,
+                chat_id=chat_id,
+                details={"schema": record["schema"], "reason": reason, "revision_id": revision_id},
+            )
+            return record
+
+    def update_records(
+        self,
+        chat_id: str,
+        schema_name: str,
+        patch: dict[str, Any],
+        reason: str,
+        source_attachment: str = "",
+    ) -> int:
+        """Apply an administrator's scoped field change after validating every result."""
+        with self._lock:
+            self._read_chat(chat_id)
+            if not NAME_PATTERN.fullmatch(schema_name):
+                raise ValueError("Invalid record schema")
+            if source_attachment and not re.fullmatch(r"[0-9a-f]{64}", source_attachment):
+                raise ValueError("Invalid source attachment")
+            if not patch:
+                raise ValueError("Bulk update requires at least one field")
+            selected = [
+                record
+                for record in self.records()
+                if record["schema"] == schema_name
+                and (not source_attachment or record.get("source_attachment") == source_attachment)
+            ]
+            if not selected:
+                raise ValueError("No matching active records found")
+            replacements = []
+            for record in selected:
+                values = {**record["values"], **patch}
+                if SECRET_PATTERN.search(json.dumps(values, ensure_ascii=False)):
+                    raise ValueError("Record contains a credential")
+                self._validate_record(schema_name, values)
+                if values != record["values"]:
+                    replacements.append((record["id"], values))
+            for record_id, values in replacements:
+                self.update_record(chat_id, record_id, values, reason)
+            return len(replacements)
+
+    def delete_records(self, chat_id: str, scope: str, identifier: str, reason: str) -> int:
+        with self._lock:
+            self._read_chat(chat_id)
+            if scope == "id":
+                if not re.fullmatch(r"[0-9a-f]{32}", identifier):
+                    raise ValueError("Invalid record ID")
+                selected = [item for item in self.records() if item["id"] == identifier]
+            elif scope == "schema":
+                if not NAME_PATTERN.fullmatch(identifier):
+                    raise ValueError("Invalid record schema")
+                selected = [item for item in self.records() if item["schema"] == identifier]
+            elif scope == "all":
+                selected = self.records()
+            else:
+                raise ValueError("Invalid deletion scope")
+            for record in selected:
+                record["deleted_at"] = _now()
+                record["deleted_by"] = "Admin"
+                record["deleted_from_chat"] = chat_id
+                record["deletion_reason"] = reason
+                _save(self.root / "records" / record["schema"] / f"{record['id']}.json", record)
+                self.record_event(
+                    "record.deleted",
+                    "Admin",
+                    "record",
+                    record["id"],
+                    chat_id=chat_id,
+                    details={"schema": record["schema"], "reason": reason},
+                )
+            return len(selected)
+
+    def save_imported_records(
+        self,
+        chat_id: str,
+        schema_name: str,
+        attachment_id: str,
+        filename: str,
+        rows: list[tuple[int, dict[str, Any]]],
+        section: str = "",
+    ) -> int:
+        with self._lock:
+            self._read_chat(chat_id)
+            schema_version = []
+            existing_records = [
+                record for record in self.records() if record["schema"] == schema_name
+            ]
+            order_key = next(
+                (
+                    key
+                    for key in ("purchase_order_id", "sales_order_id")
+                    if rows and key in rows[0][1]
+                ),
+                None,
+            )
+            existing_orders = {}
+            if order_key:
+                for record in existing_records:
+                    identifier = record["values"].get(order_key)
+                    if identifier:
+                        if identifier in existing_orders:
+                            raise ValueError(
+                                f"Multiple active records have {order_key} {identifier}"
+                            )
+                        existing_orders[identifier] = record
+            existing_lot_ids = {
+                record["values"]["lot_id"]
+                for record in existing_records
+                if "lot_id" in record["values"]
+            }
+            pending_lot_ids = set()
+            pending_order_ids = set()
+            normalized_rows = []
+            for row_number, values in rows:
+                previous = existing_orders.get(values.get(order_key)) if order_key else None
+                if previous:
+                    values = {**previous["values"], **values}
+                normalized_rows.append((row_number, values))
+                try:
+                    schema_version.append(self._validate_record(schema_name, values))
+                except ValueError as error:
+                    raise ValueError(f"CSV row {row_number}: {error}") from error
+                if order_key:
+                    order_id = values.get(order_key)
+                    if not order_id or order_id in pending_order_ids:
+                        raise ValueError(f"CSV row {row_number}: missing or duplicate {order_key}")
+                    pending_order_ids.add(order_id)
+                lot_id = values.get("lot_id")
+                if lot_id is not None:
+                    if lot_id in pending_lot_ids:
+                        raise ValueError(f"CSV row {row_number}: duplicate lot_id")
+                    pending_lot_ids.add(lot_id)
+                    identity = f"{schema_name}:{attachment_id}:{section}:{row_number}"
+                    record_id = hashlib.sha256(identity.encode()).hexdigest()[:32]
+                    path = self.root / "records" / schema_name / f"{record_id}.json"
+                    if not path.exists() and lot_id in existing_lot_ids:
+                        raise ValueError(f"CSV row {row_number}: lot_id already exists")
+            saved = 0
+            for (row_number, values), version in zip(normalized_rows, schema_version):
+                previous = existing_orders.get(values[order_key]) if order_key else None
+                if previous:
+                    old_values = {
+                        key: value
+                        for key, value in previous["values"].items()
+                        if key != "provenance"
+                    }
+                    new_values = {
+                        key: value for key, value in values.items() if key != "provenance"
+                    }
+                    if old_values == new_values:
+                        continue
+                    revision_id = uuid4().hex
+                    _save(
+                        self.root
+                        / "record_history"
+                        / schema_name
+                        / previous["id"]
+                        / f"{revision_id}.json",
+                        previous,
+                    )
+                    previous.update(
+                        {
+                            "values": values,
+                            "schema_version": version,
+                            "source_attachment": attachment_id,
+                            "source_file": filename,
+                            "source_section": section,
+                            "source_row": row_number,
+                            "updated_at": _now(),
+                            "updated_by": "Austra",
+                            "updated_from_chat": chat_id,
+                        }
+                    )
+                    _save(self.root / "records" / schema_name / f"{previous['id']}.json", previous)
+                    self.record_event(
+                        "record.import_updated",
+                        "Austra",
+                        "record",
+                        previous["id"],
+                        chat_id=chat_id,
+                        details={
+                            "schema": schema_name,
+                            "source_row": row_number,
+                            "revision_id": revision_id,
+                        },
+                    )
+                    saved += 1
+                    continue
+                identity = f"{schema_name}:{attachment_id}:{section}:{row_number}"
+                record_id = hashlib.sha256(identity.encode()).hexdigest()[:32]
+                path = self.root / "records" / schema_name / f"{record_id}.json"
+                if path.exists():
+                    continue
+                _save(
+                    path,
+                    {
+                        "id": record_id,
+                        "schema": schema_name,
+                        "schema_version": version,
+                        "values": values,
+                        "source_chat": chat_id,
+                        "source_attachment": attachment_id,
+                        "source_file": filename,
+                        "source_section": section,
+                        "source_row": row_number,
+                        "approved_at": _now(),
+                    },
+                )
+                self.record_event(
+                    "record.imported",
+                    "Austra",
+                    "record",
+                    record_id,
+                    chat_id=chat_id,
+                    details={"schema": schema_name, "source_row": row_number},
+                )
+                saved += 1
+            return saved
 
     def record_event(
         self,

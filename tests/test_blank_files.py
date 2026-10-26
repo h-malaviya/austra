@@ -96,3 +96,76 @@ def test_record_requires_user_created_schema_and_is_validated(tmp_path):
     files.review(proposal["id"], "approved")
     assert files.records()[0]["values"] == {"quantity": 12}
     assert files.records()[0]["schema_version"] == 1
+
+
+def test_repeating_an_import_does_not_duplicate_identical_records(tmp_path):
+    files = Files(tmp_path)
+    chat = files.create_chat("Add supplier list", "Admin")
+    drafts = [
+        {
+            "kind": "schema",
+            "name": "supplier_candidate",
+            "summary": "Supplier candidates",
+            "content": json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"supplier_id": {"type": "string"}},
+                    "required": ["supplier_id"],
+                }
+            ),
+        },
+        {
+            "kind": "record",
+            "name": "supplier_candidate",
+            "summary": "Supplier candidate",
+            "content": '{"supplier_id": "DEMO-01"}',
+        },
+    ]
+
+    assert len(files.apply_agent_drafts(chat["id"], drafts, ["foundation"])) == 2
+    assert files.apply_agent_drafts(chat["id"], drafts, ["foundation"]) == []
+    assert len(files.records()) == 1
+
+
+def test_admin_can_update_and_soft_delete_records_with_audit_history(tmp_path):
+    files = Files(tmp_path)
+    chat = files.create_chat("Correct and remove a stock record", "Admin")
+    schema = {
+        "type": "object",
+        "properties": {"quantity": {"type": "number"}},
+        "required": ["quantity"],
+        "additionalProperties": False,
+    }
+    files.apply_agent_drafts(
+        chat["id"],
+        [
+            {
+                "kind": "schema",
+                "name": "stock_lot",
+                "summary": "Stock lot",
+                "content": json.dumps(schema),
+            },
+            {
+                "kind": "record",
+                "name": "stock_lot",
+                "summary": "One stock lot",
+                "content": '{"quantity": 12}',
+            },
+        ],
+        ["foundation"],
+    )
+    record_id = files.records()[0]["id"]
+
+    updated = files.update_record(chat["id"], record_id, {"quantity": 9}, "Count corrected")
+    assert updated["values"] == {"quantity": 9}
+    history = list((tmp_path / "record_history/stock_lot" / record_id).glob("*.json"))
+    assert len(history) == 1
+    assert json.loads(history[0].read_text(encoding="utf-8"))["values"] == {"quantity": 12}
+
+    assert files.delete_records(chat["id"], "all", "", "Added by mistake") == 1
+    assert files.delete_records(chat["id"], "all", "", "Added by mistake") == 0
+    assert files.records() == []
+    assert files.records(include_deleted=True)[0]["values"] == {"quantity": 9}
+    assert files.records(include_deleted=True)[0]["deleted_at"]
+    actions = {entry["action"] for entry in files.audit_entries()}
+    assert {"record.updated", "record.deleted"} <= actions
