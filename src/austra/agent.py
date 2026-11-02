@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from typing import Any, Literal
 
 from anthropic import Anthropic, APIConnectionError, APIStatusError, APITimeoutError
@@ -9,17 +10,29 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from austra.access import Access
 from austra.files import Files
+from austra.mcp_connections import McpConnections
+from austra.mcp_gateway import ExternalToolError
+from austra.reports import has_stock_order_table, is_stock_order_report_request
 from austra.skills import load_skills
 from austra.tools import ReadTools
 
 ConnectorName = Literal["anthropic", "gmail", "slack"]
 ArtifactName = Literal[
-    "policy", "skill", "workflow", "schema", "record", "backend", "frontend", "infrastructure"
+    "policy",
+    "skill",
+    "workflow",
+    "schema",
+    "record",
+    "backend",
+    "frontend",
+    "infrastructure",
+    "formula",
 ]
 logger = logging.getLogger(__name__)
 FINAL_RESPONSE_TOKENS = 24000
 MODEL_TIMEOUT_SECONDS = 240
 RESEARCH_RESPONSE_TOKENS = 4096
+MAX_RESEARCH_TURNS = 8
 TOKEN_COUNT_THRESHOLD_CHARS = 100000
 
 
@@ -53,6 +66,14 @@ class RuleChange(BaseModel):
     reason: str = Field(min_length=1, max_length=300)
 
 
+class ExternalCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connection: str = Field(pattern=r"^[a-z][a-z0-9_]{1,31}$")
+    tool: str = Field(min_length=1, max_length=128)
+    arguments_json: str = Field(min_length=2, max_length=20000)
+
+
 class AgentReply(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -61,9 +82,11 @@ class AgentReply(BaseModel):
     drafts: list[Draft] = Field(default_factory=list, max_length=50)
     credential_requests: list[ConnectorName] = Field(default_factory=list, max_length=3)
     decision: Literal["allow", "deny"] = "allow"
+    needs_input: bool = False
     save_records: bool = False
     record_changes: list[RecordChange] = Field(default_factory=list, max_length=50)
     rule_changes: list[RuleChange] = Field(default_factory=list, max_length=20)
+    external_calls: list[ExternalCall] = Field(default_factory=list, max_length=3)
 
 
 OUTPUT_SCHEMA = {
@@ -75,9 +98,11 @@ OUTPUT_SCHEMA = {
         "drafts",
         "credential_requests",
         "decision",
+        "needs_input",
         "save_records",
         "record_changes",
         "rule_changes",
+        "external_calls",
     ],
     "properties": {
         "reply": {"type": "string"},
@@ -100,6 +125,7 @@ OUTPUT_SCHEMA = {
                             "backend",
                             "frontend",
                             "infrastructure",
+                            "formula",
                         ],
                     },
                     "name": {"type": "string"},
@@ -113,6 +139,7 @@ OUTPUT_SCHEMA = {
             "items": {"type": "string", "enum": ["anthropic", "gmail", "slack"]},
         },
         "decision": {"type": "string", "enum": ["allow", "deny"]},
+        "needs_input": {"type": "boolean"},
         "save_records": {"type": "boolean"},
         "record_changes": {
             "type": "array",
@@ -150,6 +177,19 @@ OUTPUT_SCHEMA = {
                     "name": {"type": "string"},
                     "content": {"type": "string"},
                     "reason": {"type": "string"},
+                },
+            },
+        },
+        "external_calls": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["connection", "tool", "arguments_json"],
+                "properties": {
+                    "connection": {"type": "string"},
+                    "tool": {"type": "string"},
+                    "arguments_json": {"type": "string"},
                 },
             },
         },
@@ -209,7 +249,7 @@ def _delegate_research(client: Any, files: Files, chat_id: str, task: str) -> st
     """Run a read-only worker for one bounded part of the supervisor's request."""
     worker_tools = ReadTools(files, chat_id)
     messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
-    for _ in range(3):
+    for _ in range(MAX_RESEARCH_TURNS):
         response = client.messages.create(
             model="claude-sonnet-5",
             max_tokens=RESEARCH_RESPONSE_TOKENS,
@@ -236,11 +276,11 @@ def _delegate_research(client: Any, files: Files, chat_id: str, task: str) -> st
         results = []
         for call in calls:
             try:
-                result = worker_tools.invoke(call.name, call.input)
+                result = worker_tools.invoke_for_research(call.name, call.input)
                 results.append(
                     {"type": "tool_result", "tool_use_id": call.id, "content": json.dumps(result)}
                 )
-            except (KeyError, ValueError) as error:
+            except (ExternalToolError, KeyError, ValueError) as error:
                 results.append(
                     {
                         "type": "tool_result",
@@ -253,7 +293,12 @@ def _delegate_research(client: Any, files: Files, chat_id: str, task: str) -> st
     raise ValueError("Research worker reached its tool limit")
 
 
-def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
+def analyze(
+    files: Files,
+    access: Access,
+    chat_id: str,
+    verified_material_plan: dict[str, Any] | None = None,
+) -> AgentReply:
     key = access.get("ANTHROPIC_API_KEY")
     if not key:
         return AgentReply(
@@ -264,16 +309,35 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
             credential_requests=["anthropic"],
         )
     chat = files.chat(chat_id)
+    latest = chat["messages"][-1]
+    latest_text = latest.get("display_body", latest["body"])
+    stock_order_report_requested = verified_material_plan is None and is_stock_order_report_request(
+        latest_text
+    )
+    document_import_requested = bool(
+        re.search(r"\b(add|import|save|ingest|load|continue)\b", latest_text, re.IGNORECASE)
+        or (not latest_text.strip() and latest.get("attachments"))
+    )
+    document_attachments = [
+        attachment
+        for message in chat["messages"]
+        if message["role"] == "user"
+        for attachment in message.get("attachments", [])
+        if not attachment["name"].lower().endswith((".csv", ".xlsx"))
+    ]
     client = Anthropic(api_key=key, timeout=MODEL_TIMEOUT_SECONDS, max_retries=0)
     tools = ReadTools(
         files, chat_id, delegate=lambda task: _delegate_research(client, files, chat_id, task)
     )
     records = files.records()
+    mcp_catalog = McpConnections(files.root, access).list()
     context = {
         "conversation": [
             {
                 "role": item["role"],
-                "body": item.get("display_body", item["body"])
+                "body": item["body"]
+                if index == len(chat["messages"][-16:]) - 1 and item.get("attachments")
+                else item.get("display_body", item["body"])
                 if index == len(chat["messages"][-16:]) - 1
                 else item.get("display_body", item["body"])[:900],
                 "attachments": [
@@ -293,8 +357,31 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
         ],
         "record_count": len(records),
         "saved_record_summary": _record_summary(records),
+        "recovery_lessons": files.recovery_lessons(),
+        "saved_read_plans": files.read_plans(),
         "connector_status": access.configured(),
+        "mcp_connections": {
+            name: [tool["name"] for tool in connection["tools"]]
+            for name, connection in mcp_catalog.items()
+            if not connection["built_in"]
+        },
     }
+    if verified_material_plan is not None:
+        context["verified_material_plan"] = verified_material_plan
+    if document_import_requested:
+        context["document_evidence"] = []
+        for attachment in document_attachments:
+            path = files.root / "evidence_text" / f"{attachment['id']}.txt"
+            if path.is_file():
+                extracted = path.read_text(encoding="utf-8")
+                context["document_evidence"].append(
+                    {
+                        "id": attachment["id"],
+                        "name": attachment["name"],
+                        "text": extracted[:8000],
+                        "complete": len(extracted) <= 8000,
+                    }
+                )
     serialized = json.dumps(context, ensure_ascii=False, default=str)
     instructions = load_skills(files)
     try:
@@ -331,7 +418,9 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
             for item in chat["messages"]
             for attachment in item.get("attachments", [])
         )
-        latest = chat["messages"][-1]
+        integration_setup = any(
+            term in latest["body"].casefold() for term in ("mcp", "teams", "integration", "connect")
+        )
         latest_attachments = latest.get("attachments", [])
         latest_attachment_fully_visible = bool(latest_attachments) and all(
             (path := files.root / "evidence_text" / f"{attachment['id']}.txt").is_file()
@@ -342,26 +431,50 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
             context["approved_workspace_index"]
             or context["record_count"]
             or has_document_attachment
+            or integration_setup
+            or context["mcp_connections"]
         ):
-            for _ in range(3):
+            completed_calls: set[str] = set()
+            pending_recoveries: list[str] = []
+            for turn in range(MAX_RESEARCH_TURNS):
                 research = client.messages.create(
                     model="claude-sonnet-5",
                     max_tokens=RESEARCH_RESPONSE_TOKENS,
                     system=(
                         instructions
                         + "\nResearch phase: use a read tool to inspect only the evidence needed "
-                        "for the latest request. Do not draft records or write the final reply here."
+                        "for the latest request. For stock versus orders, read every relevant "
+                        "stock and open-order schema before comparing quantities, grades, "
+                        "status, and restrictions. list_records collects all remaining pages "
+                        "automatically. If a read fails or repeats, change the read plan; "
+                        "compose_record_lookup can assemble a new read-only lookup from named "
+                        "schemas and save a reusable plan; run_saved_record_lookup reruns one "
+                        "on current records. Use recovery_lessons only as hints and verify against current "
+                        "records. Do not draft records or write the final reply here."
+                        + (
+                            " The verified material plan is already supplied. Research only "
+                            "the additional parts of the user's request, including relevant "
+                            "supplier, customer, purchase, or other saved records."
+                            if verified_material_plan is not None
+                            else ""
+                        )
                     ),
                     messages=messages,
                     tools=tools.definitions(),
-                    tool_choice={"type": "any", "disable_parallel_tool_use": True},
+                    tool_choice={
+                        "type": "any" if turn == 0 or pending_recoveries else "auto",
+                        "disable_parallel_tool_use": True,
+                    },
                 )
                 if research.stop_reason == "max_tokens":
                     logger.warning("Research response reached token limit")
+                    files.record_recovery_failure(chat_id, "research", "token_limit")
                     research_incomplete = True
                     break
                 messages.append({"role": "assistant", "content": research.content})
                 if research.stop_reason == "end_turn":
+                    if pending_recoveries:
+                        research_incomplete = True
                     messages.append(
                         {"role": "user", "content": "Return the final structured answer."}
                     )
@@ -373,8 +486,53 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
                     raise AnalysisUnavailable("Austra requested a tool without a call")
                 results = []
                 for call in calls:
+                    signature = json.dumps(
+                        {"name": call.name, "input": call.input}, sort_keys=True, default=str
+                    )
+                    if signature in completed_calls:
+                        pending_recoveries.append(
+                            files.record_recovery_failure(chat_id, call.name, "repeated_read")
+                        )
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call.id,
+                                "content": (
+                                    "This exact lookup was already completed. Choose another "
+                                    "record schema or compose_record_lookup with the missing schemas."
+                                ),
+                                "is_error": True,
+                            }
+                        )
+                        continue
                     try:
-                        result = tools.invoke(call.name, call.input)
+                        result = tools.invoke_for_research(call.name, call.input)
+                        data = result.get("data")
+                        if (
+                            result["truncated"]
+                            or (isinstance(data, dict) and data.get("error"))
+                            or (
+                                call.name
+                                in {
+                                    "list_records",
+                                    "compose_record_lookup",
+                                    "run_saved_record_lookup",
+                                }
+                                and (not isinstance(data, dict) or data.get("complete") is not True)
+                            )
+                        ):
+                            raise ValueError("Read result is incomplete; use a narrower lookup")
+                        completed_calls.add(signature)
+                        for recovery_id in pending_recoveries:
+                            files.resolve_recovery(
+                                recovery_id,
+                                "composed_record_lookup"
+                                if call.name == "compose_record_lookup"
+                                else "saved_record_lookup"
+                                if call.name == "run_saved_record_lookup"
+                                else "revised_read_call",
+                            )
+                        pending_recoveries.clear()
                         results.append(
                             {
                                 "type": "tool_result",
@@ -382,7 +540,10 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
                                 "content": json.dumps(result),
                             }
                         )
-                    except (KeyError, ValueError) as error:
+                    except (ExternalToolError, KeyError, ValueError) as error:
+                        pending_recoveries.append(
+                            files.record_recovery_failure(chat_id, call.name, "read_tool_error")
+                        )
                         results.append(
                             {
                                 "type": "tool_result",
@@ -392,7 +553,42 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
                             }
                         )
                 messages.append({"role": "user", "content": results})
-        for attempt in range(2):
+            else:
+                files.record_recovery_failure(chat_id, "research", "turn_limit")
+                research_incomplete = True
+        if stock_order_report_requested:
+            report_schemas = sorted(
+                {
+                    record["schema"]
+                    for record in records
+                    if "stock" in record["schema"]
+                    or "inventory" in record["schema"]
+                    or ("sales_order" in record["schema"] and "historical" not in record["schema"])
+                }
+            )
+            for start in range(0, len(report_schemas), 8):
+                try:
+                    evidence = tools.invoke_for_research(
+                        "compose_record_lookup", {"schemas": report_schemas[start : start + 8]}
+                    )
+                except (KeyError, ValueError):
+                    files.record_recovery_failure(chat_id, "stock_order_report", "lookup_failed")
+                    research_incomplete = True
+                    break
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Complete saved stock and sales-order record set for this report. "
+                            "Use each lot at most once across orders. Treat stock quality or "
+                            "compatibility not evidenced in the records as uncertain. "
+                            + json.dumps(evidence["data"], ensure_ascii=False, default=str)
+                        ),
+                    }
+                )
+        completion_retry = False
+        report_recovery_id: str | None = None
+        for attempt in range(3):
             response = client.messages.create(
                 model="claude-sonnet-5",
                 max_tokens=FINAL_RESPONSE_TOKENS,
@@ -400,10 +596,44 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
                     instructions
                     + "\nGive the chat a short, specific title based on the user's request "
                     "in the title field. Use at most five words and 60 characters."
+                    "\nSpeak plainly to a business user. State what you are doing or what is "
+                    "still needed; the app will report confirmed saves. Do not claim a save "
+                    "already succeeded in your reply. Do not mention schemas, columns, JSON, extraction, tool calls, "
+                    "or internal review steps in the reply. Never say you will continue after "
+                    "sending the reply. If source facts conflict or an active business rule "
+                    "requires a missing detail, set needs_input=true, return no changes, and "
+                    "ask one direct question naming the exact choice or missing detail. "
+                    "If the user can change a business requirement, say that in plain words. "
+                    "Do not treat an internal data format mismatch as a reason to ask the user."
+                    "\nFor data-bearing answers, include complete Markdown tables with "
+                    "headers, units, and every requested breakdown in this one reply. "
+                    "The app renders these tables as interactive A2UI views. Use "
+                    "calculate_decimal for arithmetic during research; identify unknown "
+                    "figures rather than estimating them."
                     + (
                         "\nResearch was incomplete. Use only available evidence, state any "
                         "uncertainty, and do not claim complete extraction or save partial records."
                         if research_incomplete
+                        else ""
+                    )
+                    + (
+                        "\nFor this stock versus open sales order request, give the result as a "
+                        "Markdown table with order, requested quantity, compatible available "
+                        "quantity, shortfall, and additional quantity needed. Add totals and "
+                        "state when purchase quantities cannot be calculated from the saved "
+                        "facts. Do not return a placeholder or substitute a skill proposal "
+                        "for the requested report."
+                        if stock_order_report_requested
+                        else ""
+                    )
+                    + (
+                        "\nThe application will attach the verified material plan to your reply. "
+                        "Answer only the additional requested topics, with sourced reasons "
+                        "and complete tables where useful. Do not repeat or recalculate the "
+                        "plan. Distinguish supplier candidates from qualified suppliers; "
+                        "do not rank candidates without price, lead-time, capacity, or "
+                        "qualification evidence."
+                        if verified_material_plan is not None
                         else ""
                     )
                 ),
@@ -423,14 +653,81 @@ def analyze(files: Files, access: Access, chat_id: str) -> AgentReply:
             if len(blocks) != 1:
                 raise AnalysisUnavailable("Austra returned an unexpected response")
             try:
-                return AgentReply.model_validate_json(blocks[0])
+                answer = AgentReply.model_validate_json(blocks[0])
+                if answer.reply.strip().casefold() == "placeholder" or (
+                    stock_order_report_requested
+                    and not answer.needs_input
+                    and not has_stock_order_table(answer.reply)
+                ):
+                    if report_recovery_id is None:
+                        report_recovery_id = files.record_recovery_failure(
+                            chat_id,
+                            "stock_order_report",
+                            "placeholder_reply"
+                            if answer.reply.strip().casefold() == "placeholder"
+                            else "missing_report_table",
+                        )
+                    if attempt == 2:
+                        raise AnalysisUnavailable(
+                            "Austra could not produce the stock and open-order table."
+                        )
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous reply did not answer the request. Return the "
+                                "stock and open-order result as a Markdown table with Order, "
+                                "Requested, Available, Shortfall, and Purchase needed. Use "
+                                "the complete saved record set already provided; show unknown "
+                                "values plainly. Do not return a placeholder or a skill draft."
+                            ),
+                        }
+                    )
+                    continue
+                if answer.needs_input:
+                    return answer
+                if (
+                    document_import_requested
+                    and document_attachments
+                    and answer.decision == "allow"
+                    and not any(draft.kind == "record" for draft in answer.drafts)
+                ):
+                    if completion_retry or attempt == 2:
+                        return AgentReply(
+                            reply=(
+                                "I couldn't save the attached files yet. Nothing new was saved. "
+                                "Please try again or send the missing order details in the chat."
+                            ),
+                            save_records=True,
+                        )
+                    completion_retry = True
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Complete the document import now. The extracted text is in "
+                                "the conversation or document_evidence. Return record drafts "
+                                "for the unsaved documents, with schemas where needed. "
+                                "If a source detail is missing or conflicts with an active rule, "
+                                "set needs_input=true and ask one plain-language question. "
+                                "Do not describe internal data structures or promise to "
+                                "continue later."
+                            ),
+                        }
+                    )
+                    continue
+                if report_recovery_id is not None:
+                    files.resolve_recovery(report_recovery_id, "revised_report_with_table")
+                return answer
             except ValidationError as error:
                 issues = [
                     {"field": ".".join(map(str, item["loc"])), "type": item["type"]}
                     for item in error.errors(include_input=False)
                 ]
                 logger.warning("Structured response validation failed: %s", issues)
-                if attempt:
+                if attempt == 2:
                     raise AnalysisUnavailable(
                         "Austra could not validate its response. Please retry the request."
                     ) from error

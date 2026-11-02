@@ -127,6 +127,28 @@ def test_repeating_an_import_does_not_duplicate_identical_records(tmp_path):
     assert len(files.records()) == 1
 
 
+def test_chat_record_with_secret_does_not_create_inferred_schema(tmp_path):
+    files = Files(tmp_path)
+    chat = files.create_chat("Save a record", "Admin")
+
+    with pytest.raises(ValueError, match="credential"):
+        files.apply_agent_drafts(
+            chat["id"],
+            [
+                {
+                    "kind": "record",
+                    "name": "private_entry",
+                    "summary": "Private entry",
+                    "content": '{"value":"sk-ant-test"}',
+                }
+            ],
+            ["foundation"],
+        )
+
+    assert files.approved() == []
+    assert files.records() == []
+
+
 def test_admin_can_update_and_soft_delete_records_with_audit_history(tmp_path):
     files = Files(tmp_path)
     chat = files.create_chat("Correct and remove a stock record", "Admin")

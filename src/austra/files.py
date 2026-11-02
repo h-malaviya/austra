@@ -12,16 +12,41 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
+from austra.formulas import parse_formula, validate_formula_mapping
 from austra.infrastructure import SERVICES, InfrastructureError
 
 ArtifactKind = Literal[
-    "policy", "skill", "workflow", "schema", "record", "backend", "frontend", "infrastructure"
+    "policy",
+    "skill",
+    "workflow",
+    "schema",
+    "record",
+    "backend",
+    "frontend",
+    "infrastructure",
+    "formula",
 ]
-KINDS = ("policy", "skill", "workflow", "schema", "record", "backend", "frontend", "infrastructure")
+KINDS = (
+    "policy",
+    "skill",
+    "workflow",
+    "schema",
+    "record",
+    "backend",
+    "frontend",
+    "infrastructure",
+    "formula",
+)
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 SECRET_PATTERN = re.compile(r"sk-ant-|xox[baprs]-|-----BEGIN .*PRIVATE KEY-----", re.IGNORECASE)
 LEGACY_ATTACHMENT = re.compile(r"Attachment (.+?) \(([0-9a-f]{64})\):")
-EXTENSIONS = {"schema": ".json", "record": ".json", "backend": ".py", "frontend": ".js"}
+EXTENSIONS = {
+    "schema": ".json",
+    "record": ".json",
+    "formula": ".json",
+    "backend": ".py",
+    "frontend": ".js",
+}
 
 
 def _now() -> str:
@@ -33,6 +58,34 @@ def _save(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
     temporary.replace(path)
+
+
+def _record_value_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
+def _schema_from_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    field_types: dict[str, set[str]] = {}
+    for record in records:
+        for field, value in record.items():
+            field_types.setdefault(field, set()).add(_record_value_type(value))
+    return {
+        "type": "object",
+        "properties": {
+            field: {"type": sorted(types) if len(types) > 1 else next(iter(types))}
+            for field, types in field_types.items()
+        },
+    }
 
 
 class Files:
@@ -101,11 +154,14 @@ class Files:
         return chat
 
     def _evidence_path(self, digest: str) -> Path | None:
-        folder = self.root / "evidence"
-        exact = folder / digest
-        if exact.is_file():
-            return exact
-        return next((path for path in folder.glob(f"{digest}.*") if path.is_file()), None)
+        for folder in (self.root / "evidence", self.root / "generated"):
+            exact = folder / digest
+            if exact.is_file():
+                return exact
+            match = next((path for path in folder.glob(f"{digest}.*") if path.is_file()), None)
+            if match is not None:
+                return match
+        return None
 
     def attachment(
         self, chat_id: str, attachment_id: str, *, audit: bool = False
@@ -188,12 +244,21 @@ class Files:
         *,
         display_body: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        needs_input: bool = False,
+        report: dict[str, Any] | None = None,
+        visualize: bool = False,
     ) -> dict[str, Any]:
         message = {"id": uuid4().hex, "role": role, "body": body, "sender": sender, "at": _now()}
         if display_body is not None:
             message["display_body"] = display_body
         if attachments:
             message["attachments"] = attachments
+        if needs_input and role == "assistant":
+            message["needs_input"] = True
+        if report is not None and role == "assistant":
+            message["report"] = report
+        if visualize and role == "assistant":
+            message["visualize"] = True
         chat["messages"].append(message)
         chat["updated_at"] = _now()
         _save(self._chat_path(chat["id"]), chat)
@@ -212,11 +277,55 @@ class Files:
             },
         )
 
-    def add_message(self, chat_id: str, role: str, body: str, sender: str) -> dict[str, Any]:
+    def add_message(
+        self,
+        chat_id: str,
+        role: str,
+        body: str,
+        sender: str,
+        *,
+        needs_input: bool = False,
+        display_body: str | None = None,
+        report: dict[str, Any] | None = None,
+        visualize: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
-            chat = self._add_message(self._read_chat(chat_id), role, body, sender)
+            chat = self._add_message(
+                self._read_chat(chat_id),
+                role,
+                body,
+                sender,
+                needs_input=needs_input,
+                display_body=display_body,
+                report=report,
+                visualize=visualize,
+            )
             self.record_event("chat.message_added", sender, "chat", chat_id, chat_id=chat_id)
             return chat
+
+    def add_generated_attachment_message(
+        self, chat_id: str, body: str, filename: str, content: bytes
+    ) -> dict[str, Any]:
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,159}\.pdf", filename):
+            raise ValueError("Invalid generated PDF filename")
+        if not content.startswith(b"%PDF-") or len(content) > 1_000_000:
+            raise ValueError("Invalid generated PDF")
+        with self._lock:
+            chat = self._read_chat(chat_id)
+            digest = hashlib.sha256(content).hexdigest()
+            path = self.root / "generated" / digest
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_bytes(content)
+            self._add_message(
+                chat,
+                "assistant",
+                body,
+                "Austra",
+                attachments=[{"id": digest, "name": filename, "size": len(content)}],
+            )
+            self.record_event("report.generated", "Austra", "attachment", digest, chat_id=chat_id)
+            return self.chat(chat_id)
 
     def set_chat_title(self, chat_id: str, title: str) -> None:
         with self._lock:
@@ -265,6 +374,114 @@ class Files:
                 and not item["body"].startswith("Attachment ")
             )
         return sorted(entries, key=lambda item: item["at"])[-12:]
+
+    def record_recovery_failure(self, chat_id: str, tool: str, failure: str) -> str:
+        """Keep operational failures separate from business facts and chat memory."""
+        self.chat(chat_id)
+        recovery_id = uuid4().hex
+        _save(
+            self.root / "memory" / "recovery" / f"{recovery_id}.json",
+            {
+                "id": recovery_id,
+                "chat_id": chat_id,
+                "tool": tool,
+                "failure": failure,
+                "resolution": None,
+                "at": _now(),
+            },
+        )
+        self.record_event(
+            "agent.recovery_failed",
+            "Austra",
+            "tool",
+            tool,
+            chat_id=chat_id,
+            details={"failure": failure, "recovery_id": recovery_id},
+            outcome="failed",
+        )
+        return recovery_id
+
+    def resolve_recovery(self, recovery_id: str, resolution: str) -> None:
+        if not re.fullmatch(r"[0-9a-f]{32}", recovery_id):
+            raise ValueError("Invalid recovery ID")
+        path = self.root / "memory" / "recovery" / f"{recovery_id}.json"
+        entry = json.loads(path.read_text(encoding="utf-8"))
+        entry["resolution"] = resolution
+        entry["resolved_at"] = _now()
+        _save(path, entry)
+        self.record_event(
+            "agent.recovery_resolved",
+            "Austra",
+            "tool",
+            entry["tool"],
+            chat_id=entry["chat_id"],
+            details={"failure": entry["failure"], "resolution": resolution},
+        )
+
+    def recovery_lessons(self) -> list[dict[str, str]]:
+        resolved = sorted(
+            (item for item in self._recovery_entries() if item.get("resolution")),
+            key=lambda item: item["resolved_at"],
+            reverse=True,
+        )
+        return [
+            {
+                "tool": item["tool"],
+                "failure": item["failure"],
+                "resolution": item["resolution"],
+            }
+            for item in resolved[:10]
+        ]
+
+    def _recovery_entries(self) -> list[dict[str, Any]]:
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (self.root / "memory" / "recovery").glob("*.json")
+        ]
+
+    def recovery_history(self) -> list[dict[str, Any]]:
+        return sorted(self._recovery_entries(), key=lambda item: item["at"], reverse=True)[:20]
+
+    def save_read_plan(self, chat_id: str, name: str, schemas: list[str]) -> None:
+        self.chat(chat_id)
+        if (
+            not NAME_PATTERN.fullmatch(name)
+            or not schemas
+            or any(not NAME_PATTERN.fullmatch(schema) for schema in schemas)
+        ):
+            raise ValueError("Invalid read plan")
+        path = self.root / "memory" / "read_plans" / f"{name}.json"
+        if path.exists() and self.read_plan(name)["schemas"] != schemas:
+            raise ValueError("Read plan name already exists with different schemas")
+        _save(
+            path,
+            {"name": name, "schemas": schemas, "updated_at": _now()},
+        )
+        self.record_event(
+            "agent.read_plan_saved",
+            "Austra",
+            "read_plan",
+            name,
+            chat_id=chat_id,
+            details={"schema_count": str(len(schemas))},
+        )
+
+    def read_plan(self, name: str) -> dict[str, Any]:
+        if not NAME_PATTERN.fullmatch(name):
+            raise ValueError("Invalid read plan name")
+        try:
+            return json.loads(
+                (self.root / "memory" / "read_plans" / f"{name}.json").read_text(encoding="utf-8")
+            )
+        except FileNotFoundError as error:
+            raise ValueError("Saved read plan not found") from error
+
+    def read_plans(self) -> list[dict[str, Any]]:
+        plans = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (self.root / "memory" / "read_plans").glob("*.json")
+        ]
+        return sorted(plans, key=lambda item: item["updated_at"], reverse=True)[:10]
 
     def submit_message(
         self, chat_id: str | None, text: str, uploads: list[dict[str, Any]]
@@ -316,7 +533,10 @@ class Files:
                 if item.get("text"):
                     text_path = self.root / "evidence_text" / f"{item['id']}.txt"
                     text_path.parent.mkdir(parents=True, exist_ok=True)
-                    if not text_path.exists():
+                    if (
+                        not text_path.exists()
+                        or text_path.read_text(encoding="utf-8") != item["text"]
+                    ):
                         text_path.write_text(item["text"], encoding="utf-8")
 
             if chat:
@@ -402,6 +622,8 @@ class Files:
                         raise ValueError(
                             "Infrastructure draft must use an allowed service and action"
                         )
+                if kind == "formula":
+                    parse_formula(content)
                 if kind in {"schema", "record"}:
                     try:
                         value = json.loads(content)
@@ -458,8 +680,36 @@ class Files:
     def apply_agent_drafts(
         self, chat_id: str, drafts: list[dict[str, str]], skills_used: list[str]
     ) -> list[dict[str, Any]]:
+        known_schemas = {item["name"] for item in self.approved() if item["kind"] == "schema"}
+        known_schemas.update(item["name"] for item in drafts if item["kind"] == "schema")
+        missing_schemas: dict[str, list[dict[str, Any]]] = {}
+        for draft in drafts:
+            if draft["kind"] != "record" or draft["name"] in known_schemas:
+                continue
+            if not NAME_PATTERN.fullmatch(draft["name"]):
+                raise ValueError("Invalid artifact kind or name")
+            if len(draft["content"].encode("utf-8")) > 1_000_000:
+                raise ValueError("Invalid artifact content")
+            if SECRET_PATTERN.search(draft["content"]):
+                raise ValueError("Draft appears to contain a credential")
+            try:
+                values = json.loads(draft["content"])
+            except json.JSONDecodeError as error:
+                raise ValueError("Record draft must be JSON") from error
+            if not isinstance(values, dict):
+                raise TypeError("Record draft must describe an object")
+            missing_schemas.setdefault(draft["name"], []).append(values)
+        inferred = [
+            {
+                "kind": "schema",
+                "name": name,
+                "summary": "Schema inferred from supplied record fields",
+                "content": json.dumps(_schema_from_records(records), ensure_ascii=False),
+            }
+            for name, records in missing_schemas.items()
+        ]
         saved = []
-        for draft in sorted(drafts, key=lambda item: item["kind"] != "schema"):
+        for draft in sorted([*drafts, *inferred], key=lambda item: item["kind"] != "schema"):
             if draft["kind"] == "record":
                 values = json.loads(draft["content"])
                 if any(
@@ -509,6 +759,8 @@ class Files:
             if draft["status"] != "proposed":
                 raise ValueError("Draft was already reviewed")
             if decision == "approved":
+                if draft["kind"] == "formula":
+                    validate_formula_mapping(draft["content"], self.approved())
                 if draft["kind"] == "infrastructure":
                     if infrastructure is None:
                         raise ValueError(

@@ -6,27 +6,19 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
 from austra.access import Access
 from austra.files import Files
+from austra.mcp_gateway import ExternalToolError, call_external_async
 
 logger = logging.getLogger(__name__)
 RECONNECT_SECONDS = 5
 
 
 async def socket_url(token: str) -> str:
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.post(
-            "https://slack.com/api/apps.connections.open",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        response.raise_for_status()
-    result = response.json()
-    if not isinstance(result, dict) or not result.get("ok"):
-        raise ValueError("Slack rejected the app-level token or Socket Mode is disabled")
+    result = await call_external_async("slack_socket_url", {}, {"SLACK_APP_TOKEN": token})
     url = result.get("url")
     if not isinstance(url, str) or not url.startswith("wss://"):
         raise ValueError("Slack returned an invalid Socket Mode URL")
@@ -89,7 +81,7 @@ async def run_socket_mode(
                 await receive_events(websocket, token, access, on_event)
         except asyncio.CancelledError:
             raise
-        except (httpx.HTTPError, OSError, TimeoutError, ValueError, WebSocketException) as error:
+        except (ExternalToolError, OSError, TimeoutError, ValueError, WebSocketException) as error:
             if not failed:
                 files.record_event(
                     "connection.socket_failed", "Austra", "connector", "slack", outcome="failed"

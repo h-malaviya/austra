@@ -97,7 +97,7 @@ def test_chat_bulk_update_applies_and_stock_report_shows_verification(tmp_path):
     client = TestClient(create_app(tmp_path, planner=planner))
     client.post("/api/setup", json={"password": "long private passphrase"})
     response = client.post("/api/chats", json={"body": "Mark the imported lots verified"})
-    assert "Updated 2 business record(s)" in response.json()["chat"]["messages"][-1]["body"]
+    assert "Updated 2 items" in response.json()["chat"]["messages"][-1]["body"]
     report = client.post("/api/chats", json={"body": "Show stock"})
     assert "Verification" in report.json()["chat"]["messages"][-1]["body"]
     assert "verified" in report.json()["chat"]["messages"][-1]["body"]

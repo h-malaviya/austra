@@ -1,6 +1,7 @@
 """Handle explicit administrator commands that must not depend on model discretion."""
 
 import re
+from decimal import Decimal
 
 from austra.agent import AgentReply, RecordChange
 from austra.files import Files
@@ -13,11 +14,36 @@ RULE_QUERY = re.compile(
     r"^(?:show|list|what|which)\b.*\b(?:rules?|polic(?:y|ies))\b",
     re.IGNORECASE | re.DOTALL,
 )
+ALLOWANCE_RANGE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(?:-|–|to)\s*(\d+(?:\.\d+)?)\s*%")
+TONNE_AMOUNT = re.compile(r"\b(\d+(?:\.\d+)?)\s*(?:tonnes?|tons?|t)\b")
 
 
 def is_rule_suggestion(message: str) -> bool:
     return bool(
         re.search(r"\b(?:suggest|recommend|suggestion|ideas for rules?)\b", message, re.IGNORECASE)
+    )
+
+
+def conflicting_material_allowance(message: str) -> str | None:
+    text = message.casefold()
+    if not re.search(r"\b(?:wastage|waste|efficiency|buffer)\b", text):
+        return None
+    if not re.search(r"\b(?:cost\w*|calculat\w*|always|apply)\b", text):
+        return None
+    allowance = ALLOWANCE_RANGE.search(text)
+    amounts = [Decimal(value) for value in TONNE_AMOUNT.findall(text)]
+    if allowance is None or len(amounts) < 2 or amounts[-2] == 0:
+        return None
+    lower, upper = sorted((Decimal(allowance[1]), Decimal(allowance[2])))
+    implied = (amounts[-1] / amounts[-2] - 1) * 100
+    if lower <= implied <= upper:
+        return None
+    lower_text = format(lower.normalize(), "f")
+    upper_text = format(upper.normalize(), "f")
+    implied_text = format(implied.normalize(), "f")
+    return (
+        f"You mentioned {lower_text}–{upper_text}% extra, but {amounts[-1]} tonnes for "
+        f"{amounts[-2]} tonne adds {implied_text}%. Which buffer should I use for costing?"
     )
 
 

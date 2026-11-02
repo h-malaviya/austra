@@ -9,3 +9,6 @@ __pycache__/
 .env
 .env.*
 data/
+node_modules/
+output/
+tmp/

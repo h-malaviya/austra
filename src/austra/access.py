@@ -6,10 +6,12 @@ import json
 import os
 import re
 import secrets
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 ITERATIONS = 600_000
+SESSION_TTL_SECONDS = 12 * 60 * 60
 CONNECTORS = {
     "anthropic": ("ANTHROPIC_API_KEY",),
     "gmail": (
@@ -65,7 +67,7 @@ class Access:
         self.root.mkdir(parents=True, exist_ok=True)
         self.admin_path = self.root / "admin.json"
         self.env_path = self.root / ".env"
-        self.sessions: set[str] = set()
+        self.sessions: dict[str, datetime] = {}
 
     @property
     def ready(self) -> bool:
@@ -95,15 +97,25 @@ class Access:
         if not hmac.compare_digest(digest, bytes.fromhex(saved["hash"])):
             raise ValueError("Incorrect passphrase")
         session = secrets.token_urlsafe(32)
-        self.sessions.add(session)
+        self.sessions[session] = datetime.now(UTC) + timedelta(seconds=SESSION_TTL_SECONDS)
         return session
 
     def authenticated(self, session: str | None) -> bool:
-        return bool(session and session in self.sessions)
+        if not session or session not in self.sessions:
+            return False
+        if self.sessions[session] <= datetime.now(UTC):
+            self.sessions.pop(session, None)
+            return False
+        return True
+
+    def session_seconds_remaining(self, session: str | None) -> float:
+        if not self.authenticated(session):
+            return 0
+        return max(0, (self.sessions[session] - datetime.now(UTC)).total_seconds())
 
     def logout(self, session: str | None) -> None:
         if session:
-            self.sessions.discard(session)
+            self.sessions.pop(session, None)
 
     def _stored(self) -> dict[str, str]:
         if not self.env_path.exists():
@@ -141,7 +153,26 @@ class Access:
         team_id = values.get("SLACK_ALLOWED_TEAM_ID")
         if team_id is not None and not re.fullmatch(r"T[A-Z0-9]+", team_id):
             raise ValueError("Slack workspace team ID must start with T; do not enter an app token")
+        self._write_private(values)
+        return self.missing(connector)
+
+    def save_mcp_token(self, name: str, token: str) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{1,31}", name):
+            raise ValueError("Invalid MCP connection name")
+        if not token or len(token) > 8000 or "\n" in token or "\r" in token:
+            raise ValueError("Invalid MCP token")
+        self._write_private({f"MCP_{name.upper()}_TOKEN": token})
+
+    def mcp_token(self, name: str) -> str:
+        return self.get(f"MCP_{name.upper()}_TOKEN")
+
+    def delete_mcp_token(self, name: str) -> None:
         stored = self._stored()
+        stored.pop(f"MCP_{name.upper()}_TOKEN", None)
+        self._write_private(stored, replace=True)
+
+    def _write_private(self, values: dict[str, str], *, replace: bool = False) -> None:
+        stored = {} if replace else self._stored()
         stored.update(values)
         temporary = self.env_path.with_name(f".env.{uuid4().hex}.tmp")
         temporary.write_text(
@@ -150,4 +181,3 @@ class Access:
         )
         temporary.chmod(0o600)
         temporary.replace(self.env_path)
-        return self.missing(connector)
