@@ -16,8 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-import httpx
 from docx import Document
+from docx.table import Table
 from fastapi import (
     BackgroundTasks,
     Depends,
@@ -35,8 +35,15 @@ from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from austra.access import CONNECTORS, GUIDES, VISIBLE_FIELDS, Access
-from austra.admin_intents import is_rule_suggestion, rule_listing, verification_update
+from austra.a2ui import chat_surfaces, workspace_page
+from austra.a2ui_tables import markdown_tables, table_summary
+from austra.access import CONNECTORS, GUIDES, SESSION_TTL_SECONDS, VISIBLE_FIELDS, Access
+from austra.admin_intents import (
+    conflicting_material_allowance,
+    is_rule_suggestion,
+    rule_listing,
+    verification_update,
+)
 from austra.agent import (
     AgentReply,
     AnalysisUnavailable,
@@ -47,8 +54,18 @@ from austra.agent import (
 )
 from austra.connectors import VERIFIERS, Verifier, exchange_gmail_code, gmail_authorization_url
 from austra.files import SECRET_PATTERN, Files
-from austra.imports import import_chat_tables
+from austra.imports import import_chat_tables, inspect_chat_table
 from austra.infrastructure import Infrastructure, InfrastructureError
+from austra.mail_draft import is_requirement_mail_request, requirement_email, requirement_pdf
+from austra.material_plan import (
+    build_material_plan,
+    is_material_plan_followup,
+    material_plan_additions,
+    material_plan_reply,
+    unsupported_allocation_request,
+)
+from austra.mcp_connections import McpConnections
+from austra.mcp_gateway import ExternalToolError, call_external
 from austra.pdf_text import PDFExtractionError, extract_pdf_text
 from austra.reports import (
     is_stock_request,
@@ -59,6 +76,7 @@ from austra.reports import (
 from austra.skills import PLATFORM_SKILLS
 from austra.slack import event_message, verify_signature
 from austra.slack_socket import run_socket_mode
+from austra.supplier_plan import supplier_shortlist, supplier_shortlist_reply
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -91,6 +109,16 @@ class Credentials(BaseModel):
     values: dict[str, str]
 
 
+class McpConnectionInput(BaseModel):
+    name: str = Field(min_length=2, max_length=32)
+    url: str = Field(min_length=8, max_length=2048)
+    token: str = Field(default="", max_length=8000)
+
+
+class McpToolInput(BaseModel):
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
 class Review(BaseModel):
     decision: Literal["approved", "rejected"]
 
@@ -100,7 +128,14 @@ def _extract_attachment(filename: str, content: bytes) -> str:
     if suffix == ".pdf":
         return extract_pdf_text(content)
     if suffix == ".docx":
-        return "\n".join(paragraph.text for paragraph in Document(io.BytesIO(content)).paragraphs)
+        document = Document(io.BytesIO(content))
+        lines = []
+        for block in document.iter_inner_content():
+            if isinstance(block, Table):
+                lines.extend("\t".join(cell.text for cell in row.cells) for row in block.rows)
+            else:
+                lines.append(block.text)
+        return "\n".join(lines)
     if suffix in {".csv", ".txt", ".md"}:
         return content.decode("utf-8-sig")
     if suffix == ".xlsx":
@@ -177,6 +212,7 @@ def create_app(
     workspace = Path(root or os.getenv("AUSTRA_WORKSPACE", "data/blank"))
     files = Files(workspace)
     access = Access(workspace)
+    mcp_connections = McpConnections(workspace, access)
     infrastructure = Infrastructure()
     verifiers = {**VERIFIERS, **(connector_verifiers or {})}
     oauth_states: dict[str, tuple[float, str]] = {}
@@ -231,6 +267,29 @@ def create_app(
             for attachment in message.get("attachments", [])
             if attachment["name"].lower().endswith((".csv", ".xlsx"))
         ]
+        document_attachments = [
+            attachment
+            for message in files.chat(chat_id)["messages"]
+            if message["role"] == "user"
+            for attachment in message.get("attachments", [])
+            if not attachment["name"].lower().endswith((".csv", ".xlsx"))
+        ]
+        if document_attachments and re.search(
+            r"\b(add|import|save|ingest|load|continue)\b", latest_text, re.IGNORECASE
+        ):
+            for attachment in document_attachments:
+                if not attachment["name"].lower().endswith(".docx"):
+                    continue
+                path, name = files.attachment(chat_id, attachment["id"])
+                try:
+                    extracted = _extract_attachment(name, path.read_bytes())
+                except (OSError, ValueError) as error:
+                    logger.warning("Could not refresh DOCX extraction: %s", type(error).__name__)
+                    continue
+                text_path = files.root / "evidence_text" / f"{attachment['id']}.txt"
+                if not text_path.is_file() or text_path.read_text(encoding="utf-8") != extracted:
+                    text_path.parent.mkdir(parents=True, exist_ok=True)
+                    text_path.write_text(extracted, encoding="utf-8")
         import_intent = bool(
             re.search(r"\b(add|import|save|ingest|load|continue)\b", latest_text, re.IGNORECASE)
         )
@@ -239,6 +298,7 @@ def create_app(
         )
         if (
             table_attachments
+            and not document_attachments
             and (large_table or planner is analyze)
             and (import_intent or not latest_text.strip())
         ):
@@ -248,9 +308,9 @@ def create_app(
                 files, chat_id, auto_schema=True, progress=progress
             )
             reply = (
-                f"Saved {imported} business record(s)."
+                f"Saved {imported} item{'s' if imported != 1 else ''}."
                 if imported
-                else "No new rows needed saving."
+                else "Nothing new needed saving."
             )
             if issues:
                 reply += "\n\n" + "\n".join(issues)
@@ -265,6 +325,99 @@ def create_app(
         rules = rule_listing(files, chat_id)
         if rules is not None:
             files.add_message(chat_id, "assistant", rules, "Austra")
+            files.record_event("agent.replied", "Austra", "chat", chat_id, chat_id=chat_id)
+            return {
+                "chat": files.chat(chat_id),
+                "drafts": files.drafts(chat_id),
+                "credential_requests": [],
+                "analysis_error": None,
+            }
+        earlier_user_messages = [
+            item.get("display_body", item["body"])
+            for item in files.chat(chat_id)["messages"][:-1]
+            if item["role"] == "user"
+        ]
+        if (
+            planner is analyze
+            and latest["role"] == "user"
+            and not latest.get("attachments")
+            and is_requirement_mail_request(latest_text)
+        ):
+            try:
+                plan = build_material_plan(files)
+                content = requirement_pdf(plan)
+            except ValueError as error:
+                reply = f"I couldn't prepare the requirement PDF from current records: {error}."
+                files.add_message(chat_id, "assistant", reply, "Austra")
+            else:
+                files.add_generated_attachment_message(
+                    chat_id,
+                    requirement_email(plan),
+                    "material-requirements.pdf",
+                    content,
+                )
+            files.record_event("agent.replied", "Austra", "chat", chat_id, chat_id=chat_id)
+            return {
+                "chat": files.chat(chat_id),
+                "drafts": files.drafts(chat_id),
+                "credential_requests": [],
+                "analysis_error": None,
+            }
+        verified_material_plan = None
+        if (
+            planner is analyze
+            and latest["role"] == "user"
+            and not latest.get("attachments")
+            and is_material_plan_followup(latest_text, earlier_user_messages)
+        ):
+            try:
+                if unsupported_allocation_request(latest_text):
+                    raise ValueError(
+                        "That finished-stock allocation method is not supported. "
+                        "Please use earliest requested delivery first, then order ID."
+                    )
+                plan = build_material_plan(files)
+            except ValueError as error:
+                reply = f"I couldn't verify a complete order-wise material plan: {error}."
+                files.add_message(chat_id, "assistant", reply, "Austra")
+                files.record_event("agent.replied", "Austra", "chat", chat_id, chat_id=chat_id)
+                return {
+                    "chat": files.chat(chat_id),
+                    "drafts": files.drafts(chat_id),
+                    "credential_requests": [],
+                    "analysis_error": None,
+                }
+            additions = material_plan_additions(latest_text)
+            if "other" in additions:
+                verified_material_plan = plan
+            else:
+                if "suppliers" in additions:
+                    plan = {**plan, "supplier_shortlist": supplier_shortlist(plan, files.records())}
+                reply = material_plan_reply(plan)
+                if "supplier_shortlist" in plan:
+                    reply += "\n\n" + supplier_shortlist_reply(plan["supplier_shortlist"])
+                files.add_message(
+                    chat_id,
+                    "assistant",
+                    reply,
+                    "Austra",
+                    display_body=reply.split("\n", 1)[0],
+                    report=plan,
+                )
+                files.record_event("agent.replied", "Austra", "chat", chat_id, chat_id=chat_id)
+                return {
+                    "chat": files.chat(chat_id),
+                    "drafts": files.drafts(chat_id),
+                    "credential_requests": [],
+                    "analysis_error": None,
+                }
+        allowance_question = conflicting_material_allowance(latest_text)
+        if (
+            latest["role"] == "user"
+            and allowance_question
+            and files.chat(chat_id)["source"] == "ui"
+        ):
+            files.add_message(chat_id, "assistant", allowance_question, "Austra", needs_input=True)
             files.record_event("agent.replied", "Austra", "chat", chat_id, chat_id=chat_id)
             return {
                 "chat": files.chat(chat_id),
@@ -318,7 +471,11 @@ def create_app(
         try:
             if progress:
                 progress("Analyzing request")
-            result = verification_update(files, chat_id) or planner(files, access, chat_id)
+            result = verification_update(files, chat_id) or (
+                analyze(files, access, chat_id, verified_material_plan=verified_material_plan)
+                if verified_material_plan is not None
+                else planner(files, access, chat_id)
+            )
         except AnalysisUnavailable as error:
             logger.warning("Chat analysis unavailable: %s", error)
             files.record_event(
@@ -334,7 +491,9 @@ def create_app(
             result = AgentReply(reply=str(error))
         if result.title.strip() and not files.chat(chat_id).get("title_generated"):
             files.set_chat_title(chat_id, result.title)
-        if is_rule_suggestion(latest_text) and result.rule_changes:
+        if result.needs_input:
+            result = AgentReply(reply=f"Nothing new was saved. {result.reply}", needs_input=True)
+        elif is_rule_suggestion(latest_text) and result.rule_changes:
             result.drafts.extend(
                 Draft(
                     kind="policy",
@@ -368,12 +527,32 @@ def create_app(
                     for message in files.chat(chat_id)["messages"]
                     for attachment in message.get("attachments", [])
                 )
+                table_schema_names = {
+                    record["schema"]
+                    for record in files.records()
+                    if record.get("source_attachment")
+                    in {attachment["id"] for attachment in table_attachments}
+                }
+                for attachment in table_attachments:
+                    try:
+                        table = inspect_chat_table(files, chat_id, attachment["id"])
+                    except ValueError:
+                        continue
+                    for section in table["sections"]:
+                        table_schema_names.add(section["candidate_schema"])
+                        if section["matching_schema"]:
+                            table_schema_names.add(section["matching_schema"])
                 applied = files.apply_agent_drafts(
                     chat_id,
                     [
                         draft.model_dump()
                         for draft in result.drafts
-                        if not (has_table and result.save_records and draft.kind == "record")
+                        if not (
+                            has_table
+                            and result.save_records
+                            and draft.kind == "record"
+                            and draft.name in table_schema_names
+                        )
                     ],
                     list(PLATFORM_SKILLS),
                 )
@@ -420,29 +599,46 @@ def create_app(
                     else:
                         files.retire_policy(chat_id, change.name, change.reason)
                         retired_rules += 1
-                if any(item["kind"] == "schema" for item in applied):
-                    updates.append("The business schema is ready to use.")
                 if saved_records:
-                    updates.append(f"Saved {saved_records} business record(s).")
-                elif result.save_records and not issues and has_table:
-                    updates.append("No new rows needed saving.")
+                    saved_document_records = [item for item in applied if item["kind"] == "record"]
+                    label = (
+                        "sales order"
+                        if document_attachments
+                        and len(saved_document_records) == saved_records
+                        and all("sales_order" in item["name"] for item in saved_document_records)
+                        and all(
+                            "sales_order" in item["name"].lower() for item in document_attachments
+                        )
+                        else "item"
+                    )
+                    updates.append(
+                        f"Saved {saved_records} {label}{'s' if saved_records != 1 else ''}."
+                    )
+                elif result.save_records and not issues and has_table and not document_attachments:
+                    updates.append("Nothing new needed saving.")
                 if updated_records:
-                    updates.append(f"Updated {updated_records} business record(s).")
+                    updates.append(
+                        f"Updated {updated_records} item{'s' if updated_records != 1 else ''}."
+                    )
                 if activated_rules:
-                    updates.append(f"Activated {activated_rules} business rule(s).")
+                    updates.append(
+                        f"Saved {activated_rules} rule{'s' if activated_rules != 1 else ''}."
+                    )
                 if retired_rules:
-                    updates.append(f"Retired {retired_rules} business rule(s).")
+                    updates.append(
+                        f"Removed {retired_rules} rule{'s' if retired_rules != 1 else ''}."
+                    )
                 if removed_records:
                     updates.append(
-                        f"Removed {removed_records} business record(s) from active data. "
-                        "Audit copies are retained."
+                        f"Removed {removed_records} item{'s' if removed_records != 1 else ''}. "
+                        "Earlier versions remain in the history."
                     )
                 elif any(change.action == "delete" for change in result.record_changes):
                     updates.append("No matching active records remained to remove.")
                 updates.extend(issues)
                 if updates:
-                    result.reply = f"{result.reply}\n\n{' '.join(updates)}"
-            except ValueError as error:
+                    result.reply = f"{' '.join(updates)}\n\n{result.reply}"
+            except (TypeError, ValueError) as error:
                 files.record_event(
                     "agent.draft_rejected",
                     "Austra",
@@ -452,9 +648,76 @@ def create_app(
                     skills_used=list(PLATFORM_SKILLS),
                     outcome="failed",
                 )
-                analysis_error = str(error)
-                result = AgentReply(reply=f"I could not save the data: {error}")
-        files.add_message(chat_id, "assistant", result.reply, "Austra")
+                result = AgentReply(
+                    reply=(
+                        "I couldn't finish saving this request because it conflicts with "
+                        "information already stored. Please tell me which details should be used."
+                        if "schema" in str(error).casefold()
+                        else "I couldn't finish saving this request. Please check the details and try again."
+                    )
+                )
+                analysis_error = result.reply
+        if result.external_calls:
+            if files.chat(chat_id)["source"] != "ui" or latest.get("sender") != "Admin":
+                result.reply += "\n\nExternal actions require an administrator chat in the app."
+            else:
+                outcomes = []
+                call_dir = files.root / "external_calls"
+                call_dir.mkdir(exist_ok=True)
+                for call in result.external_calls:
+                    try:
+                        arguments = json.loads(call.arguments_json)
+                        if not isinstance(arguments, dict):
+                            raise TypeError("Tool arguments must be a JSON object")
+                        identity = (
+                            f"{latest['id']}:{call.connection}:{call.tool}:{call.arguments_json}"
+                        )
+                        marker = call_dir / hashlib.sha256(identity.encode()).hexdigest()
+                        try:
+                            marker.open("x").close()
+                        except FileExistsError:
+                            outcomes.append(f"{call.connection}.{call.tool}: already requested")
+                            continue
+                        response = mcp_connections.call(call.connection, call.tool, arguments)
+                        details = json.dumps(response, ensure_ascii=False, default=str)[:2000]
+                        if SECRET_PATTERN.search(details):
+                            details = "Completed; sensitive output omitted"
+                        outcomes.append(f"{call.connection}.{call.tool}: {details}")
+                        files.record_event(
+                            "mcp.tool_called",
+                            "Admin",
+                            "connector",
+                            call.connection,
+                            chat_id=chat_id,
+                            details={"tool": call.tool},
+                        )
+                    except (ExternalToolError, KeyError, TypeError, ValueError) as error:
+                        outcomes.append(f"{call.connection}.{call.tool}: failed ({error})")
+                        files.record_event(
+                            "mcp.tool_failed",
+                            "Admin",
+                            "connector",
+                            call.connection,
+                            chat_id=chat_id,
+                            details={"tool": call.tool},
+                            outcome="failed",
+                        )
+                result.reply += "\n\n" + "\n".join(outcomes)
+        if verified_material_plan is not None and result.decision == "allow":
+            extension = result.reply
+            result.reply = material_plan_reply(verified_material_plan) + "\n\n" + extension
+            verified_material_plan = {**verified_material_plan, "extension": extension}
+        visualize = bool(markdown_tables(result.reply))
+        files.add_message(
+            chat_id,
+            "assistant",
+            result.reply,
+            "Austra",
+            needs_input=result.needs_input,
+            display_body=table_summary(result.reply) if visualize else None,
+            visualize=visualize,
+            report=verified_material_plan,
+        )
         files.record_event(
             "agent.replied",
             "Austra",
@@ -557,9 +820,11 @@ def create_app(
 
     @app.get("/api/config")
     def config(request: Request) -> dict[str, Any]:
+        session = request.cookies.get(SESSION_COOKIE)
         return {
             "admin_ready": access.ready,
-            "authenticated": access.authenticated(request.cookies.get(SESSION_COOKIE)),
+            "authenticated": access.authenticated(session),
+            "session_seconds_remaining": access.session_seconds_remaining(session),
             "connectors": access.configured(),
             "guides": GUIDES,
             "missing": {name: access.missing(name) for name in CONNECTORS},
@@ -579,7 +844,9 @@ def create_app(
                 "admin.setup_failed", "unknown", "access", "administrator", outcome="failed"
             )
             raise HTTPException(status_code=400, detail=str(error)) from error
-        response.set_cookie(SESSION_COOKIE, session, httponly=True, samesite="strict")
+        response.set_cookie(
+            SESSION_COOKIE, session, httponly=True, samesite="strict", max_age=SESSION_TTL_SECONDS
+        )
         files.record_event("admin.setup", "Admin", "access", "administrator")
         return {"authenticated": True}
 
@@ -592,7 +859,9 @@ def create_app(
                 "admin.login_failed", "unknown", "access", "administrator", outcome="failed"
             )
             raise HTTPException(status_code=401, detail=str(error)) from error
-        response.set_cookie(SESSION_COOKIE, session, httponly=True, samesite="strict")
+        response.set_cookie(
+            SESSION_COOKIE, session, httponly=True, samesite="strict", max_age=SESSION_TTL_SECONDS
+        )
         files.record_event("admin.login", "Admin", "access", "administrator")
         return {"authenticated": True}
 
@@ -644,6 +913,59 @@ def create_app(
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
         files.record_event("connection.tested", "Admin", "connector", connector)
         return {"connected": True}
+
+    @app.get("/api/mcp/connections", dependencies=[Depends(require_admin)])
+    def list_mcp_connections() -> dict[str, dict[str, Any]]:
+        return mcp_connections.list()
+
+    @app.post("/api/mcp/connections", dependencies=[Depends(require_admin)])
+    def add_mcp_connection(payload: McpConnectionInput) -> dict[str, Any]:
+        try:
+            result = mcp_connections.add(payload.name, payload.url, payload.token)
+        except (ExternalToolError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        files.record_event("mcp.connection_added", "Admin", "connector", payload.name)
+        return result
+
+    @app.post("/api/mcp/connections/{name}/test", dependencies=[Depends(require_admin)])
+    def test_mcp_connection(name: str) -> dict[str, Any]:
+        try:
+            result = mcp_connections.test(name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="MCP connection not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except ExternalToolError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        files.record_event("mcp.connection_tested", "Admin", "connector", name)
+        return result
+
+    @app.post(
+        "/api/mcp/connections/{name}/tools/{tool_name}",
+        dependencies=[Depends(require_admin)],
+    )
+    def call_mcp_tool(name: str, tool_name: str, payload: McpToolInput) -> dict[str, Any]:
+        try:
+            result = mcp_connections.call(name, tool_name, payload.arguments)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="MCP connection not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except ExternalToolError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        files.record_event(
+            "mcp.tool_called", "Admin", "connector", name, details={"tool": tool_name}
+        )
+        return result
+
+    @app.delete("/api/mcp/connections/{name}", dependencies=[Depends(require_admin)])
+    def remove_mcp_connection(name: str) -> dict[str, bool]:
+        try:
+            mcp_connections.remove(name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="MCP connection not found") from error
+        files.record_event("mcp.connection_removed", "Admin", "connector", name)
+        return {"removed": True}
 
     @app.post("/api/connections/gmail/start", dependencies=[Depends(require_admin)])
     def start_gmail_connection(request: Request) -> dict[str, str]:
@@ -719,6 +1041,22 @@ def create_app(
             return {"chat": files.chat(chat_id), "drafts": files.drafts(chat_id)}
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Chat not found") from error
+
+    @app.get("/api/ui/chats/{chat_id}", dependencies=[Depends(require_admin)])
+    def get_chat_ui(chat_id: str) -> dict[str, Any]:
+        try:
+            return {"surfaces": chat_surfaces(files, chat_id)}
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Chat not found") from error
+
+    @app.get("/api/ui/workspace", dependencies=[Depends(require_admin)])
+    def get_workspace_ui(section: str = "records", offset: int = 0) -> dict[str, Any]:
+        if offset < 0:
+            raise HTTPException(status_code=400, detail="Offset must be non-negative")
+        try:
+            return workspace_page(files, section, offset)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get(
         "/api/chats/{chat_id}/attachments/{attachment_id}", dependencies=[Depends(require_admin)]
@@ -876,18 +1214,16 @@ def create_app(
         if not token:
             return
         try:
-            response = httpx.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
+            posted = call_external(
+                "slack_post_message",
+                {
                     "channel": channel,
                     "thread_ts": thread_ts,
                     "text": result["chat"]["messages"][-1]["body"],
                 },
-                timeout=15,
+                {"SLACK_BOT_TOKEN": token},
             )
-            response.raise_for_status()
-            if not response.json().get("ok"):
+            if not posted.get("ok"):
                 logger.warning("Slack did not accept the reply")
                 files.record_event(
                     "connection.reply_failed",
@@ -901,7 +1237,7 @@ def create_app(
                 files.record_event(
                     "connection.reply_sent", "Austra", "connector", "slack", chat_id=chat_id
                 )
-        except (httpx.HTTPError, ValueError):
+        except ExternalToolError:
             logger.exception("Slack reply failed")
             files.record_event(
                 "connection.reply_failed",

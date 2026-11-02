@@ -30,6 +30,38 @@ def _schema_for_headers(files: Files, headers: list[str]) -> dict[str, Any] | No
     return min(candidates, key=lambda entry: entry[0])[1] if candidates else None
 
 
+def _schema_for_source(
+    files: Files, attachment_id: str, section: str, headers: list[str]
+) -> dict[str, Any] | None:
+    previous = next(
+        (
+            record
+            for record in files.records()
+            if record.get("source_attachment") == attachment_id
+            and record.get("source_section", "") == section
+        ),
+        None,
+    )
+    if previous is None:
+        return None
+    schema_item = next(
+        (
+            item
+            for item in files.approved()
+            if item["kind"] == "schema" and item["name"] == previous["schema"]
+        ),
+        None,
+    )
+    if schema_item is None:
+        return None
+    schema = json.loads(schema_item["content"])
+    properties = set(schema.get("properties", {}))
+    required = set(schema.get("required", [])) - {"provenance"}
+    if set(headers).issubset(properties) and required.issubset(headers):
+        return schema_item
+    return None
+
+
 def _schema_name(filename: str, section: str) -> str:
     stem = section or filename.rsplit(".", 1)[0]
     name = re.sub(r"[^a-z0-9]+", "_", stem.lower()).strip("_")
@@ -268,7 +300,9 @@ def import_chat_tables(
                     raise ValueError(f"{section or filename}: empty or too many rows")
                 if not all(headers) or len(set(headers)) != len(headers):
                     raise ValueError(f"{section or filename}: invalid column names")
-                schema_item = _schema_for_headers(files, headers)
+                schema_item = _schema_for_source(files, digest, section, headers)
+                if schema_item is None:
+                    schema_item = _schema_for_headers(files, headers)
                 if schema_item is None:
                     if not auto_schema:
                         issues.append(f"{filename}: no schema matches {section or 'the columns'}")

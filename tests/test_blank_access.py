@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from austra.access import Access
@@ -21,6 +23,17 @@ def test_admin_setup_and_private_credentials(tmp_path):
     assert "sample-local-key" not in (tmp_path / "admin.json").read_text(encoding="utf-8")
     access.logout(session)
     assert not access.authenticated(session)
+
+
+def test_administrator_session_expires_and_is_removed(tmp_path):
+    access = Access(tmp_path)
+    session = access.setup("long private passphrase")
+    assert access.session_seconds_remaining(session) > 0
+    access.sessions[session] = datetime.now(UTC) - timedelta(seconds=1)
+
+    assert not access.authenticated(session)
+    assert access.session_seconds_remaining(session) == 0
+    assert session not in access.sessions
 
 
 def test_credentials_reject_arbitrary_names_and_multiline_values(tmp_path):

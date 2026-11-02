@@ -66,6 +66,20 @@ def test_first_run_chat_review_and_authentication(tmp_path):
     assert client.get(f"/api/chats/{chat_id}").json()["chat"]["messages"][0]["role"] == "user"
 
 
+def test_logout_invalidates_session_and_reports_no_time_remaining(tmp_path):
+    client = TestClient(create_app(tmp_path, planner=planner))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    config = client.get("/api/config").json()
+    assert config["authenticated"] is True
+    assert config["session_seconds_remaining"] > 0
+
+    assert client.post("/api/logout").json() == {"authenticated": False}
+    config = client.get("/api/config").json()
+    assert config["authenticated"] is False
+    assert config["session_seconds_remaining"] == 0
+    assert client.get("/api/chats").status_code == 401
+
+
 def test_admin_chat_can_remove_records_without_separate_approval(tmp_path):
     files = Files(tmp_path)
     source = files.create_chat("Add stock", "Admin")
@@ -99,11 +113,86 @@ def test_admin_chat_can_remove_records_without_separate_approval(tmp_path):
     response = client.post("/api/chats", json={"body": "Remove all records added by mistake"})
 
     assert response.status_code == 201
-    assert "Removed 1 business record" in response.json()["chat"]["messages"][-1]["body"]
+    assert "Removed 1 item" in response.json()["chat"]["messages"][-1]["body"]
     assert client.get("/api/records").json() == []
     archived = client.get("/api/audit/records").json()
     assert len(archived) == 1
     assert archived[0]["deleted_at"]
+
+
+def test_chat_saves_record_without_requesting_schema_approval(tmp_path):
+    quantities = [
+        {
+            "purity": "6N",
+            "quartzite_t": 2.89,
+            "charcoal_t": 0.84,
+            "petroleum_coke_t": 0.52,
+            "mg_si_powder_t": 1.16,
+            "hcl_ideal_t": 4.22,
+            "hydrogen_ideal_kg": 74,
+        },
+        {
+            "purity": "9N",
+            "quartzite_t": 3.05,
+            "charcoal_t": 0.88,
+            "petroleum_coke_t": 0.54,
+            "mg_si_powder_t": 1.22,
+            "hcl_ideal_t": 4.45,
+            "hydrogen_ideal_kg": 76,
+        },
+        {
+            "purity": "11N",
+            "quartzite_t": 3.36,
+            "charcoal_t": 0.97,
+            "petroleum_coke_t": 0.60,
+            "mg_si_powder_t": 1.35,
+            "hcl_ideal_t": 4.91,
+            "hydrogen_ideal_kg": 80,
+        },
+    ]
+
+    def save_quantities(_files, _access, _chat_id):
+        return AgentReply(
+            reply="I saved the material quantities per tonne of polysilicon.",
+            save_records=True,
+            drafts=[
+                Draft(
+                    kind="record",
+                    name="polysilicon_materials",
+                    summary=f"Materials for {row['purity']} polysilicon",
+                    content=json.dumps(row),
+                )
+                for row in quantities
+            ],
+        )
+
+    client = TestClient(create_app(tmp_path, planner=save_quantities))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+
+    response = client.post(
+        "/api/chats",
+        json={"body": "Here are the raw materials needed per tonne for 6N, 9N, and 11N."},
+    )
+
+    assert response.status_code == 201
+    assert "Saved 3 items." in response.json()["chat"]["messages"][-1]["body"]
+    assert "could not save" not in response.json()["chat"]["messages"][-1]["body"]
+    assert len(client.get("/api/records").json()) == 3
+    assert {record["values"]["purity"] for record in client.get("/api/records").json()} == {
+        "6N",
+        "9N",
+        "11N",
+    }
+    schema = json.loads((tmp_path / "approved/schema/polysilicon_materials/v1.json").read_text())
+    assert schema["properties"]["quartzite_t"] == {"type": "number"}
+    assert all(draft["status"] == "approved" for draft in response.json()["drafts"])
+
+    repeated = client.post(
+        f"/api/chats/{response.json()['chat']['id']}/messages",
+        json={"body": "Keep those figures on file."},
+    )
+    assert repeated.status_code == 200
+    assert len(client.get("/api/records").json()) == 3
 
 
 def test_private_credential_endpoint_and_secret_free_responses(tmp_path):

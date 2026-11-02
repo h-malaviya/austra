@@ -64,6 +64,58 @@ def test_admin_unit_instruction_activates_markdown_rule_and_converts_display_onl
     )
 
 
+def test_conflicting_material_buffer_asks_which_value_to_use(tmp_path):
+    def no_model(_files, _access, _chat_id):
+        raise AssertionError("A clear numerical conflict needs a direct question")
+
+    client = TestClient(create_app(tmp_path, planner=no_model))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+
+    response = client.post(
+        "/api/chats",
+        json={
+            "body": "Always keep +3-5% material wastage in calculation for 1 ton raw material "
+            "costing; 1.005 ton was my example."
+        },
+    )
+
+    assert response.status_code == 201
+    reply = response.json()["chat"]["messages"][-1]["body"]
+    assert "3–5%" in reply
+    assert "0.5%" in reply
+    assert "Which buffer should I use" in reply
+    assert client.get("/api/rules").json() == []
+
+
+def test_clear_material_costing_buffer_reaches_rule_planner(tmp_path):
+    def planner(_files, _access, _chat_id):
+        return AgentReply(
+            reply="The costing buffer is set.",
+            rule_changes=[
+                RuleChange(
+                    action="activate",
+                    name="raw_material_costing_buffer",
+                    content="# Raw material costing buffer\n\nApply a 5% allowance (factor 1.05).",
+                    reason="Administrator set the material costing allowance",
+                )
+            ],
+        )
+
+    client = TestClient(create_app(tmp_path, planner=planner))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+
+    response = client.post(
+        "/api/chats",
+        json={"body": "Always add 5% wastage to raw material costing: 1 ton becomes 1.05 tons."},
+    )
+
+    assert response.status_code == 201
+    assert "Saved 1 rule" in response.json()["chat"]["messages"][-1]["body"]
+    assert [rule["name"] for rule in client.get("/api/rules").json()] == [
+        "raw_material_costing_buffer"
+    ]
+
+
 def test_explicit_rule_change_activates_and_retires_separate_policy(tmp_path):
     def planner(files, _access, chat_id):
         message = files.chat(chat_id)["messages"][-1]["body"]
@@ -83,10 +135,10 @@ def test_explicit_rule_change_activates_and_retires_separate_policy(tmp_path):
     client = TestClient(create_app(tmp_path, planner=planner))
     client.post("/api/setup", json={"password": "long private passphrase"})
     added = client.post("/api/chats", json={"body": "Set an inventory update rule"})
-    assert "Activated 1 business rule" in added.json()["chat"]["messages"][-1]["body"]
+    assert "Saved 1 rule" in added.json()["chat"]["messages"][-1]["body"]
     assert len(client.get("/api/rules").json()) == 1
     removed = client.post("/api/chats", json={"body": "Remove that inventory update rule"})
-    assert "Retired 1 business rule" in removed.json()["chat"]["messages"][-1]["body"]
+    assert "Removed 1 rule" in removed.json()["chat"]["messages"][-1]["body"]
     assert client.get("/api/rules").json() == []
     assert (tmp_path / "approved/policy/inventory_updates/v1.md").exists()
 
@@ -152,7 +204,7 @@ def test_clear_admin_verification_command_updates_contextual_schema_without_evid
         "/api/messages",
         data={"chat_id": chat["id"], "body": "Update all records to verified; I got a QA report"},
     )
-    assert "Updated 1 business record" in result.json()["chat"]["messages"][-1]["body"]
+    assert "Updated 1 item" in result.json()["chat"]["messages"][-1]["body"]
     assert files.records()[0]["values"]["verification_status"] == "verified"
     assert len(list((tmp_path / "record_history").glob("*/*/*.json"))) == 1
 

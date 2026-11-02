@@ -3,7 +3,12 @@ import json
 from fastapi.testclient import TestClient
 
 from austra.files import Files
-from austra.reports import is_stock_request, stock_report
+from austra.reports import (
+    has_stock_order_table,
+    is_stock_order_report_request,
+    is_stock_request,
+    stock_report,
+)
 from austra.tools import ReadTools
 from austra.web import create_app
 
@@ -46,6 +51,21 @@ def test_stock_request_routes_only_unfiltered_stock_lists():
     assert is_stock_request("shoe me current tock")
     assert not is_stock_request("show me stock for supplier A")
     assert not is_stock_request("add these in stock")
+
+
+def test_stock_order_report_request_and_table_shape():
+    assert is_stock_order_report_request("Analyze current stock against open sales orders")
+    assert is_stock_order_report_request("What is available and what must we purchase for open SO?")
+    assert not is_stock_order_report_request("Compare stock with purchase orders")
+    assert not is_stock_order_report_request(
+        "Draft mail with PDF of requirements using latest stock and open orders"
+    )
+    assert not has_stock_order_table("placeholder")
+    assert has_stock_order_table(
+        "| Order | Requested | Available | Shortfall | Purchase needed |\n"
+        "| --- | ---: | ---: | ---: | ---: |\n"
+        "| SO-1 | 10 kg | 8 kg | 2 kg | 2 kg |"
+    )
 
 
 def test_stock_query_uses_saved_records_without_model_omissions(tmp_path):

@@ -4,16 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Austra · Blank workspace</title>
-  <link rel="stylesheet" href="/static/app.css?v=11">
+  <link rel="stylesheet" href="/static/app.css?v=17">
 </head>
 <body>
-  <div class="app-shell">
+  <div class="app-shell" id="appShell">
     <aside class="sidebar" id="sidebar" aria-label="Conversations">
       <div class="brand"><span class="brand-mark">A</span><span>Austra<small>Business workspace</small></span></div>
       <button class="new-chat" id="newChat" type="button">＋ New chat</button>
       <div class="sidebar-label">YOUR CHATS</div>
       <nav class="chat-list" id="chatList" aria-label="Previous chats"></nav>
       <div class="sidebar-bottom">
+        <button class="side-action" id="workspaceButton" type="button">Workspace <span>↗</span></button>
         <button class="side-action" id="infrastructureButton" type="button">Infrastructure <span>↗</span></button>
         <button class="side-action" id="connectionsButton" type="button">Connections <span>↗</span></button>
         <button class="side-action" id="logoutButton" type="button">Sign out <span>↗</span></button>
@@ -50,8 +51,18 @@
         <section class="connection-detail" id="connectionDetail" aria-live="polite"></section>
       </div>
     </main>
+    <main class="workspace-page" id="workspacePage" hidden>
+      <header class="connections-header">
+        <div><span class="eyebrow">YOUR WORKSPACE</span><h1>Workspace</h1><p>Browse saved items, proposed changes, and activity.</p></div>
+        <button class="top-action" id="workspaceBack" type="button">← Back to chat</button>
+      </header>
+      <nav class="workspace-tabs" id="workspaceTabs" aria-label="Workspace sections"></nav>
+      <div class="workspace-content" id="workspaceContent" aria-live="polite"></div>
+      <div class="workspace-pagination" id="workspacePagination"></div>
+    </main>
   </div>
   <script src="/static/markdown.js?v=8" defer></script>
-  <script src="/static/app.js?v=12" defer></script>
+  <script src="/static/a2ui.bundle.js?v=3" defer></script>
+  <script src="/static/app.js?v=16" defer></script>
 </body>
 </html>

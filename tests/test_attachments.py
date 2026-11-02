@@ -1,11 +1,14 @@
 import hashlib
+import io
+import json
 import threading
 import time
 
+from docx import Document
 from fastapi.testclient import TestClient
 
-from austra.agent import AgentReply
-from austra.web import create_app
+from austra.agent import AgentReply, Draft
+from austra.web import _extract_attachment, create_app
 
 
 def test_multi_file_submission_analyzes_once_and_skips_reuploads(tmp_path):
@@ -80,6 +83,246 @@ def test_file_only_submission_and_duplicate_in_same_batch(tmp_path):
     assert result["chat"]["messages"][0]["display_body"] == ""
     assert len(result["chat"]["messages"][0]["attachments"]) == 1
     assert (tmp_path / "evidence" / hashlib.sha256(content).hexdigest()).exists()
+
+
+def test_docx_extraction_keeps_table_values_in_document_order():
+    document = Document()
+    document.add_paragraph("Order details")
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Quantity"
+    table.cell(0, 1).text = "Unit price"
+    table.cell(1, 0).text = "14,000 kg"
+    table.cell(1, 1).text = "USD 17.50/kg"
+    document.add_paragraph("Delivery pending")
+    content = io.BytesIO()
+    document.save(content)
+
+    extracted = _extract_attachment("order.docx", content.getvalue())
+
+    assert extracted.splitlines() == [
+        "Order details",
+        "Quantity\tUnit price",
+        "14,000 kg\tUSD 17.50/kg",
+        "Delivery pending",
+    ]
+
+
+def test_conflicting_order_details_ask_one_question_and_save_nothing(tmp_path):
+    def planner(_files, _access, _chat_id):
+        return AgentReply(
+            reply="The order lists USD 17 and USD 18 per kg. Which price should I use?",
+            needs_input=True,
+            save_records=True,
+            drafts=[
+                Draft(
+                    kind="record",
+                    name="sales_order",
+                    summary="Incomplete order",
+                    content='{"order_id":"DOC-3"}',
+                )
+            ],
+        )
+
+    client = TestClient(create_app(tmp_path, planner=planner))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+
+    response = client.post(
+        "/api/messages",
+        data={"body": "Add this sales order"},
+        files=[("uploads", ("sales_order.txt", b"Order DOC-3", "text/plain"))],
+    )
+
+    assert response.status_code == 200
+    reply = response.json()["chat"]["messages"][-1]["body"]
+    assert reply.startswith("Nothing new was saved.")
+    assert "Which price should I use?" in reply
+    assert client.get("/api/records").json() == []
+
+
+def test_saved_orders_are_reported_without_storage_terms(tmp_path):
+    def planner(_files, _access, _chat_id):
+        return AgentReply(
+            reply="Both orders are on file.",
+            save_records=True,
+            drafts=[
+                Draft(
+                    kind="record",
+                    name="sales_order",
+                    summary=f"Order {order_id}",
+                    content=json.dumps({"order_id": order_id}),
+                )
+                for order_id in ("SO-201", "SO-202")
+            ],
+        )
+
+    client = TestClient(create_app(tmp_path, planner=planner))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+
+    response = client.post(
+        "/api/messages",
+        data={"body": "Add these sales orders"},
+        files=[
+            ("uploads", ("sales_order_201.txt", b"Order SO-201", "text/plain")),
+            ("uploads", ("sales_order_202.txt", b"Order SO-202", "text/plain")),
+        ],
+    )
+
+    assert response.status_code == 200
+    reply = response.json()["chat"]["messages"][-1]["body"]
+    assert "Saved 2 sales orders." in reply
+    assert "schema" not in reply.casefold()
+
+
+def test_mixed_csv_and_documents_save_every_order(tmp_path, monkeypatch):
+    monkeypatch.setattr("austra.web.extract_pdf_text", lambda _content: "Order PDF-1")
+    document = Document()
+    document.add_paragraph("Order DOC-1")
+    content = io.BytesIO()
+    document.save(content)
+    calls = []
+
+    def planner(_files, _access, chat_id):
+        calls.append(chat_id)
+        return AgentReply(
+            reply="Orders processed.",
+            save_records=True,
+            drafts=[
+                Draft(
+                    kind="schema",
+                    name="document_order",
+                    summary="Document orders",
+                    content=json.dumps(
+                        {"type": "object", "properties": {"order_id": {"type": "string"}}}
+                    ),
+                ),
+                *[
+                    Draft(
+                        kind="record",
+                        name="document_order",
+                        summary="Document order",
+                        content=json.dumps({"order_id": order_id}),
+                    )
+                    for order_id in ("DOC-1", "PDF-1")
+                ],
+            ],
+        )
+
+    client = TestClient(create_app(tmp_path, planner=planner))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    result = client.post(
+        "/api/messages",
+        data={"body": "Add these orders"},
+        files=[
+            ("uploads", ("one.csv", b"order_id\nCSV-1\n", "text/csv")),
+            (
+                "uploads",
+                (
+                    "two.docx",
+                    content.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ),
+            ),
+            ("uploads", ("three.pdf", b"pdf placeholder", "application/pdf")),
+        ],
+    ).json()
+
+    assert len(calls) == 1
+    assert "Saved 3 items" in result["chat"]["messages"][-1]["body"]
+    assert {record["values"]["order_id"] for record in client.get("/api/records").json()} == {
+        "CSV-1",
+        "DOC-1",
+        "PDF-1",
+    }
+
+
+def test_followup_add_in_mixed_chat_reaches_document_planner(tmp_path):
+    calls = []
+
+    def planner(_files, _access, chat_id):
+        calls.append(chat_id)
+        if len(calls) == 1:
+            return AgentReply(reply="Table imported.", save_records=True)
+        return AgentReply(
+            reply="Document imported.",
+            save_records=True,
+            drafts=[
+                Draft(
+                    kind="schema",
+                    name="document_order",
+                    summary="Document order",
+                    content=json.dumps(
+                        {"type": "object", "properties": {"order_id": {"type": "string"}}}
+                    ),
+                ),
+                Draft(
+                    kind="record",
+                    name="document_order",
+                    summary="Document order",
+                    content='{"order_id":"DOC-1"}',
+                ),
+            ],
+        )
+
+    client = TestClient(create_app(tmp_path, planner=planner))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    first = client.post(
+        "/api/messages",
+        data={"body": "Add these"},
+        files=[
+            ("uploads", ("one.csv", b"order_id\nCSV-1\n", "text/csv")),
+            ("uploads", ("two.txt", b"Order DOC-1", "text/plain")),
+        ],
+    ).json()
+    assert len(client.get("/api/records").json()) == 1
+
+    followup = client.post(
+        f"/api/chats/{first['chat']['id']}/messages", json={"body": "add it"}
+    ).json()
+
+    assert len(calls) == 2
+    assert "Saved 1 item" in followup["chat"]["messages"][-1]["body"]
+    assert {record["values"]["order_id"] for record in client.get("/api/records").json()} == {
+        "CSV-1",
+        "DOC-1",
+    }
+
+
+def test_followup_refreshes_old_docx_text_cache(tmp_path):
+    document = Document()
+    document.add_paragraph("Order DOC-1")
+    table = document.add_table(rows=1, cols=2)
+    table.cell(0, 0).text = "Unit price"
+    table.cell(0, 1).text = "USD 17.50/kg"
+    content = io.BytesIO()
+    document.save(content)
+    extracted_text = []
+
+    def planner(files, _access, chat_id):
+        digest = files.chat(chat_id)["messages"][0]["attachments"][0]["id"]
+        extracted_text.append(
+            (files.root / "evidence_text" / f"{digest}.txt").read_text(encoding="utf-8")
+        )
+        return AgentReply(reply="Reviewed")
+
+    client = TestClient(create_app(tmp_path, planner=planner))
+    client.post("/api/setup", json={"password": "long private passphrase"})
+    first = client.post(
+        "/api/messages",
+        data={"body": "Review this order"},
+        files={
+            "uploads": (
+                "order.docx",
+                content.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    ).json()
+    digest = first["chat"]["messages"][0]["attachments"][0]["id"]
+    (tmp_path / "evidence_text" / f"{digest}.txt").write_text("Order DOC-1", encoding="utf-8")
+
+    client.post(f"/api/chats/{first['chat']['id']}/messages", json={"body": "add it"})
+
+    assert "USD 17.50/kg" in extracted_text[-1]
 
 
 def test_invalid_attachment_batch_does_not_create_chat_or_evidence(tmp_path):

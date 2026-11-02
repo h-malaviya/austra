@@ -11,6 +11,15 @@ STOCK_REQUEST = re.compile(
     r"(?:stock|tock|inventory)(?:\s+(?:lots|records|on\s+record))?[?.!\s]*",
     re.IGNORECASE,
 )
+STOCK_ORDER_TERMS = re.compile(r"\b(?:sales\s+orders?|open\s+orders?|sos?)\b", re.IGNORECASE)
+STOCK_SUPPLY_TERMS = re.compile(
+    r"\b(?:stock|inventory|available|purchase|procure|fulfill|fulfil|match)\b",
+    re.IGNORECASE,
+)
+STOCK_REPORT_TERMS = re.compile(
+    r"\b(?:analy[sz]e|compare|report|result|need|purchase|procure|fulfill|fulfil|match)\b",
+    re.IGNORECASE,
+)
 PREFERRED_COLUMNS = (
     "lot_id",
     "verification_status",
@@ -73,11 +82,45 @@ def is_stock_request(message: str) -> bool:
     return STOCK_REQUEST.fullmatch(message.strip()) is not None
 
 
+def is_stock_order_report_request(message: str) -> bool:
+    if re.search(
+        r"\b(?:draft|compose|write|send)\b.{0,100}\b(?:mail|email)\b", message, re.IGNORECASE
+    ):
+        return False
+    if re.search(r"\b(?:mail|email)\b.{0,100}\b(?:draft|pdf|attachment)\b", message, re.IGNORECASE):
+        return False
+    return bool(
+        STOCK_ORDER_TERMS.search(message)
+        and STOCK_SUPPLY_TERMS.search(message)
+        and STOCK_REPORT_TERMS.search(message)
+    )
+
+
+def has_stock_order_table(reply: str) -> bool:
+    if "placeholder" in reply.casefold():
+        return False
+    lines = [line.strip() for line in reply.splitlines()]
+    if not any(re.search(r"\|\s*:?-{3,}", line) for line in lines):
+        return False
+    table_lines = [line for line in lines if line.count("|") >= 2]
+    if len(table_lines) < 3:
+        return False
+    header = table_lines[0].casefold()
+    return (
+        "order" in header
+        and any(word in header for word in ("request", "demand", "needed", "required"))
+        and any(word in header for word in ("available", "stock"))
+        and any(word in reply.casefold() for word in ("purchase", "procure", "shortfall", "gap"))
+    )
+
+
 def requested_stock_unit(message: str) -> str | None:
     text = message.casefold()
     if not re.search(r"\b(?:from now on|going forward|always|underlying)\b", text):
         return None
-    if not re.search(r"\b(?:show|display|present|see|calculate)\b", text):
+    if not re.search(r"\b(?:show|display|present|see)\b", text):
+        return None
+    if not re.search(r"\b(?:stock|inventory)\b", text):
         return None
     if re.search(r"\b(?:metric\s+tons?|tonnes?|tons?)\b", text):
         return "t"

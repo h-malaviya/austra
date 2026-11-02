@@ -48,7 +48,7 @@ def test_csv_stock_is_saved_without_schema_approval_and_is_idempotent(tmp_path):
         "/api/messages", files={"uploads": ("stock.csv", content, "text/csv")}
     ).json()
 
-    assert "Saved 2 business record(s)" in first["chat"]["messages"][-1]["body"]
+    assert "Saved 2 items" in first["chat"]["messages"][-1]["body"]
     assert first["drafts"][0]["status"] == "approved"
     assert len(client.get("/api/records").json()) == 2
     assert client.get("/api/records").json()[0]["values"]["data_origin"] == "synthetic_demo"
@@ -117,7 +117,7 @@ def test_xlsx_stock_rows_are_imported(tmp_path):
         },
     ).json()
 
-    assert "Saved 1 business record(s)" in result["chat"]["messages"][-1]["body"]
+    assert "Saved 1 item" in result["chat"]["messages"][-1]["body"]
     assert client.get("/api/records").json()[0]["values"]["on_hand_kg"] == 9
 
 
@@ -158,7 +158,7 @@ def test_large_tables_create_distinct_schemas_and_import_without_model(tmp_path)
         ],
     )
     assert first.status_code == 200
-    assert "Saved 3 business record(s)" in first.json()["chat"]["messages"][-1]["body"]
+    assert "Saved 3 items" in first.json()["chat"]["messages"][-1]["body"]
     records = client.get("/api/records").json()
     assert {record["schema"] for record in records} == {
         "historical_purchase_order",
@@ -178,7 +178,7 @@ def test_large_tables_create_distinct_schemas_and_import_without_model(tmp_path)
     )
     chat_id = first.json()["chat"]["id"]
     again = client.post(f"/api/chats/{chat_id}/messages", json={"body": "continue"})
-    assert "No new rows needed saving" in again.json()["chat"]["messages"][-1]["body"]
+    assert "Nothing new needed saving" in again.json()["chat"]["messages"][-1]["body"]
     assert len(client.get("/api/records").json()) == 3
 
     corrected = purchase.replace(notes.encode(), f"{notes} corrected".encode())
@@ -187,7 +187,7 @@ def test_large_tables_create_distinct_schemas_and_import_without_model(tmp_path)
         data={"chat_id": chat_id, "body": "Add corrected data"},
         files={"uploads": ("historical_purchase_orders.csv", corrected, "text/csv")},
     )
-    assert "Saved 1 business record(s)" in update.json()["chat"]["messages"][-1]["body"]
+    assert "Saved 1 item" in update.json()["chat"]["messages"][-1]["body"]
     assert len(client.get("/api/records").json()) == 3
     assert (
         len(list((tmp_path / "record_history" / "historical_purchase_order").glob("*/*.json"))) == 1

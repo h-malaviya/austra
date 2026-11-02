@@ -2,7 +2,6 @@ import asyncio
 import json
 from urllib.parse import parse_qs, urlsplit
 
-import httpx
 from fastapi.testclient import TestClient
 
 from austra.access import CONNECTORS, GUIDES, Access
@@ -57,29 +56,20 @@ def test_connection_tests_are_authenticated_and_audited_without_secrets(tmp_path
 
 
 def test_slack_verifier_checks_bot_and_workspace(monkeypatch):
-    def post(_url, *, headers, timeout):
-        assert timeout == 10.0
-        if _url.endswith("apps.connections.open"):
-            assert headers["Authorization"] == "Bearer xapp-test-token"
-            return httpx.Response(
-                200,
-                json={"ok": True, "url": "wss://wss.slack.com/link/test"},
-                request=httpx.Request("POST", _url),
-            )
-        assert headers["Authorization"] == "Bearer token"
-        return httpx.Response(
-            200,
-            json={"ok": True, "bot_id": "B1", "team_id": "T1"},
-            request=httpx.Request("POST", _url),
-        )
+    called = []
 
-    monkeypatch.setattr(httpx, "post", post)
+    def call(name, arguments, credentials):
+        called.append((name, arguments, credentials))
+        return {"team_id": "T1"} if name == "slack_verify" else {"url": "wss://example"}
+
+    monkeypatch.setattr("austra.connectors.call_external", call)
     values = {
         "SLACK_BOT_TOKEN": "token",
         "SLACK_ALLOWED_TEAM_ID": "T1",
         "SLACK_APP_TOKEN": "xapp-test-token",
     }
     verify_slack(values)
+    assert [item[0] for item in called] == ["slack_verify", "slack_socket_url"]
     try:
         verify_slack({**values, "SLACK_ALLOWED_TEAM_ID": "T2"})
     except ConnectionCheckError as error:
@@ -126,22 +116,13 @@ def test_slack_socket_acknowledges_before_processing_event(tmp_path):
 
 
 def test_gmail_verifier_refreshes_token_and_matches_mailbox(monkeypatch):
-    def post(_url, *, data, timeout):
-        assert data["grant_type"] == "refresh_token"
-        assert timeout == 10.0
-        return httpx.Response(
-            200, json={"access_token": "temporary-token"}, request=httpx.Request("POST", _url)
-        )
+    called = []
 
-    def get(_url, *, headers, timeout):
-        assert headers["Authorization"] == "Bearer temporary-token"
-        assert timeout == 10.0
-        return httpx.Response(
-            200, json={"emailAddress": "admin@example.com"}, request=httpx.Request("GET", _url)
-        )
+    def call(name, arguments, credentials):
+        called.append((name, arguments, credentials))
+        return {"email": "admin@example.com"}
 
-    monkeypatch.setattr(httpx, "post", post)
-    monkeypatch.setattr(httpx, "get", get)
+    monkeypatch.setattr("austra.connectors.call_external", call)
     values = {
         "GMAIL_CLIENT_ID": "client",
         "GMAIL_CLIENT_SECRET": "secret",
@@ -149,6 +130,7 @@ def test_gmail_verifier_refreshes_token_and_matches_mailbox(monkeypatch):
         "GMAIL_SENDER_EMAIL": "admin@example.com",
     }
     verify_gmail(values)
+    assert called == [("gmail_verify", {}, values)]
     try:
         verify_gmail({**values, "GMAIL_SENDER_EMAIL": "other@example.com"})
     except ConnectionCheckError as error:
@@ -221,26 +203,13 @@ def test_gmail_oauth_flow_hides_refresh_token_and_rejects_replayed_state(tmp_pat
 
 
 def test_gmail_code_exchange_uses_authorization_code_without_manual_token(monkeypatch):
-    def post(url, *, data, timeout):
-        assert url == "https://oauth2.googleapis.com/token"
-        assert data["grant_type"] == "authorization_code"
-        assert data["code"] == "code"
-        assert timeout == 10.0
-        return httpx.Response(
-            200,
-            json={"access_token": "access", "refresh_token": "refresh"},
-            request=httpx.Request("POST", url),
-        )
+    def call(name, arguments, credentials):
+        assert name == "gmail_exchange_code"
+        assert arguments == {"code": "code", "redirect_uri": "http://localhost/callback"}
+        assert credentials == {"GMAIL_CLIENT_ID": "id", "GMAIL_CLIENT_SECRET": "secret"}
+        return {"refresh_token": "refresh", "email": "admin@example.com"}
 
-    def get(url, *, headers, timeout):
-        assert headers["Authorization"] == "Bearer access"
-        assert timeout == 10.0
-        return httpx.Response(
-            200, json={"emailAddress": "admin@example.com"}, request=httpx.Request("GET", url)
-        )
-
-    monkeypatch.setattr(httpx, "post", post)
-    monkeypatch.setattr(httpx, "get", get)
+    monkeypatch.setattr("austra.connectors.call_external", call)
     assert exchange_gmail_code("code", "id", "secret", "http://localhost/callback") == (
         "refresh",
         "admin@example.com",
