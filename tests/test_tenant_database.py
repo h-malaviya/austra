@@ -30,7 +30,9 @@ def database():
 
 def test_migration_session_scope_and_revocation(database):
     assert apply_migrations(database) == [
-        "001_identity.sql", "002_business_catalog.sql", "003_organization_contacts.sql"
+        "001_identity.sql",
+        "002_business_catalog.sql",
+        "003_organization_contacts.sql",
     ]
     assert apply_migrations(database) == []
     organization_id = database.execute(

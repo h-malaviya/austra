@@ -79,7 +79,10 @@ def require_organization(connection: psycopg.Connection, organization_id: UUID) 
 
 
 def audit_change(
-    connection: psycopg.Connection, organization_id: UUID, actor_id: UUID, action: str,
+    connection: psycopg.Connection,
+    organization_id: UUID,
+    actor_id: UUID,
+    action: str,
     resource_id: UUID,
 ) -> None:
     connection.execute(
@@ -141,9 +144,18 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                 "WHERE o.deleted_at IS NULL GROUP BY o.id ORDER BY o.name"
             ).fetchall()
         return [
-            {"id": str(row[0]), "slug": row[1], "name": row[2], "status": row[3],
-             "email": row[4], "contact_number": row[5], "city": row[6],
-             "country": row[7], "admin_count": row[8]} for row in rows
+            {
+                "id": str(row[0]),
+                "slug": row[1],
+                "name": row[2],
+                "status": row[3],
+                "email": row[4],
+                "contact_number": row[5],
+                "city": row[6],
+                "country": row[7],
+                "admin_count": row[8],
+            }
+            for row in rows
         ]
 
     @app.post("/api/platform/organizations", status_code=201)
@@ -162,16 +174,27 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                 row = connection.execute(
                     "INSERT INTO organizations (slug, name, email, contact_number, city, country) "
                     "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-                    (payload.slug, payload.name.strip(), email, clean_contact(payload.contact_number),
-                     clean_contact(payload.city), clean_contact(payload.country)),
+                    (
+                        payload.slug,
+                        payload.name.strip(),
+                        email,
+                        clean_contact(payload.contact_number),
+                        clean_contact(payload.city),
+                        clean_contact(payload.country),
+                    ),
                 ).fetchone()
                 connection.execute(
                     "INSERT INTO users (organization_id, username_normalized, role, password_hash, "
                     "full_name, email, contact_number) "
                     "VALUES (%s, %s, 'org_admin', %s, %s, %s, %s)",
-                    (row[0], admin_username, password_hash(credential),
-                     clean_contact(payload.admin_full_name), admin_email,
-                     clean_contact(payload.admin_contact_number)),
+                    (
+                        row[0],
+                        admin_username,
+                        password_hash(credential),
+                        clean_contact(payload.admin_full_name),
+                        admin_email,
+                        clean_contact(payload.admin_contact_number),
+                    ),
                 )
                 connection.execute(
                     "INSERT INTO audit_events (organization_id, actor_user_id, channel, "
@@ -197,8 +220,14 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
             row = connection.execute(
                 "UPDATE organizations SET name = %s, email = %s, contact_number = %s, "
                 "city = %s, country = %s WHERE id = %s AND deleted_at IS NULL RETURNING id",
-                (payload.name, validate_email(payload.email), clean_contact(payload.contact_number),
-                 clean_contact(payload.city), clean_contact(payload.country), organization_id),
+                (
+                    payload.name,
+                    validate_email(payload.email),
+                    clean_contact(payload.contact_number),
+                    clean_contact(payload.city),
+                    clean_contact(payload.country),
+                    organization_id,
+                ),
             ).fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Organization not found")
@@ -216,8 +245,17 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                 "AND deleted_at IS NULL ORDER BY username_normalized",
                 (organization_id,),
             ).fetchall()
-        return [{"id": str(row[0]), "username": row[1], "full_name": row[2],
-                 "email": row[3], "contact_number": row[4], "status": row[5]} for row in rows]
+        return [
+            {
+                "id": str(row[0]),
+                "username": row[1],
+                "full_name": row[2],
+                "email": row[3],
+                "contact_number": row[4],
+                "status": row[5],
+            }
+            for row in rows
+        ]
 
     @app.post("/api/platform/organizations/{organization_id}/admins", status_code=201)
     def create_admin(organization_id: UUID, payload: AdminInput, request: Request):
@@ -231,9 +269,14 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                     "INSERT INTO users (organization_id, username_normalized, role, password_hash, "
                     "full_name, email, contact_number) "
                     "VALUES (%s, %s, 'org_admin', %s, %s, %s, %s) RETURNING id",
-                    (organization_id, username, password_hash(credential),
-                     clean_contact(payload.full_name), validate_email(payload.email),
-                     clean_contact(payload.contact_number)),
+                    (
+                        organization_id,
+                        username,
+                        password_hash(credential),
+                        clean_contact(payload.full_name),
+                        validate_email(payload.email),
+                        clean_contact(payload.contact_number),
+                    ),
                 ).fetchone()
                 audit_change(connection, organization_id, actor.user_id, "admin.created", row[0])
         except ValueError as error:
@@ -243,7 +286,9 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
         return {"id": str(row[0]), "username": username, "temporary_password": credential}
 
     @app.patch("/api/platform/organizations/{organization_id}/admins/{admin_id}")
-    def update_admin(organization_id: UUID, admin_id: UUID, payload: AdminDetails, request: Request):
+    def update_admin(
+        organization_id: UUID, admin_id: UUID, payload: AdminDetails, request: Request
+    ):
         actor = platform(request)
         if payload.status not in {"active", "suspended"}:
             raise HTTPException(status_code=400, detail="Invalid admin status")
@@ -256,15 +301,23 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                     "contact_number = %s, status = %s "
                     "WHERE id = %s AND organization_id = %s AND role = 'org_admin' "
                     "AND deleted_at IS NULL RETURNING id",
-                    (username, clean_contact(payload.full_name), validate_email(payload.email),
-                     clean_contact(payload.contact_number), payload.status, admin_id, organization_id),
+                    (
+                        username,
+                        clean_contact(payload.full_name),
+                        validate_email(payload.email),
+                        clean_contact(payload.contact_number),
+                        payload.status,
+                        admin_id,
+                        organization_id,
+                    ),
                 ).fetchone()
                 if row is None:
                     raise HTTPException(status_code=404, detail="Admin not found")
                 if payload.status == "suspended":
                     connection.execute(
                         "UPDATE sessions SET revoked_at = now() WHERE user_id = %s "
-                        "AND revoked_at IS NULL", (admin_id,),
+                        "AND revoked_at IS NULL",
+                        (admin_id,),
                     )
                 audit_change(connection, organization_id, actor.user_id, "admin.updated", admin_id)
         except ValueError as error:
@@ -291,7 +344,9 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                 "UPDATE sessions SET revoked_at = now() WHERE user_id = %s AND revoked_at IS NULL",
                 (admin_id,),
             )
-            audit_change(connection, organization_id, actor.user_id, "admin.password_reset", admin_id)
+            audit_change(
+                connection, organization_id, actor.user_id, "admin.password_reset", admin_id
+            )
         return {"id": str(admin_id), "username": row[1], "temporary_password": credential}
 
     @app.patch("/api/platform/organizations/{organization_id}/status")

@@ -350,15 +350,23 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             )
             assert platform.get("/api/chats").status_code == 403
             legacy_organization_id = platform.get("/api/platform/organizations").json()[0]["id"]
-            assert platform.get(
-                f"/platform/organizations/{legacy_organization_id}"
-            ).status_code == 200
-            assert platform.patch(
-                f"/api/platform/organizations/{legacy_organization_id}",
-                headers={"X-Austra-Request": "1"},
-                json={"name": "Edited Plant", "email": "plant@example.com",
-                      "contact_number": "+91 555 0100", "city": "Pune", "country": "India"},
-            ).status_code == 200
+            assert (
+                platform.get(f"/platform/organizations/{legacy_organization_id}").status_code == 200
+            )
+            assert (
+                platform.patch(
+                    f"/api/platform/organizations/{legacy_organization_id}",
+                    headers={"X-Austra-Request": "1"},
+                    json={
+                        "name": "Edited Plant",
+                        "email": "plant@example.com",
+                        "contact_number": "+91 555 0100",
+                        "city": "Pune",
+                        "country": "India",
+                    },
+                ).status_code
+                == 200
+            )
             create_app(tmp_path)
             assert platform.get("/api/platform/organizations").json()[0]["name"] == "Edited Plant"
             assert platform.get("/api/platform/support/objects").status_code == 403
@@ -381,15 +389,24 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             new_organization = platform.post(
                 "/api/platform/organizations",
                 headers={"X-Austra-Request": "1"},
-                json={"slug": "new-tenant", "name": "New Tenant", "admin_username": "owner",
-                      "email": "office@example.com", "contact_number": "+1 555 0100",
-                      "city": "Austin", "country": "USA", "admin_full_name": "First Owner",
-                      "admin_email": "owner@example.com", "admin_contact_number": "+1 555 0101"},
+                json={
+                    "slug": "new-tenant",
+                    "name": "New Tenant",
+                    "admin_username": "owner",
+                    "email": "office@example.com",
+                    "contact_number": "+1 555 0100",
+                    "city": "Austin",
+                    "country": "USA",
+                    "admin_full_name": "First Owner",
+                    "admin_email": "owner@example.com",
+                    "admin_contact_number": "+1 555 0101",
+                },
             )
             assert new_organization.status_code == 201
             organization_id = new_organization.json()["id"]
             organization = next(
-                item for item in platform.get("/api/platform/organizations").json()
+                item
+                for item in platform.get("/api/platform/organizations").json()
                 if item["id"] == organization_id
             )
             assert organization["email"] == "office@example.com"
@@ -399,26 +416,45 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             ).json()[0]
             assert first_admin["full_name"] == "First Owner"
             assert "password" not in first_admin
-            assert platform.patch(
-                f"/api/platform/organizations/{organization_id}",
-                headers={"X-Austra-Request": "1"},
-                json={"name": "New Tenant Ltd", "email": "new@example.com",
-                      "contact_number": "+1 555 0120", "city": "Dallas", "country": "USA"},
-            ).status_code == 200
+            assert (
+                platform.patch(
+                    f"/api/platform/organizations/{organization_id}",
+                    headers={"X-Austra-Request": "1"},
+                    json={
+                        "name": "New Tenant Ltd",
+                        "email": "new@example.com",
+                        "contact_number": "+1 555 0120",
+                        "city": "Dallas",
+                        "country": "USA",
+                    },
+                ).status_code
+                == 200
+            )
             second_admin = platform.post(
                 f"/api/platform/organizations/{organization_id}/admins",
                 headers={"X-Austra-Request": "1"},
-                json={"username": "manager", "full_name": "Second Admin",
-                      "email": "manager@example.com", "contact_number": "+1 555 0102"},
+                json={
+                    "username": "manager",
+                    "full_name": "Second Admin",
+                    "email": "manager@example.com",
+                    "contact_number": "+1 555 0102",
+                },
             )
             assert second_admin.status_code == 201
-            assert platform.patch(
-                f"/api/platform/organizations/{organization_id}/admins/{second_admin.json()['id']}",
-                headers={"X-Austra-Request": "1"},
-                json={"username": "manager2", "full_name": "Updated Admin",
-                      "email": "updated@example.com", "contact_number": "+1 555 0103",
-                      "status": "active"},
-            ).status_code == 200
+            assert (
+                platform.patch(
+                    f"/api/platform/organizations/{organization_id}/admins/{second_admin.json()['id']}",
+                    headers={"X-Austra-Request": "1"},
+                    json={
+                        "username": "manager2",
+                        "full_name": "Updated Admin",
+                        "email": "updated@example.com",
+                        "contact_number": "+1 555 0103",
+                        "status": "active",
+                    },
+                ).status_code
+                == 200
+            )
             reset = platform.post(
                 f"/api/platform/organizations/{organization_id}/admins/{second_admin.json()['id']}/reset-password",
                 headers={"X-Austra-Request": "1"},
@@ -426,23 +462,37 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             assert reset.status_code == 200
             assert reset.json()["temporary_password"] != second_admin.json()["temporary_password"]
             reset_admin = TestClient(create_app(tmp_path), base_url="http://new-tenant.localhost")
-            assert reset_admin.post(
-                "/api/login", json={"username": "manager2",
-                                    "password": second_admin.json()["temporary_password"],
-                                    "organization_slug": "new-tenant"},
-            ).status_code == 401
-            assert reset_admin.post(
-                "/api/login", json={"username": "manager2",
-                                    "password": reset.json()["temporary_password"],
-                                    "organization_slug": "new-tenant"},
-            ).status_code == 200
+            assert (
+                reset_admin.post(
+                    "/api/login",
+                    json={
+                        "username": "manager2",
+                        "password": second_admin.json()["temporary_password"],
+                        "organization_slug": "new-tenant",
+                    },
+                ).status_code
+                == 401
+            )
+            assert (
+                reset_admin.post(
+                    "/api/login",
+                    json={
+                        "username": "manager2",
+                        "password": reset.json()["temporary_password"],
+                        "organization_slug": "new-tenant",
+                    },
+                ).status_code
+                == 200
+            )
             assert reset_admin.get("/api/config").json()["must_change_password"] is True
-            assert len(platform.get(
-                f"/api/platform/organizations/{organization_id}/admins"
-            ).json()) == 2
-            assert client.get(
-                f"/api/platform/organizations/{organization_id}/admins"
-            ).status_code == 403
+            assert (
+                len(platform.get(f"/api/platform/organizations/{organization_id}/admins").json())
+                == 2
+            )
+            assert (
+                client.get(f"/api/platform/organizations/{organization_id}/admins").status_code
+                == 403
+            )
             assert (
                 platform.post(
                     "/api/platform/organizations",
@@ -451,11 +501,14 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
                 ).status_code
                 == 400
             )
-            assert platform.post(
-                "/api/platform/organizations",
-                headers={"X-Austra-Request": "1"},
-                json={"slug": "platform", "name": "Reserved", "admin_username": "owner"},
-            ).status_code == 400
+            assert (
+                platform.post(
+                    "/api/platform/organizations",
+                    headers={"X-Austra-Request": "1"},
+                    json={"slug": "platform", "name": "Reserved", "admin_username": "owner"},
+                ).status_code
+                == 400
+            )
             other_admin = TestClient(create_app(tmp_path), base_url="http://new-tenant.localhost")
             assert (
                 other_admin.post(
@@ -493,30 +546,48 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             assert other_admin.get("/api/chats").status_code == 403
             assert client.post("/api/org/users", json={"username": "unsafe"}).status_code == 403
             new_employee = client.post(
-                "/api/org/users", headers={"X-Austra-Request": "1"},
-                json={"username": "hrassistant", "full_name": "HR Assistant",
-                      "email": "hr@example.com", "contact_number": "+91 555 0110"},
+                "/api/org/users",
+                headers={"X-Austra-Request": "1"},
+                json={
+                    "username": "hrassistant",
+                    "full_name": "HR Assistant",
+                    "email": "hr@example.com",
+                    "contact_number": "+91 555 0110",
+                },
             )
             assert new_employee.status_code == 201
             assert any(
                 user["full_name"] == "HR Assistant" and user["email"] == "hr@example.com"
                 for user in client.get("/api/org/users").json()
             )
-            assert client.patch(
-                f"/api/org/users/{new_employee.json()['id']}",
-                headers={"X-Austra-Request": "1"},
-                json={"username": "hrassistant", "full_name": "Senior HR Assistant",
-                      "email": "senior.hr@example.com", "contact_number": "+91 555 0111",
-                      "status": "suspended"},
-            ).status_code == 200
+            assert (
+                client.patch(
+                    f"/api/org/users/{new_employee.json()['id']}",
+                    headers={"X-Austra-Request": "1"},
+                    json={
+                        "username": "hrassistant",
+                        "full_name": "Senior HR Assistant",
+                        "email": "senior.hr@example.com",
+                        "contact_number": "+91 555 0111",
+                        "status": "suspended",
+                    },
+                ).status_code
+                == 200
+            )
             suspended = TestClient(
                 create_app(tmp_path), base_url="http://polysilicon-manufacturing.localhost"
             )
-            assert suspended.post(
-                "/api/login", json={"username": "hrassistant",
-                                    "password": new_employee.json()["temporary_password"],
-                                    "organization_slug": "polysilicon-manufacturing"},
-            ).status_code == 401
+            assert (
+                suspended.post(
+                    "/api/login",
+                    json={
+                        "username": "hrassistant",
+                        "password": new_employee.json()["temporary_password"],
+                        "organization_slug": "polysilicon-manufacturing",
+                    },
+                ).status_code
+                == 401
+            )
         finally:
             admin_connection.execute(
                 sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema))

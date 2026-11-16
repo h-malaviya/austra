@@ -338,10 +338,14 @@ def install_tenant_routes(app: FastAPI, identity: SaasIdentity) -> None:
                     "INSERT INTO users (organization_id, username_normalized, role, password_hash, "
                     "full_name, email, contact_number) "
                     "VALUES (%s, %s, 'employee', %s, %s, %s, %s) RETURNING id",
-                    (context.organization_id, username, password_hash(credential),
-                     payload.full_name.strip() or None if payload.full_name else None,
-                     payload.email.strip() or None if payload.email else None,
-                     payload.contact_number.strip() or None if payload.contact_number else None),
+                    (
+                        context.organization_id,
+                        username,
+                        password_hash(credential),
+                        payload.full_name.strip() or None if payload.full_name else None,
+                        payload.email.strip() or None if payload.email else None,
+                        payload.contact_number.strip() or None if payload.contact_number else None,
+                    ),
                 ).fetchone()
                 record_event(connection, context, "user.created", resource_id=row[0])
         except ValueError as error:
@@ -363,17 +367,23 @@ def install_tenant_routes(app: FastAPI, identity: SaasIdentity) -> None:
                     "contact_number = %s, status = %s "
                     "WHERE id = %s AND organization_id = %s AND role = 'employee' "
                     "AND deleted_at IS NULL RETURNING id",
-                    (username, payload.full_name.strip() or None if payload.full_name else None,
-                     payload.email.strip() or None if payload.email else None,
-                     payload.contact_number.strip() or None if payload.contact_number else None,
-                     payload.status, user_id, context.organization_id),
+                    (
+                        username,
+                        payload.full_name.strip() or None if payload.full_name else None,
+                        payload.email.strip() or None if payload.email else None,
+                        payload.contact_number.strip() or None if payload.contact_number else None,
+                        payload.status,
+                        user_id,
+                        context.organization_id,
+                    ),
                 ).fetchone()
                 if row is None:
                     raise HTTPException(status_code=404, detail="Employee not found")
                 if payload.status == "suspended":
                     connection.execute(
                         "UPDATE sessions SET revoked_at = now() WHERE user_id = %s "
-                        "AND revoked_at IS NULL", (user_id,),
+                        "AND revoked_at IS NULL",
+                        (user_id,),
                     )
                 record_event(connection, context, "user.updated", resource_id=user_id)
         except ValueError as error:

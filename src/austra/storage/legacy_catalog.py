@@ -41,9 +41,7 @@ def legacy_catalog_signature(root: Path) -> tuple[tuple[str, int], ...]:
     for current, children, _files in os.walk(root):
         children.sort()
         directory = Path(current)
-        directories.append(
-            (directory.relative_to(root).as_posix(), directory.stat().st_mtime_ns)
-        )
+        directories.append((directory.relative_to(root).as_posix(), directory.stat().st_mtime_ns))
     return tuple(directories)
 
 
