@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Austra · Blank workspace</title>
-  <link rel="stylesheet" href="/static/app.css?v=17">
+  <title>Austra · Business workspace</title>
+  <link rel="stylesheet" href="/static/app.css?v=21">
+  <link rel="stylesheet" href="/static/organization-admin.css?v=2">
 </head>
 <body>
   <div class="app-shell" id="appShell">
@@ -15,6 +16,7 @@
       <nav class="chat-list" id="chatList" aria-label="Previous chats"></nav>
       <div class="sidebar-bottom">
         <button class="side-action" id="workspaceButton" type="button">Workspace <span>↗</span></button>
+        <button class="side-action" id="departmentsButton" type="button" hidden>Departments & People <span>↗</span></button>
         <button class="side-action" id="infrastructureButton" type="button">Infrastructure <span>↗</span></button>
         <button class="side-action" id="connectionsButton" type="button">Connections <span>↗</span></button>
         <button class="side-action" id="logoutButton" type="button">Sign out <span>↗</span></button>
@@ -24,7 +26,7 @@
     <main class="chat-area" id="chatArea">
       <header class="topbar">
         <button class="mobile-menu icon-button" id="menuButton" type="button" aria-label="Open chats">☰</button>
-        <div class="chat-heading"><strong id="chatTitle">New chat</strong><span>Skills and structures grow from your instructions</span></div>
+        <div class="chat-heading"><strong id="chatTitle">New chat</strong><span id="organizationLabel">Skills and structures grow from your instructions</span></div>
         <button class="top-action" id="topConnections" type="button">Connections</button>
       </header>
       <div class="messages" id="messages" role="log" aria-live="polite"></div>
@@ -54,15 +56,24 @@
     <main class="workspace-page" id="workspacePage" hidden>
       <header class="connections-header">
         <div><span class="eyebrow">YOUR WORKSPACE</span><h1>Workspace</h1><p>Browse saved items, proposed changes, and activity.</p></div>
+        <select id="workspaceDepartment" class="top-action" aria-label="Department" hidden><option value="">All departments</option></select>
         <button class="top-action" id="workspaceBack" type="button">← Back to chat</button>
       </header>
       <nav class="workspace-tabs" id="workspaceTabs" aria-label="Workspace sections"></nav>
       <div class="workspace-content" id="workspaceContent" aria-live="polite"></div>
       <div class="workspace-pagination" id="workspacePagination"></div>
     </main>
+    <main class="org-page" id="departmentsPage" hidden>
+      <div id="departmentsContent" aria-live="polite"></div>
+    </main>
   </div>
+  <div id="platformRoot" class="platform-root" hidden></div>
   <script src="/static/markdown.js?v=8" defer></script>
   <script src="/static/a2ui.bundle.js?v=3" defer></script>
-  <script src="/static/app.js?v=16" defer></script>
+  <script src="/static/platform.js?v=4" defer></script>
+  <script src="/static/organization-admin.js?v=2" defer></script>
+  <script src="/static/organization-admin-detail.js?v=2" defer></script>
+  <script src="/static/organization-admin-actions.js?v=2" defer></script>
+  <script src="/static/app.js?v=19" defer></script>
 </body>
 </html>

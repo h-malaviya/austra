@@ -11,6 +11,7 @@ function response(data, status = 200) {
 }
 
 beforeEach(() => {
+  window.history.replaceState({}, "", "/");
   channels = [];
   window.BroadcastChannel = class {
     constructor() { channels.push(this); }
@@ -20,6 +21,10 @@ beforeEach(() => {
   document.body.innerHTML = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i)[1];
   window.requestAnimationFrame = callback => callback();
   window.eval(fs.readFileSync(path.join(staticRoot, "markdown.js"), "utf8"));
+  window.eval(fs.readFileSync(path.join(staticRoot, "platform.js"), "utf8"));
+  window.eval(fs.readFileSync(path.join(staticRoot, "organization-admin.js"), "utf8"));
+  window.eval(fs.readFileSync(path.join(staticRoot, "organization-admin-detail.js"), "utf8"));
+  window.eval(fs.readFileSync(path.join(staticRoot, "organization-admin-actions.js"), "utf8"));
   const app = fs.readFileSync(path.join(staticRoot, "app.js"), "utf8");
   window.eval(app.replace(
     /\nstart\(\);\s*$/,
@@ -55,6 +60,31 @@ test("sign out shows sign in immediately and removes private content", async () 
   expect(document.getElementById("messages").textContent).not.toContain("Private answer");
   expect(document.getElementById("chatList").textContent).toBe("");
   expect(channels[0].postMessage).toHaveBeenCalledWith("signed-out");
+});
+
+test("organization admin can open the department ownership view", async () => {
+  window.fetch = jest.fn(async url => {
+    if (url === "/api/config") return response({
+      admin_ready: true, authenticated: true, saas_mode: true, role: "org_admin",
+      organization_name: "Polysilicon Manufacturing Plant",
+      session_seconds_remaining: 3600, connectors: { anthropic: false }
+    });
+    if (url === "/api/org/departments") return response([
+      { id: "department-id", slug: "inventory", name: "Inventory", object_count: 52 }
+    ]);
+    if (url === "/api/org/users") return response([
+      { id: "admin-id", username: "admin", role: "org_admin", status: "active" }
+    ]);
+    return response({});
+  });
+  await window.authTest.refreshConfig();
+  const button = document.getElementById("departmentsButton");
+  expect(button.hidden).toBe(false);
+  button.click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(document.getElementById("departmentsContent").textContent).toContain("Inventory");
+  expect(document.getElementById("departmentsContent").textContent).toContain("52");
+  expect(window.location.pathname).toBe("/organization/departments");
 });
 
 test("expired session on an API response returns to sign in without reload", async () => {
