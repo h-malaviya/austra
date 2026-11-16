@@ -67,6 +67,8 @@ from austra.material_plan import (
 from austra.mcp_connections import McpConnections
 from austra.mcp_gateway import ExternalToolError, call_external
 from austra.pdf_text import PDFExtractionError, extract_pdf_text
+from austra.platform.auth import SaasIdentity
+from austra.platform.routes import install_platform_routes
 from austra.reports import (
     is_stock_request,
     requested_stock_unit,
@@ -77,6 +79,8 @@ from austra.skills import PLATFORM_SKILLS
 from austra.slack import event_message, verify_signature
 from austra.slack_socket import run_socket_mode
 from austra.supplier_plan import supplier_shortlist, supplier_shortlist_reply
+from austra.tenant.manager_routes import install_manager_routes
+from austra.tenant.routes import install_tenant_routes
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -87,6 +91,10 @@ DIRECT_TABLE_IMPORT_BYTES = 20 * 1024
 SUPPORTED_ATTACHMENTS = {".pdf", ".docx", ".csv", ".txt", ".md", ".xlsx"}
 SESSION_COOKIE = "austra_session"
 OAUTH_STATE_SECONDS = 600
+SAAS_HOST_PATTERN = re.compile(
+    r"(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)\.localhost(?::(?P<port>[0-9]{1,5}))?"
+)
+BARE_HOST_PATTERN = re.compile(r"(?:localhost|127\.0\.0\.1)(?::(?P<port>[0-9]{1,5}))?")
 
 
 class Message(BaseModel):
@@ -103,6 +111,7 @@ class Message(BaseModel):
 
 class Passphrase(BaseModel):
     password: str = Field(min_length=1, max_length=200)
+    username: str = "admin"
 
 
 class Credentials(BaseModel):
@@ -212,18 +221,31 @@ def create_app(
     workspace = Path(root or os.getenv("AUSTRA_WORKSPACE", "data/blank"))
     files = Files(workspace)
     access = Access(workspace)
+    database_url = os.getenv("AUSTRA_DATABASE_URL")
+    saas = SaasIdentity(database_url, workspace) if database_url else None
+    if saas:
+        saas.bootstrap()
     mcp_connections = McpConnections(workspace, access)
     infrastructure = Infrastructure()
     verifiers = {**VERIFIERS, **(connector_verifiers or {})}
-    oauth_states: dict[str, tuple[float, str]] = {}
+    oauth_states: dict[str, tuple[float, str, str | None]] = {}
     jobs: dict[str, dict[str, Any]] = {}
     jobs_lock = threading.RLock()
     slack_socket_status = {"connected": False}
     public_url = os.getenv("AUSTRA_PUBLIC_URL", "http://127.0.0.1:8000").rstrip("/")
     gmail_redirect_uri = f"{public_url}/api/connections/gmail/callback"
 
+    def redirect_uri(request: Request) -> str:
+        if not saas:
+            return gmail_redirect_uri
+        scheme = "https" if public_url.startswith("https://") else "http"
+        return f"{scheme}://{request.headers['host']}/api/connections/gmail/callback"
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        if saas:
+            yield
+            return
         task = asyncio.create_task(
             run_socket_mode(access, files, process_socket_event, slack_socket_status)
         )
@@ -236,9 +258,60 @@ def create_app(
 
     app = FastAPI(title="Austra", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    if saas:
+        install_platform_routes(app, saas)
+        install_tenant_routes(app, saas)
+        install_manager_routes(app, saas)
 
     @app.middleware("http")
     async def restrict_local_access(request: Request, call_next):
+        if saas:
+            host = request.headers.get("host", "").lower()
+            match = SAAS_HOST_PATTERN.fullmatch(host)
+            bare = BARE_HOST_PATTERN.fullmatch(host)
+            if match:
+                port = match.group("port")
+                if port and not 1 <= int(port) <= 65535:
+                    return JSONResponse({"detail": "Invalid host"}, status_code=400)
+                name = match.group("name")
+                if len(name) > 64:
+                    return JSONResponse({"detail": "Invalid host"}, status_code=400)
+                organization_slug = "platform" if name == "admin" else name
+            elif bare:
+                port = bare.group("port")
+                if port and not 1 <= int(port) <= 65535:
+                    return JSONResponse({"detail": "Invalid host"}, status_code=400)
+                if request.url.path == "/":
+                    scheme = "https" if public_url.startswith("https://") else "http"
+                    suffix = f":{port}" if port else ""
+                    return RedirectResponse(f"{scheme}://admin.localhost{suffix}/")
+                if request.url.path != "/api/config":
+                    return JSONResponse(
+                        {"detail": "Use an organization subdomain"}, status_code=404
+                    )
+                organization_slug = None
+            else:
+                return JSONResponse({"detail": "Invalid host"}, status_code=400)
+            request.state.organization_slug = organization_slug
+            session_token = request.cookies.get(SESSION_COOKIE)
+            if session_token and organization_slug:
+                context, _remaining = saas.session(session_token)
+                if context:
+                    if organization_slug == "platform":
+                        host_matches_session = context.role == "super_admin"
+                    elif context.organization_id:
+                        with saas.connect() as connection:
+                            row = connection.execute(
+                                "SELECT slug FROM organizations WHERE id = %s",
+                                (context.organization_id,),
+                            ).fetchone()
+                        host_matches_session = bool(row and row[0] == organization_slug)
+                    else:
+                        host_matches_session = False
+                    if not host_matches_session:
+                        return JSONResponse(
+                            {"detail": "Session belongs to another host"}, status_code=403
+                        )
         if (
             request.url.path != "/integrations/slack/events"
             and os.getenv("AUSTRA_DOCKER_PROXY") != "1"
@@ -246,12 +319,39 @@ def create_app(
             host = request.client.host if request.client else ""
             if host not in {"127.0.0.1", "::1", "testclient"}:
                 return JSONResponse({"detail": "Local access only"}, status_code=403)
+        if (
+            saas
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path.startswith("/api/")
+            and request.cookies.get(SESSION_COOKIE)
+            and request.headers.get("X-Austra-Request") != "1"
+        ):
+            return JSONResponse({"detail": "Request verification required"}, status_code=403)
         response = await call_next(request)
         if request.url.path == "/" or request.url.path.startswith(("/static/", "/api/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     def require_admin(request: Request) -> None:
+        if saas:
+            context, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+            if context is None:
+                raise HTTPException(status_code=401, detail="Sign in required")
+            if (
+                context.role != "org_admin"
+                or not context.user_active
+                or not context.organization_active
+                or context.must_change_password
+            ):
+                raise HTTPException(status_code=403, detail="Organization admin access required")
+            with saas.connect() as connection:
+                legacy = connection.execute(
+                    "SELECT id FROM organizations WHERE slug = %s",
+                    (os.environ["AUSTRA_LEGACY_ORGANIZATION_SLUG"],),
+                ).fetchone()
+            if not legacy or context.organization_id != legacy[0]:
+                raise HTTPException(status_code=403, detail="Business workspace unavailable")
+            return
         if not access.authenticated(request.cookies.get(SESSION_COOKIE)):
             raise HTTPException(status_code=401, detail="Administrator sign in required")
 
@@ -818,25 +918,71 @@ def create_app(
     def home() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/platform/organizations")
+    @app.get("/platform/organizations/{organization_id}")
+    def platform_page(request: Request, organization_id: str | None = None) -> FileResponse:
+        if not saas or request.state.organization_slug != "platform":
+            raise HTTPException(status_code=404, detail="Page not found")
+        return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/organization/departments")
+    @app.get("/organization/departments/{department_id}")
+    @app.get("/organization/people")
+    def organization_page(request: Request, department_id: str | None = None) -> FileResponse:
+        if not saas or request.state.organization_slug in {None, "platform"}:
+            raise HTTPException(status_code=404, detail="Page not found")
+        return FileResponse(STATIC_DIR / "index.html")
+
     @app.get("/api/config")
     def config(request: Request) -> dict[str, Any]:
         session = request.cookies.get(SESSION_COOKIE)
+        context, remaining = (
+            saas.session(session) if saas and request.state.organization_slug else (None, 0)
+        )
+        organization_name = None
+        if saas and context and context.organization_id:
+            with saas.connect() as connection:
+                row = connection.execute(
+                    "SELECT name FROM organizations WHERE id = %s",
+                    (context.organization_id,),
+                ).fetchone()
+                organization_name = row[0] if row else None
         return {
-            "admin_ready": access.ready,
-            "authenticated": access.authenticated(session),
-            "session_seconds_remaining": access.session_seconds_remaining(session),
+            "admin_ready": True if saas else access.ready,
+            "authenticated": (
+                bool(
+                    context
+                    and context.user_active
+                    and (context.organization_active or context.role == "super_admin")
+                )
+                if saas
+                else access.authenticated(session)
+            ),
+            "session_seconds_remaining": remaining
+            if saas
+            else access.session_seconds_remaining(session),
+            "saas_mode": bool(saas),
+            "organization_slug": request.state.organization_slug if saas else None,
+            "role": context.role if context else None,
+            "must_change_password": context.must_change_password if context else False,
+            "organization_id": str(context.organization_id)
+            if context and context.organization_id
+            else None,
+            "organization_name": organization_name,
             "connectors": access.configured(),
             "guides": GUIDES,
             "missing": {name: access.missing(name) for name in CONNECTORS},
             "fields": {
                 name: list(VISIBLE_FIELDS.get(name, fields)) for name, fields in CONNECTORS.items()
             },
-            "gmail_redirect_uri": gmail_redirect_uri,
+            "gmail_redirect_uri": redirect_uri(request),
             "slack_socket_connected": slack_socket_status["connected"],
         }
 
     @app.post("/api/setup")
     def setup(payload: Passphrase, response: Response) -> dict[str, bool]:
+        if saas:
+            raise HTTPException(status_code=404, detail="Setup is managed by the platform")
         try:
             session = access.setup(payload.password)
         except ValueError as error:
@@ -851,7 +997,23 @@ def create_app(
         return {"authenticated": True}
 
     @app.post("/api/login")
-    def login(payload: Passphrase, response: Response) -> dict[str, bool]:
+    def login(payload: Passphrase, request: Request, response: Response) -> dict[str, bool]:
+        if saas:
+            try:
+                session = saas.login(
+                    payload.username, payload.password, request.state.organization_slug
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=401, detail=str(error)) from error
+            response.set_cookie(
+                SESSION_COOKIE,
+                session,
+                httponly=True,
+                secure=public_url.startswith("https://"),
+                samesite="strict",
+                max_age=SESSION_TTL_SECONDS,
+            )
+            return {"authenticated": True}
         try:
             session = access.login(payload.password)
         except ValueError as error:
@@ -867,7 +1029,10 @@ def create_app(
 
     @app.post("/api/logout")
     def logout(request: Request, response: Response) -> dict[str, bool]:
-        access.logout(request.cookies.get(SESSION_COOKIE))
+        if saas:
+            saas.logout(request.cookies.get(SESSION_COOKIE))
+        else:
+            access.logout(request.cookies.get(SESSION_COOKIE))
         response.delete_cookie(SESSION_COOKIE)
         files.record_event("admin.logout", "Admin", "access", "administrator")
         return {"authenticated": False}
@@ -974,15 +1139,33 @@ def create_app(
             raise HTTPException(status_code=400, detail="Save the Gmail OAuth client details first")
         session = request.cookies.get(SESSION_COOKIE, "")
         state = secrets.token_urlsafe(32)
-        oauth_states[state] = (time.monotonic() + OAUTH_STATE_SECONDS, session)
+        oauth_states[state] = (
+            time.monotonic() + OAUTH_STATE_SECONDS,
+            session,
+            request.state.organization_slug if saas else None,
+        )
         files.record_event("connection.authorization_started", "Admin", "connector", "gmail")
-        return {"authorization_url": gmail_authorization_url(client_id, gmail_redirect_uri, state)}
+        return {
+            "authorization_url": gmail_authorization_url(client_id, redirect_uri(request), state)
+        }
 
     @app.get("/api/connections/gmail/callback")
     def finish_gmail_connection(request: Request) -> RedirectResponse:
         state = request.query_params.get("state", "")
         pending = oauth_states.pop(state, None)
-        if not pending or pending[0] < time.monotonic() or not access.authenticated(pending[1]):
+        authenticated = (
+            bool(saas.session(pending[1])[0])
+            if saas and pending
+            else access.authenticated(pending[1])
+            if pending
+            else False
+        )
+        if (
+            not pending
+            or pending[0] < time.monotonic()
+            or not authenticated
+            or (saas and pending[2] != request.state.organization_slug)
+        ):
             files.record_event(
                 "connection.authorization_failed", "unknown", "connector", "gmail", outcome="failed"
             )
@@ -995,7 +1178,7 @@ def create_app(
                     code,
                     access.get("GMAIL_CLIENT_ID"),
                     access.get("GMAIL_CLIENT_SECRET"),
-                    gmail_redirect_uri,
+                    redirect_uri(request),
                 )
                 access.save(
                     "gmail", {"GMAIL_REFRESH_TOKEN": refresh_token, "GMAIL_SENDER_EMAIL": email}
@@ -1017,7 +1200,13 @@ def create_app(
                 "connection.authorization_failed", "Admin", "connector", "gmail", outcome="failed"
             )
         response = RedirectResponse(f"/?connection=gmail&oauth={result}", status_code=303)
-        response.set_cookie(SESSION_COOKIE, pending[1], httponly=True, samesite="strict")
+        response.set_cookie(
+            SESSION_COOKIE,
+            pending[1],
+            httponly=True,
+            secure=public_url.startswith("https://"),
+            samesite="strict",
+        )
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
@@ -1050,11 +1239,36 @@ def create_app(
             raise HTTPException(status_code=404, detail="Chat not found") from error
 
     @app.get("/api/ui/workspace", dependencies=[Depends(require_admin)])
-    def get_workspace_ui(section: str = "records", offset: int = 0) -> dict[str, Any]:
+    def get_workspace_ui(
+        request: Request, section: str = "records", offset: int = 0, department_id: str = ""
+    ) -> dict[str, Any]:
         if offset < 0:
             raise HTTPException(status_code=400, detail="Offset must be non-negative")
         try:
-            return workspace_page(files, section, offset)
+            allowed_ids = None
+            if saas and department_id:
+                context, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+                with saas.connect() as connection:
+                    department = connection.execute(
+                        "SELECT id FROM departments WHERE id::text = %s "
+                        "AND organization_id = %s AND archived_at IS NULL",
+                        (department_id, context.organization_id),
+                    ).fetchone()
+                    if department is None:
+                        raise HTTPException(status_code=404, detail="Department not found")
+                    kind = {"records": "record", "files": "artifact", "drafts": "draft"}.get(
+                        section
+                    )
+                    if kind:
+                        allowed_ids = {
+                            row[0]
+                            for row in connection.execute(
+                                "SELECT external_id FROM business_objects WHERE organization_id = %s "
+                                "AND department_id = %s AND kind = %s AND archived_at IS NULL",
+                                (context.organization_id, department[0], kind),
+                            ).fetchall()
+                        }
+            return workspace_page(files, section, offset, allowed_ids)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -1295,6 +1509,8 @@ def create_app(
 
     @app.post("/integrations/slack/events")
     async def slack_events(request: Request, background: BackgroundTasks) -> JSONResponse:
+        if saas:
+            raise HTTPException(status_code=403, detail="External identity is not linked")
         signing_secret = access.get("SLACK_SIGNING_SECRET")
         if not signing_secret:
             raise HTTPException(status_code=503, detail="Slack is not configured")

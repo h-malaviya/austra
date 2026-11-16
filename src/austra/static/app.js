@@ -12,6 +12,7 @@ const authChannel = typeof window.BroadcastChannel === "function"
 let selectedConnector = "anthropic";
 let workspaceSection = "records";
 let workspaceOffset = 0;
+let workspaceDepartmentId = "";
 let chatSurfaceRequest = 0;
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -24,7 +25,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, {
     credentials: "same-origin",
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+    headers: { "Content-Type": "application/json", "X-Austra-Request": "1", ...(options.headers || {}) }
   });
   const data = await response.json();
   if (requestGeneration !== authGeneration) throw new Error("Your session ended. Sign in again.");
@@ -42,6 +43,23 @@ function add(parent, tag, text = "", className = "") {
   if (className) item.className = className;
   parent.appendChild(item);
   return item;
+}
+
+function showLoadingState(target, label, variant = "table") {
+  target.replaceChildren();
+  const state = add(target, "div", "", `loading-state loading-${variant}`);
+  state.setAttribute("role", "status");
+  state.setAttribute("aria-label", label);
+  state.setAttribute("aria-busy", "true");
+  const shape = add(state, "div", "", "loading-shape");
+  shape.setAttribute("aria-hidden", "true");
+  add(shape, "div", "", "loading-bar loading-title");
+  add(shape, "div", "", "loading-bar loading-subtitle");
+  const cards = add(shape, "div", "", "loading-cards");
+  for (let index = 0; index < 3; index += 1) add(cards, "div", "", "loading-bar loading-card");
+  const table = add(shape, "div", "", "loading-table");
+  for (let index = 0; index < 4; index += 1) add(table, "div", "", "loading-bar loading-row");
+  return state;
 }
 
 function showModal({ title, message, confirmLabel = "OK", cancelLabel, destructive = false }) {
@@ -104,8 +122,13 @@ function status(text, error = false) {
 function showSignedOut(broadcast = true) {
   if (!currentConfig?.authenticated && byId("appShell").classList.contains("signed-out")) return;
   const wasAuthenticated = currentConfig?.authenticated;
+  byId("platformRoot").hidden = true;
+  byId("appShell").hidden = false;
+  document.querySelectorAll(".platform-backdrop").forEach(backdrop => backdrop.remove());
+  byId("platformRoot").replaceChildren();
   authGeneration += 1;
   currentConfig = { ...currentConfig, authenticated: false };
+  window.clearOrganizationManagementCache?.();
   currentChatId = null;
   activeJobIds.clear();
   busy = false;
@@ -220,8 +243,8 @@ function renderWelcome() {
   byId("messages").replaceChildren();
   const welcome = add(byId("messages"), "div", "", "welcome");
   add(welcome, "div", "✦", "welcome-icon");
-  add(welcome, "h1", "Start with a blank sheet");
-  add(welcome, "p", "Describe your business in chat. Austra will ask for missing facts and propose skills, rules, and structures for your review.");
+  add(welcome, "h1", "Work with your business");
+  add(welcome, "p", "Ask about saved records and workflows, or describe a change for Austra to draft and review.");
   thread();
 }
 
@@ -319,7 +342,11 @@ async function refreshConfig() {
     return;
   }
   currentConfig = config;
-  byId("appShell").classList.toggle("signed-out", !config.authenticated);
+  byId("organizationLabel").textContent = config.organization_name || "Business workspace";
+  byId("departmentsButton").hidden = !(config.saas_mode && config.role === "org_admin");
+  byId("appShell").classList.toggle(
+    "signed-out", !config.authenticated || config.must_change_password || config.role === "super_admin"
+  );
   clearTimeout(sessionExpiryTimer);
   if (config.authenticated) {
     sessionExpiryTimer = setTimeout(
@@ -367,13 +394,22 @@ function accessPrompt(setup) {
   showChatView();
   byId("messages").replaceChildren();
   thread();
-  const card = bubble(setup
-    ? "Create your administrator passphrase to begin. This protects business chats, draft approvals, and connector credentials."
-    : "Enter your administrator passphrase to continue.");
+  const card = bubble(currentConfig?.saas_mode
+    ? `Sign in to ${currentConfig.organization_slug === "platform" ? "Austra platform" : currentConfig.organization_slug + ".localhost"} with your username and password.`
+    : setup
+      ? "Create your administrator passphrase to begin. This protects business chats, draft approvals, and connector credentials."
+      : "Enter your administrator passphrase to continue.");
+  let username = null;
+  if (currentConfig?.saas_mode) {
+    username = add(card, "input", "", "secure-input");
+    username.placeholder = "Username";
+    username.autocomplete = "username";
+    username.value = currentConfig.organization_slug === "platform" ? "superadmin" : "admin";
+  }
   const input = add(card, "input", "", "secure-input");
   input.type = "password";
   input.autocomplete = setup ? "new-password" : "current-password";
-  input.placeholder = setup ? "At least 12 characters" : "Administrator passphrase";
+  input.placeholder = setup ? "At least 12 characters" : currentConfig?.saas_mode ? "Password" : "Administrator passphrase";
   const button = add(card, "button", setup ? "Create workspace" : "Sign in", "inline-button");
   button.type = "button";
   const feedback = add(card, "p", "", "auth-feedback");
@@ -381,11 +417,16 @@ function accessPrompt(setup) {
   button.onclick = async () => {
     try {
       await api(setup ? "/api/setup" : "/api/login", {
-        method: "POST", body: JSON.stringify({ password: input.value })
+        method: "POST", body: JSON.stringify({
+          password: input.value,
+          ...(username ? { username: username.value } : {})
+        })
       });
       input.value = "";
       await refreshConfig();
       if (!currentConfig.authenticated) return;
+      if (currentConfig.must_change_password) { renderPasswordChange(); return; }
+      if (currentConfig.role === "super_admin") { renderPlatform(); return; }
       renderWelcome();
       await loadChats();
       if (!currentConfig.authenticated) return;
@@ -393,6 +434,7 @@ function accessPrompt(setup) {
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
       else await testSavedModel();
       showGmailOauthResult();
+      if (currentConfig.role === "org_admin" && organizationRoute()) await showDepartments(false);
     } catch (error) {
       feedback.textContent = error.message;
       status(error.message, true);
@@ -403,8 +445,11 @@ function accessPrompt(setup) {
 }
 
 async function loadChats() {
-  const chats = await api("/api/chats");
   const list = byId("chatList");
+  if (!list.childElementCount) showLoadingState(list, "Loading chats", "list");
+  let chats;
+  try { chats = await api("/api/chats"); }
+  catch (error) { list.replaceChildren(); throw error; }
   list.replaceChildren();
   if (!chats.length) add(list, "p", "No chats yet.", "connection");
   chats.forEach(chat => {
@@ -624,7 +669,7 @@ async function sendMessage() {
     if (currentChatId) form.append("chat_id", currentChatId);
     selectedFiles.forEach(({ file }) => form.append("uploads", file, file.name));
     const response = await fetch("/api/messages/background", {
-      method: "POST", credentials: "same-origin", body: form
+      method: "POST", credentials: "same-origin", headers: { "X-Austra-Request": "1" }, body: form
     });
     const result = await response.json();
     if (requestGeneration !== authGeneration) return;
@@ -662,9 +707,21 @@ async function sendMessage() {
   }
 }
 
-function showChatView() {
+function organizationRoute() {
+  return window.location.pathname.startsWith("/organization/");
+}
+
+function leaveOrganizationRoute() {
+  if (currentConfig?.role === "org_admin" && organizationRoute()) {
+    window.history.pushState({}, "", "/");
+  }
+}
+
+function showChatView(syncRoute = true) {
+  if (syncRoute) leaveOrganizationRoute();
   byId("connectionsPage").hidden = true;
   byId("workspacePage").hidden = true;
+  byId("departmentsPage").hidden = true;
   byId("chatArea").hidden = false;
   byId("sidebar").classList.remove("open");
   scrollBottom();
@@ -931,9 +988,11 @@ function showGmailOauthResult() {
 
 function showConnections(connector = "anthropic") {
   if (!currentConfig?.authenticated) return;
+  leaveOrganizationRoute();
   selectedConnector = connector === "mcp" || currentConfig.guides[connector] ? connector : "anthropic";
   byId("chatArea").hidden = true;
   byId("workspacePage").hidden = true;
+  byId("departmentsPage").hidden = true;
   byId("connectionsPage").hidden = false;
   byId("sidebar").classList.remove("open");
   renderConnectionList();
@@ -962,11 +1021,21 @@ function renderWorkspaceTabs() {
 async function loadWorkspace() {
   const section = workspaceSection;
   const offset = workspaceOffset;
+  const departmentId = workspaceDepartmentId;
   const content = byId("workspaceContent");
-  content.replaceChildren();
-  add(content, "p", "Loading workspace…", "workspace-loading");
-  const response = await api(`/api/ui/workspace?section=${section}&offset=${offset}`);
-  if (section !== workspaceSection || offset !== workspaceOffset || byId("workspacePage").hidden) return;
+  showLoadingState(content, "Loading workspace", "workspace");
+  let response;
+  try {
+    response = await api(`/api/ui/workspace?section=${section}&offset=${offset}&department_id=${encodeURIComponent(departmentId)}`);
+  } catch (error) {
+    if (section === workspaceSection && offset === workspaceOffset &&
+      departmentId === workspaceDepartmentId && !byId("workspacePage").hidden) {
+      content.replaceChildren();
+      add(content, "p", error.message, "workspace-loading error");
+    }
+    throw error;
+  }
+  if (section !== workspaceSection || offset !== workspaceOffset || departmentId !== workspaceDepartmentId || byId("workspacePage").hidden) return;
   content.replaceChildren();
   if (!window.AustraA2UI) { add(content, "p", "A2UI renderer unavailable."); return; }
   const pageItemIds = new Set(response.items.map(item => item.id).filter(Boolean));
@@ -998,12 +1067,43 @@ async function loadWorkspace() {
 
 function showWorkspace() {
   if (!currentConfig?.authenticated) return;
+  leaveOrganizationRoute();
   byId("chatArea").hidden = true;
   byId("connectionsPage").hidden = true;
+  byId("departmentsPage").hidden = true;
   byId("workspacePage").hidden = false;
   byId("sidebar").classList.remove("open");
   renderWorkspaceTabs();
+  loadWorkspaceDepartments().catch(error => status(error.message, true));
   loadWorkspace().catch(error => status(error.message, true));
+}
+
+async function loadWorkspaceDepartments() {
+  const selector = byId("workspaceDepartment");
+  selector.hidden = !currentConfig?.saas_mode;
+  if (!currentConfig?.saas_mode) return;
+  const departments = await api("/api/org/departments");
+  selector.replaceChildren();
+  const all = add(selector, "option", "All departments");
+  all.value = "";
+  departments.filter(item => !item.archived).forEach(item => {
+    const option = add(selector, "option", item.name);
+    option.value = item.id;
+  });
+  selector.value = workspaceDepartmentId;
+}
+
+async function showDepartments(pushRoute = true) {
+  if (currentConfig?.role !== "org_admin") return;
+  if (pushRoute && window.location.pathname !== "/organization/departments") {
+    window.history.pushState({}, "", "/organization/departments");
+  }
+  byId("chatArea").hidden = true;
+  byId("connectionsPage").hidden = true;
+  byId("workspacePage").hidden = true;
+  byId("departmentsPage").hidden = false;
+  byId("sidebar").classList.remove("open");
+  await window.renderOrganizationManagement();
 }
 
 async function showInfrastructure() {
@@ -1027,6 +1127,12 @@ byId("attachButton").onclick = () => byId("fileInput").click();
 byId("fileInput").onchange = event => addPendingFiles([...event.target.files]);
 byId("connectionsButton").onclick = () => showConnections();
 byId("workspaceButton").onclick = showWorkspace;
+byId("workspaceDepartment").onchange = event => {
+  workspaceDepartmentId = event.target.value;
+  workspaceOffset = 0;
+  loadWorkspace().catch(error => status(error.message, true));
+};
+byId("departmentsButton").onclick = () => showDepartments().catch(error => orgNotice(error.message, true));
 byId("workspaceBack").onclick = showChatView;
 byId("topConnections").onclick = () => showConnections();
 byId("backToChat").onclick = showChatView;
@@ -1039,11 +1145,59 @@ byId("logoutButton").onclick = async () => {
   } catch (error) { status(error.message, true); }
 };
 
+window.addEventListener("popstate", () => {
+  if (currentConfig?.authenticated && currentConfig.role === "org_admin") {
+    if (organizationRoute()) showDepartments(false).catch(error => status(error.message, true));
+    else if (!byId("departmentsPage").hidden) showChatView(false);
+  }
+});
+
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && currentConfig?.authenticated) {
     refreshConfig().catch(error => status(error.message, true));
   }
 });
+
+function renderPasswordChange() {
+  byId("appShell").classList.add("signed-out");
+  showChatView();
+  byId("messages").replaceChildren();
+  const card = bubble("Change your temporary password before using Austra.");
+  const current = add(card, "input", "", "secure-input");
+  current.type = "password";
+  current.autocomplete = "current-password";
+  current.placeholder = "Temporary password";
+  const replacement = add(card, "input", "", "secure-input");
+  replacement.type = "password";
+  replacement.autocomplete = "new-password";
+  replacement.placeholder = "New password, at least 12 characters";
+  const button = add(card, "button", "Change password", "inline-button");
+  button.onclick = async () => {
+    try {
+      await api("/api/auth/change-password", {
+        method: "POST", body: JSON.stringify({
+          current_password: current.value, new_password: replacement.value
+        })
+      });
+      current.value = "";
+      replacement.value = "";
+      showSignedOut();
+    } catch (error) { status(error.message, true); }
+  };
+  current.focus();
+}
+
+async function renderPlatform() {
+  byId("appShell").hidden = true;
+  byId("platformRoot").hidden = false;
+  await window.renderPlatformDashboard();
+}
+
+function organizationUrl(slug) {
+  const url = new URL("/", window.location.origin);
+  url.hostname = `${slug}.localhost`;
+  return url.href;
+}
 
 async function start() {
   try {
@@ -1051,6 +1205,8 @@ async function start() {
     if (!currentConfig.admin_ready) accessPrompt(true);
     else if (!currentConfig.authenticated) accessPrompt(false);
     else {
+      if (currentConfig.must_change_password) { renderPasswordChange(); return; }
+      if (currentConfig.role === "super_admin") { renderPlatform(); return; }
       renderWelcome();
       await loadChats();
       if (!currentConfig.authenticated) return;
@@ -1058,6 +1214,7 @@ async function start() {
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
       else await testSavedModel();
       showGmailOauthResult();
+      if (currentConfig.role === "org_admin" && organizationRoute()) await showDepartments(false);
     }
   } catch (error) { status(error.message, true); }
 }

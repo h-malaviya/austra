@@ -5,11 +5,13 @@ description = "Chat guided blank business workspace"
 requires-python = ">=3.13"
 dependencies = [
     "anthropic>=1.0",
+    "argon2-cffi>=23,<26",
     "fastapi>=0.118",
     "httpx>=0.28",
     "jsonschema>=4.25",
     "mcp>=1.0,<2",
     "openpyxl>=3.1",
+    "psycopg[binary]>=3.2,<4",
     "pypdf>=6.20.1",
     "python-docx>=1.2.0",
     "python-multipart>=0.0.32",

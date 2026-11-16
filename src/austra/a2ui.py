@@ -522,7 +522,9 @@ def _activity_card(surface: Surface, event: dict[str, Any]) -> str:
     )
 
 
-def workspace_page(files: Files, section: str, offset: int = 0) -> dict[str, Any]:
+def workspace_page(
+    files: Files, section: str, offset: int = 0, allowed_ids: set[str] | None = None
+) -> dict[str, Any]:
     if section == "records":
         items = files.records()
         render_item = _record_card
@@ -537,6 +539,13 @@ def workspace_page(files: Files, section: str, offset: int = 0) -> dict[str, Any
         render_item = _activity_card
     else:
         raise ValueError("Unknown workspace section")
+    if allowed_ids is not None and section != "activity":
+        items = [
+            item
+            for item in items
+            if (f"{item['kind']}:{item['name']}" if section == "files" else item["id"])
+            in allowed_ids
+        ]
     if section != "activity":
         items = list(reversed(items))
     page = items[offset : offset + PAGE_SIZE]
