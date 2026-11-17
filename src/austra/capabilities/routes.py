@@ -78,9 +78,11 @@ def install_capability_routes(app: FastAPI, identity: SaasIdentity) -> None:
         def operation(db, context):
             from austra.capabilities.runtime import _active_build
             from austra.tenant.context import tenant_transaction
+
             with tenant_transaction(db, context):
                 manifest = _active_build(db, context)["manifest"]
             return projection_data(db, context, department_id, key, manifest, offset=offset)
+
         return run(request, operation)
 
     @app.get("/api/org/capability-events/{department_id}/{event_id}")
@@ -92,13 +94,20 @@ def install_capability_routes(app: FastAPI, identity: SaasIdentity) -> None:
         def operation(db, context):
             build = create_build(db, context, payload.blueprint_id)
             return build_capability(db, context, build["id"], payload.rollback_plan)
+
         return run(request, operation, admin=True)
 
     @app.post("/api/org/capability-builds/{build_id}/transitions")
     def transition(build_id: UUID, payload: TransitionInput, request: Request):
-        return run(request, lambda db, context: {"revision": transition_build(
-            db, context, build_id, payload.target, payload.expected_revision, uuid4())},
-            admin=True)
+        return run(
+            request,
+            lambda db, context: {
+                "revision": transition_build(
+                    db, context, build_id, payload.target, payload.expected_revision, uuid4()
+                )
+            },
+            admin=True,
+        )
 
     @app.post("/api/org/capability-builds/{build_id}/verify")
     def verify(build_id: UUID, request: Request):
@@ -106,21 +115,45 @@ def install_capability_routes(app: FastAPI, identity: SaasIdentity) -> None:
 
     @app.post("/api/org/capability-builds/{build_id}/preview")
     def preview(build_id: UUID, payload: PreviewInput, request: Request):
-        return run(request, lambda db, context: preview_build(
-            db, context, build_id, payload.expected_revision, payload.accepted,
-            payload.expected, payload.observed, payload.trace), admin=True)
+        return run(
+            request,
+            lambda db, context: preview_build(
+                db,
+                context,
+                build_id,
+                payload.expected_revision,
+                payload.accepted,
+                payload.expected,
+                payload.observed,
+                payload.trace,
+            ),
+            admin=True,
+        )
 
     @app.post("/api/org/capability-defects/{defect_id}/fix")
     def fix(defect_id: UUID, payload: FixInput, request: Request):
-        return run(request, lambda db, context: fix_defect(
-            db, context, defect_id, payload.expected_revision, uuid4()), admin=True)
+        return run(
+            request,
+            lambda db, context: fix_defect(
+                db, context, defect_id, payload.expected_revision, uuid4()
+            ),
+            admin=True,
+        )
 
     @app.post("/api/org/capability-builds/{build_id}/release")
     def release(build_id: UUID, payload: FixInput, request: Request):
-        return run(request, lambda db, context: {"release_id": publish(
-            db, context, build_id, payload.expected_revision, uuid4())}, admin=True)
+        return run(
+            request,
+            lambda db, context: {
+                "release_id": publish(db, context, build_id, payload.expected_revision, uuid4())
+            },
+            admin=True,
+        )
 
     @app.post("/api/org/capability-releases/{release_id}/rollback")
     def revert(release_id: UUID, request: Request):
-        return run(request, lambda db, context: {"release_id": rollback(
-            db, context, release_id, uuid4())}, admin=True)
+        return run(
+            request,
+            lambda db, context: {"release_id": rollback(db, context, release_id, uuid4())},
+            admin=True,
+        )

@@ -71,8 +71,15 @@ def _embedding(content: str) -> str:
 
 
 def save_source(
-    connection: psycopg.Connection, context: TenantContext, root: Path, *,
-    kind: str, source_key: str, display_name: str, media_type: str, content: bytes,
+    connection: psycopg.Connection,
+    context: TenantContext,
+    root: Path,
+    *,
+    kind: str,
+    source_key: str,
+    display_name: str,
+    media_type: str,
+    content: bytes,
 ) -> dict:
     context.require("policies.draft")
     if context.actor.role != "org_admin":
@@ -92,10 +99,14 @@ def save_source(
         ).fetchone()
         if case is None:
             raise ValueError("An onboarding case is required")
-        if case[1] == "locked_candidate" and connection.execute(
-            "SELECT 1 FROM releases WHERE organization_id = %s AND state = 'active'",
-            (context.organization_id,),
-        ).fetchone() is None:
+        if (
+            case[1] == "locked_candidate"
+            and connection.execute(
+                "SELECT 1 FROM releases WHERE organization_id = %s AND state = 'active'",
+                (context.organization_id,),
+            ).fetchone()
+            is None
+        ):
             raise ValueError("An open onboarding case or active release is required")
         source = connection.execute(
             "INSERT INTO evidence_sources (organization_id, case_id, kind, source_key, display_name) "
@@ -110,8 +121,12 @@ def save_source(
             (context.organization_id, source),
         ).fetchone()
         if previous and previous[2] == digest:
-            return {"source_id": source, "revision_id": previous[0],
-                    "revision": previous[1], "changed": False}
+            return {
+                "source_id": source,
+                "revision_id": previous[0],
+                "revision": previous[1],
+                "changed": False,
+            }
         number = previous[1] + 1 if previous else 1
         revision = connection.execute(
             "INSERT INTO evidence_revisions (organization_id, source_id, revision, sha256, "
@@ -126,15 +141,24 @@ def save_source(
 
         active = connection.execute(
             "SELECT blueprint_id, approved_by FROM releases WHERE organization_id = %s "
-            "AND state = 'active'", (context.organization_id,),
+            "AND state = 'active'",
+            (context.organization_id,),
         ).fetchone()
         if active:
             open_review(
-                connection, context, trigger="changed_evidence", subject_id=revision,
-                owner_user_id=active[1], blueprint_id=active[0],
-                citations=[{"source_id": str(source),
-                            "prior_revision_id": str(previous[0]) if previous else None,
-                            "revision_id": str(revision)}],
+                connection,
+                context,
+                trigger="changed_evidence",
+                subject_id=revision,
+                owner_user_id=active[1],
+                blueprint_id=active[0],
+                citations=[
+                    {
+                        "source_id": str(source),
+                        "prior_revision_id": str(previous[0]) if previous else None,
+                        "revision_id": str(revision),
+                    }
+                ],
                 impact="Evidence changed after the active blueprint was released.",
                 next_step="Review the evidence and clarify any affected business meaning.",
             )
@@ -152,32 +176,52 @@ def save_file(connection, context, root, filename: str, content: bytes, *, linke
     media_type = validate_file(name, content)
     if linkedin and not name.lower().endswith((".csv", ".xlsx", ".txt", ".pdf", ".docx")):
         raise ValueError("Unsupported LinkedIn export")
-    return save_source(connection, context, root, kind="linkedin_export" if linkedin else "file",
-                       source_key=name.casefold(), display_name=name, media_type=media_type,
-                       content=content)
+    return save_source(
+        connection,
+        context,
+        root,
+        kind="linkedin_export" if linkedin else "file",
+        source_key=name.casefold(),
+        display_name=name,
+        media_type=media_type,
+        content=content,
+    )
 
 
-def set_source_access(connection, context: TenantContext, source_id: UUID, *,
-                      access_label: str, department_id: UUID | None = None,
-                      owner_user_id: UUID | None = None) -> None:
+def set_source_access(
+    connection,
+    context: TenantContext,
+    source_id: UUID,
+    *,
+    access_label: str,
+    department_id: UUID | None = None,
+    owner_user_id: UUID | None = None,
+) -> None:
     context.require("policies.draft")
     if context.actor.role != "org_admin":
         raise PermissionError("Organization admin required")
     if access_label not in {"organization", "department", "owner", "restricted"}:
         raise ValueError("Invalid access label")
     if access_label == "department":
-        if department_id is None or not connection.execute(
-            "SELECT 1 FROM departments WHERE organization_id = %s AND id = %s "
-            "AND archived_at IS NULL", (context.organization_id, department_id),
-        ).fetchone():
+        if (
+            department_id is None
+            or not connection.execute(
+                "SELECT 1 FROM departments WHERE organization_id = %s AND id = %s "
+                "AND archived_at IS NULL",
+                (context.organization_id, department_id),
+            ).fetchone()
+        ):
             raise ValueError("Active department required")
     elif department_id is not None:
         raise ValueError("Department is only valid for department access")
     if access_label == "owner":
-        if owner_user_id is None or not connection.execute(
-            "SELECT 1 FROM users WHERE organization_id = %s AND id = %s AND status = 'active'",
-            (context.organization_id, owner_user_id),
-        ).fetchone():
+        if (
+            owner_user_id is None
+            or not connection.execute(
+                "SELECT 1 FROM users WHERE organization_id = %s AND id = %s AND status = 'active'",
+                (context.organization_id, owner_user_id),
+            ).fetchone()
+        ):
             raise ValueError("Active owner required")
     elif owner_user_id is not None:
         raise ValueError("Owner is only valid for owner access")
@@ -194,14 +238,29 @@ def set_source_access(connection, context: TenantContext, source_id: UUID, *,
 def save_manual(connection, context, root, text: str):
     if not text.strip():
         raise ValueError("LinkedIn Page text is required")
-    return save_source(connection, context, root, kind="linkedin_manual",
-                       source_key="admin_supplied_page_text", display_name="LinkedIn Page text",
-                       media_type="text/plain", content=text.encode("utf-8"))
+    return save_source(
+        connection,
+        context,
+        root,
+        kind="linkedin_manual",
+        source_key="admin_supplied_page_text",
+        display_name="LinkedIn Page text",
+        media_type="text/plain",
+        content=text.encode("utf-8"),
+    )
 
 
 def save_website_page(connection, context, root, url: str, content: bytes):
-    return save_source(connection, context, root, kind="website", source_key=url,
-                       display_name=url, media_type="text/html", content=content)
+    return save_source(
+        connection,
+        context,
+        root,
+        kind="website",
+        source_key=url,
+        display_name=url,
+        media_type="text/html",
+        content=content,
+    )
 
 
 def save_interview(connection, context: TenantContext, description: str, outcome: str) -> dict:
@@ -210,7 +269,9 @@ def save_interview(connection, context: TenantContext, description: str, outcome
         raise PermissionError("Organization admin required")
     description, outcome = description.strip(), outcome.strip()
     if not description or not outcome or len(description) > 10000 or len(outcome) > 10000:
-        raise ValueError("Business description and desired outcome are required (10,000 characters max)")
+        raise ValueError(
+            "Business description and desired outcome are required (10,000 characters max)"
+        )
     with tenant_transaction(connection, context):
         row = connection.execute(
             "UPDATE onboarding_cases SET business_description = %s, desired_outcome = %s, "
@@ -260,8 +321,16 @@ def process_job(connection, context: TenantContext, root: Path, revision_id: UUI
             else:
                 batch = list(itertools.islice(iterator, cursor, cursor + limit + 1))
                 complete = len(batch) <= limit
-        except (ValueError, OSError, RuntimeError, UnicodeError, csv.Error,
-                zipfile.BadZipFile, InvalidFileException, PdfReadError) as error:
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            UnicodeError,
+            csv.Error,
+            zipfile.BadZipFile,
+            InvalidFileException,
+            PdfReadError,
+        ) as error:
             failure = "partial" if cursor else "failed"
             connection.execute(
                 "UPDATE evidence_jobs SET state = %s, attempts = attempts + 1, updated_at = now() "
@@ -273,8 +342,12 @@ def process_job(connection, context: TenantContext, root: Path, revision_id: UUI
                 "WHERE organization_id = %s AND id = %s",
                 (failure, str(error)[:500], context.organization_id, revision_id),
             )
-            return {"revision_id": revision_id, "state": failure,
-                    "extracted_units": cursor, "error": str(error)[:500]}
+            return {
+                "revision_id": revision_id,
+                "state": failure,
+                "extracted_units": cursor,
+                "error": str(error)[:500],
+            }
         selected = batch[:limit]
         for locator, value in selected:
             for chunk_locator, text in chunks(locator, value):
@@ -289,8 +362,16 @@ def process_job(connection, context: TenantContext, root: Path, revision_id: UUI
                     "INSERT INTO evidence_chunks (organization_id, revision_id, locator, text, "
                     "content_hash, token_count, embedding, embedding_model) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                    (context.organization_id, revision_id, chunk_locator, text, content_hash,
-                     len(text.split()), embedding, EMBEDDING_MODEL),
+                    (
+                        context.organization_id,
+                        revision_id,
+                        chunk_locator,
+                        text,
+                        content_hash,
+                        len(text.split()),
+                        embedding,
+                        EMBEDDING_MODEL,
+                    ),
                 )
         next_cursor = cursor + len(selected)
         next_state = "complete" if complete else "pending"
@@ -302,11 +383,20 @@ def process_job(connection, context: TenantContext, root: Path, revision_id: UUI
         connection.execute(
             "UPDATE evidence_revisions SET status = %s, extracted_units = %s, "
             "total_units = %s, error = NULL WHERE organization_id = %s AND id = %s",
-            (next_state, next_cursor, next_cursor if complete else None,
-             context.organization_id, revision_id),
+            (
+                next_state,
+                next_cursor,
+                next_cursor if complete else None,
+                context.organization_id,
+                revision_id,
+            ),
         )
-        return {"revision_id": revision_id, "state": next_state,
-                "extracted_units": next_cursor, "total_units": next_cursor if complete else None}
+        return {
+            "revision_id": revision_id,
+            "state": next_state,
+            "extracted_units": next_cursor,
+            "total_units": next_cursor if complete else None,
+        }
 
 
 def list_sources(connection, context: TenantContext) -> list[dict]:
@@ -322,9 +412,30 @@ def list_sources(connection, context: TenantContext) -> list[dict]:
             "WHERE s.organization_id = %s ORDER BY s.created_at DESC",
             (context.organization_id,),
         ).fetchall()
-    return [dict(zip(("id", "kind", "name", "excluded", "revision_id", "revision",
-                      "sha256", "captured_at", "status", "extracted_units", "total_units",
-                      "error", "chunk_count"), row, strict=True)) for row in rows]
+    return [
+        dict(
+            zip(
+                (
+                    "id",
+                    "kind",
+                    "name",
+                    "excluded",
+                    "revision_id",
+                    "revision",
+                    "sha256",
+                    "captured_at",
+                    "status",
+                    "extracted_units",
+                    "total_units",
+                    "error",
+                    "chunk_count",
+                ),
+                row,
+                strict=True,
+            )
+        )
+        for row in rows
+    ]
 
 
 def preview_source(connection, context: TenantContext, source_id: UUID) -> list[dict]:
@@ -338,8 +449,10 @@ def preview_source(connection, context: TenantContext, source_id: UUID) -> list[
             "WHERE s.organization_id = %s AND s.id = %s ORDER BY c.locator LIMIT 30",
             (context.organization_id, source_id),
         ).fetchall()
-    return [{"locator": locator, "text": text, "captured_at": captured_at}
-            for locator, text, captured_at in rows]
+    return [
+        {"locator": locator, "text": text, "captured_at": captured_at}
+        for locator, text, captured_at in rows
+    ]
 
 
 def exclude_source(connection, context: TenantContext, source_id: UUID, excluded: bool) -> None:

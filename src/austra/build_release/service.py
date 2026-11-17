@@ -116,8 +116,8 @@ def transition_build(
     with tenant_transaction(connection, context):
         if target in {"admin_preview", "accepted", "ready_for_release"}:
             patch = connection.execute(
-                "SELECT 1 FROM defects WHERE organization_id = %s AND patch_build_id = %s "
-                "LIMIT 1", (context.organization_id, build_id),
+                "SELECT 1 FROM defects WHERE organization_id = %s AND patch_build_id = %s LIMIT 1",
+                (context.organization_id, build_id),
             ).fetchone()
             artifact = connection.execute(
                 "SELECT verification, preview_state FROM capability_build_artifacts "
@@ -128,7 +128,11 @@ def transition_build(
                 raise ValueError("Patch build needs independent verification")
             if artifact and (not artifact[0] or not artifact[0].get("passed")):
                 raise ValueError("Independent capability verification has not passed")
-            if artifact and target in {"accepted", "ready_for_release"} and artifact[1] != "accepted":
+            if (
+                artifact
+                and target in {"accepted", "ready_for_release"}
+                and artifact[1] != "accepted"
+            ):
                 raise ValueError("Admin preview has not been accepted")
         _blueprint_id, revision = _transition(
             connection, context, build_id, target, expected_revision, correlation_id
@@ -151,19 +155,33 @@ def record_defect(
     if not expected.strip() or not observed.strip():
         raise ValueError("Expected and observed behavior are required")
     with tenant_transaction(connection, context):
-        _transition(connection, context, build_id, "defect_found", expected_revision, correlation_id)
+        _transition(
+            connection, context, build_id, "defect_found", expected_revision, correlation_id
+        )
         defect_id = connection.execute(
             "INSERT INTO defects (organization_id, build_id, expected, observed, owner_user_id, trace) "
             "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-            (context.organization_id, build_id, expected, observed, owner_user_id, Jsonb(trace or {})),
+            (
+                context.organization_id,
+                build_id,
+                expected,
+                observed,
+                owner_user_id,
+                Jsonb(trace or {}),
+            ),
         ).fetchone()[0]
     return defect_id
 
 
 def preview_build(
-    connection: psycopg.Connection, context: TenantContext, build_id: UUID,
-    expected_revision: int, accepted: bool, expected: str | None = None,
-    observed: str | None = None, trace: dict | None = None,
+    connection: psycopg.Connection,
+    context: TenantContext,
+    build_id: UUID,
+    expected_revision: int,
+    accepted: bool,
+    expected: str | None = None,
+    observed: str | None = None,
+    trace: dict | None = None,
 ) -> dict:
     context.require("workflows.approve")
     if not accepted and (not expected or not observed):
@@ -182,13 +200,26 @@ def preview_build(
         connection.execute(
             "UPDATE capability_build_artifacts SET preview_state = %s, preview_by = %s, "
             "preview_at = now() WHERE organization_id = %s AND build_id = %s",
-            ("accepted" if accepted else "failed", context.actor.user_id,
-             context.organization_id, build_id),
+            (
+                "accepted" if accepted else "failed",
+                context.actor.user_id,
+                context.organization_id,
+                build_id,
+            ),
         )
     if accepted:
         return {"accepted": True, "build_id": build_id}
-    defect_id = record_defect(connection, context, build_id, expected_revision, expected,
-                              observed, context.actor.user_id, uuid4(), trace)
+    defect_id = record_defect(
+        connection,
+        context,
+        build_id,
+        expected_revision,
+        expected,
+        observed,
+        context.actor.user_id,
+        uuid4(),
+        trace,
+    )
     return {"accepted": False, "defect_id": defect_id, "build_id": build_id}
 
 
@@ -259,16 +290,28 @@ def publish(
             "SELECT 1 FROM defects WHERE organization_id = %s AND patch_build_id = %s LIMIT 1",
             (context.organization_id, build_id),
         ).fetchone()
-        if patch and (gate[0] != gate[2] or not gate[3] or not gate[3].get("passed")
-                      or gate[4] != "accepted" or not gate[5]):
+        if patch and (
+            gate[0] != gate[2]
+            or not gate[3]
+            or not gate[3].get("passed")
+            or gate[4] != "accepted"
+            or not gate[5]
+        ):
             raise ValueError("Patch release gates have not passed")
-        if any(item.get("kind") == "capability"
-               for item in gate[1].get("revisions", [])):
-            if (gate[0] != gate[2] or not gate[3] or not gate[3].get("passed")
-                or gate[4] != "accepted" or not gate[5]):
+        if any(item.get("kind") == "capability" for item in gate[1].get("revisions", [])):
+            if (
+                gate[0] != gate[2]
+                or not gate[3]
+                or not gate[3].get("passed")
+                or gate[4] != "accepted"
+                or not gate[5]
+            ):
                 raise ValueError("Capability release gates have not passed")
-            if any(item.get("key") == "so_inventory_po_email"
-                   for item in gate[1].get("revisions", []) if item.get("kind") == "capability"):
+            if any(
+                item.get("key") == "so_inventory_po_email"
+                for item in gate[1].get("revisions", [])
+                if item.get("kind") == "capability"
+            ):
                 healthy = connection.execute(
                     "SELECT state FROM capability_connection_health "
                     "WHERE organization_id = %s AND provider_key = 'email'",
@@ -369,8 +412,7 @@ def rollback(
                 (context.organization_id, blueprint_id),
             )
             connection.execute(
-                "UPDATE blueprints SET status = 'active' WHERE organization_id = %s "
-                "AND id = %s",
+                "UPDATE blueprints SET status = 'active' WHERE organization_id = %s AND id = %s",
                 (context.organization_id, previous_blueprint),
             )
     return previous_id

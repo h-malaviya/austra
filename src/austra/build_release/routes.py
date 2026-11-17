@@ -32,8 +32,11 @@ class OutcomeInput(BaseModel):
 def install_monitoring_routes(app: FastAPI, identity: SaasIdentity) -> None:
     def run(request: Request, operation):
         actor, _remaining = identity.session(request.cookies.get("austra_session"))
-        if (actor is None or actor.role != "org_admin"
-                or request.state.organization_slug in {None, "platform"}):
+        if (
+            actor is None
+            or actor.role != "org_admin"
+            or request.state.organization_slug in {None, "platform"}
+        ):
             raise HTTPException(status_code=403, detail="Organization admin required")
         try:
             context = TenantContext.from_auth(actor)
@@ -56,19 +59,35 @@ def install_monitoring_routes(app: FastAPI, identity: SaasIdentity) -> None:
 
     @app.post("/api/org/review-cases/{case_id}/resolve")
     def resolve(case_id: UUID, request: Request):
-        return run(request, lambda db, context: {"resolved":
-                   resolve_review(db, context, case_id) is None})
+        return run(
+            request, lambda db, context: {"resolved": resolve_review(db, context, case_id) is None}
+        )
 
     @app.post("/api/org/review-cases/outcome-conflicts/{event_id}")
     def outcome(event_id: UUID, payload: OutcomeInput, request: Request):
-        return run(request, lambda db, context: {"case_id": report_outcome_conflict(
-            db, context, event_id, payload.expected, payload.observed)})
+        return run(
+            request,
+            lambda db, context: {
+                "case_id": report_outcome_conflict(
+                    db, context, event_id, payload.expected, payload.observed
+                )
+            },
+        )
 
     @app.post("/api/org/releases/{release_id}/triage")
     def triage(release_id: UUID, payload: FeedbackInput, request: Request):
-        return run(request, lambda db, context: triage_feedback(
-            db, context, release_id, payload.classification, payload.expected,
-            payload.observed, payload.citations))
+        return run(
+            request,
+            lambda db, context: triage_feedback(
+                db,
+                context,
+                release_id,
+                payload.classification,
+                payload.expected,
+                payload.observed,
+                payload.citations,
+            ),
+        )
 
     @app.get("/api/org/observability")
     def observability(request: Request):

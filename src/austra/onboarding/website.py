@@ -15,7 +15,9 @@ FETCH_TIMEOUT_SECONDS = 8
 
 class _PinnedHTTPS(http.client.HTTPSConnection):
     def __init__(self, host: str, address: str, port: int):
-        super().__init__(host, port, timeout=FETCH_TIMEOUT_SECONDS, context=ssl.create_default_context())
+        super().__init__(
+            host, port, timeout=FETCH_TIMEOUT_SECONDS, context=ssl.create_default_context()
+        )
         self.address = address
 
     def connect(self):
@@ -34,7 +36,12 @@ class _PinnedHTTP(http.client.HTTPConnection):
 
 def public_target(url: str) -> tuple[str, str, int, str]:
     parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
         raise ValueError("A public HTTP or HTTPS URL is required")
     try:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -60,11 +67,20 @@ def fetch_page(url: str) -> tuple[str, bytes]:
     for _ in range(MAX_REDIRECTS + 1):
         host, address, port, safe_url = public_target(url)
         parsed = urlsplit(safe_url)
-        connection = (_PinnedHTTPS if parsed.scheme == "https" else _PinnedHTTP)(host, address, port)
+        connection = (_PinnedHTTPS if parsed.scheme == "https" else _PinnedHTTP)(
+            host, address, port
+        )
         try:
-            connection.request("GET", parsed.path + (f"?{parsed.query}" if parsed.query else ""),
-                               headers={"Host": host, "Accept": "text/html", "Accept-Encoding": "identity",
-                                        "User-Agent": "AustraEvidenceBot/1.0"})
+            connection.request(
+                "GET",
+                parsed.path + (f"?{parsed.query}" if parsed.query else ""),
+                headers={
+                    "Host": host,
+                    "Accept": "text/html",
+                    "Accept-Encoding": "identity",
+                    "User-Agent": "AustraEvidenceBot/1.0",
+                },
+            )
             response = connection.getresponse()
             if response.status in {301, 302, 303, 307, 308}:
                 location = response.getheader("Location")
@@ -75,7 +91,8 @@ def fetch_page(url: str) -> tuple[str, bytes]:
             if response.status != 200:
                 raise ValueError(f"Website returned HTTP {response.status}")
             if not response.getheader("Content-Type", "").lower().split(";", 1)[0] in {
-                "text/html", "application/xhtml+xml"
+                "text/html",
+                "application/xhtml+xml",
             }:
                 raise ValueError("Website response is not HTML")
             if response.getheader("Content-Encoding", "identity").lower() != "identity":
@@ -142,6 +159,16 @@ def crawl(root: str):
             for href in parser.links:
                 candidate = urljoin(final_url, href)
                 parsed = urlsplit(candidate)
-                if (parsed.hostname == root_host and parsed.scheme in {"http", "https"}
-                        and len(queue) < MAX_PAGES):
-                    queue.append((urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, "")), 1))
+                if (
+                    parsed.hostname == root_host
+                    and parsed.scheme in {"http", "https"}
+                    and len(queue) < MAX_PAGES
+                ):
+                    queue.append(
+                        (
+                            urlunsplit(
+                                (parsed.scheme, parsed.netloc, parsed.path, parsed.query, "")
+                            ),
+                            1,
+                        )
+                    )

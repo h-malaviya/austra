@@ -12,8 +12,11 @@ EmailSender = Callable[[dict, str], str | None]
 
 
 def deliver_email(
-    connection: psycopg.Connection, context: TenantContext, job_id: UUID,
-    lookup_receipt: ReceiptLookup, send: EmailSender,
+    connection: psycopg.Connection,
+    context: TenantContext,
+    job_id: UUID,
+    lookup_receipt: ReceiptLookup,
+    send: EmailSender,
 ) -> dict:
     context.require("workflows.approve")
     with tenant_transaction(connection, context):

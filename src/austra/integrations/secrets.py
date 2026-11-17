@@ -25,9 +25,14 @@ class ConnectionSecrets:
         return self.root / str(organization_id) / str(connection_id)
 
     def save(self, organization_id: UUID, connection_id: UUID, values: dict[str, str]) -> None:
-        if not values or any(not isinstance(value, str) or (not value and name != "token")
-                             or len(value) > 8000
-                             or "\n" in value or "\r" in value for name, value in values.items()):
+        if not values or any(
+            not isinstance(value, str)
+            or (not value and name != "token")
+            or len(value) > 8000
+            or "\n" in value
+            or "\r" in value
+            for name, value in values.items()
+        ):
             raise ValueError("Private credential fields must be nonempty single lines")
         path = self._path(organization_id, connection_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,8 +45,9 @@ class ConnectionSecrets:
 
     def read(self, organization_id: UUID, connection_id: UUID) -> dict[str, str]:
         try:
-            return json.loads(self._cipher().decrypt(
-                self._path(organization_id, connection_id).read_bytes()))
+            return json.loads(
+                self._cipher().decrypt(self._path(organization_id, connection_id).read_bytes())
+            )
         except (FileNotFoundError, InvalidToken) as error:
             raise RuntimeError("Connection credential is unavailable; reconnect") from error
 

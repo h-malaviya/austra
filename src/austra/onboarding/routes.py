@@ -81,8 +81,9 @@ def install_onboarding_routes(app: FastAPI, identity: SaasIdentity) -> None:
         context = admin_context(request)
         try:
             with identity.connect() as connection:
-                return save_interview(connection, context, payload.business_description,
-                                      payload.desired_outcome)
+                return save_interview(
+                    connection, context, payload.business_description, payload.desired_outcome
+                )
         except (ValueError, PermissionError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -93,14 +94,22 @@ def install_onboarding_routes(app: FastAPI, identity: SaasIdentity) -> None:
             return list_sources(connection, context)
 
     @app.post("/api/org/onboarding-sources/files", status_code=201)
-    async def upload_file(request: Request, upload: Annotated[UploadFile, File()], linkedin: bool = False):
+    async def upload_file(
+        request: Request, upload: Annotated[UploadFile, File()], linkedin: bool = False
+    ):
         context = admin_context(request)
         content = await upload.read(MAX_SOURCE_BYTES + 1)
         await upload.close()
         try:
             with identity.connect() as connection:
-                return save_file(connection, context, blob_root(), upload.filename or "", content,
-                                 linkedin=linkedin)
+                return save_file(
+                    connection,
+                    context,
+                    blob_root(),
+                    upload.filename or "",
+                    content,
+                    linkedin=linkedin,
+                )
         except (ValueError, UnicodeError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 

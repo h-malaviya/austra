@@ -96,7 +96,8 @@ def locked_blueprint(connection, context, event_id):
     ).fetchone()[0]
     connection.execute(
         "INSERT INTO blueprint_manifests (organization_id, blueprint_id, manifest) "
-        "VALUES (%s, %s, %s)", (context.organization_id, blueprint_id, Jsonb({})),
+        "VALUES (%s, %s, %s)",
+        (context.organization_id, blueprint_id, Jsonb({})),
     )
     connection.execute(
         "UPDATE onboarding_cases SET state = 'locked_candidate', blueprint_id = %s "
@@ -120,10 +121,13 @@ def test_rls_role_tenant_department_and_support_expiry(database):
     first_case = open_case(database, first.organization_id, first_event)
     second_case = open_case(database, second.organization_id, second_event)
     assert open_case(database, first.organization_id, first_event) == first_case
-    assert database.execute(
-        "SELECT count(*) FROM outbox_jobs WHERE organization_id = %s AND topic = 'onboarding.case_opened'",
-        (first.organization_id,),
-    ).fetchone()[0] == 1
+    assert (
+        database.execute(
+            "SELECT count(*) FROM outbox_jobs WHERE organization_id = %s AND topic = 'onboarding.case_opened'",
+            (first.organization_id,),
+        ).fetchone()[0]
+        == 1
+    )
     with tenant_transaction(database, first):
         role = database.execute("SELECT current_user").fetchone()[0]
         assert role == "austra_tenant_app"
@@ -133,8 +137,7 @@ def test_rls_role_tenant_department_and_support_expiry(database):
         assert database.execute("SELECT id FROM onboarding_cases").fetchall() == [(first_case,)]
         with pytest.raises(psycopg.errors.InsufficientPrivilege), database.transaction():
             database.execute(
-                "INSERT INTO onboarding_cases (organization_id, created_event_id) "
-                "VALUES (%s, %s)",
+                "INSERT INTO onboarding_cases (organization_id, created_event_id) VALUES (%s, %s)",
                 (second.organization_id, uuid4()),
             )
     with tenant_transaction(database, second):
@@ -185,14 +188,22 @@ def test_rls_role_tenant_department_and_support_expiry(database):
     ).fetchone()[0]
     support = TenantContext.from_auth(
         AuthContext(
-            support_user, None, "super_admin", True, True,
-            support=SupportContext(first.organization_id, "Investigate", datetime.now(UTC) + timedelta(minutes=5)),
+            support_user,
+            None,
+            "super_admin",
+            True,
+            True,
+            support=SupportContext(
+                first.organization_id, "Investigate", datetime.now(UTC) + timedelta(minutes=5)
+            ),
         )
     )
     assert current_case(database, support)["id"] == first_case
-    with tenant_transaction(database, support), pytest.raises(
-        psycopg.errors.InsufficientPrivilege
-    ), database.transaction():
+    with (
+        tenant_transaction(database, support),
+        pytest.raises(psycopg.errors.InsufficientPrivilege),
+        database.transaction(),
+    ):
         database.execute(
             "INSERT INTO onboarding_cases (organization_id, created_event_id) VALUES (%s, %s)",
             (first.organization_id, uuid4()),
@@ -200,8 +211,14 @@ def test_rls_role_tenant_department_and_support_expiry(database):
     with pytest.raises(PermissionError):
         TenantContext.from_auth(
             AuthContext(
-                support_user, None, "super_admin", True, True,
-                support=SupportContext(first.organization_id, "Investigate", datetime.now(UTC) - timedelta(seconds=1)),
+                support_user,
+                None,
+                "super_admin",
+                True,
+                True,
+                support=SupportContext(
+                    first.organization_id, "Investigate", datetime.now(UTC) - timedelta(seconds=1)
+                ),
             )
         )
     assert database.execute("SELECT current_user").fetchone()[0] != "austra_tenant_app"
@@ -211,7 +228,9 @@ def test_lifecycle_defect_patch_release_and_rollback(database):
     context, event_id = make_organization(database, "cycle")
     case_id = open_case(database, context.organization_id, event_id)
     with pytest.raises(ValueError, match="Illegal onboarding"):
-        transition_case(database, context, case_id, "locked_candidate", 1, uuid4(), content_hash="a" * 64)
+        transition_case(
+            database, context, case_id, "locked_candidate", 1, uuid4(), content_hash="a" * 64
+        )
     with pytest.raises(ValueError, match="Stale case"):
         transition_case(database, context, case_id, "collecting", 2, uuid4())
     _, blueprint_id = locked_blueprint(database, context, event_id)
@@ -221,7 +240,14 @@ def test_lifecycle_defect_patch_release_and_rollback(database):
         transition_build(database, context, build["id"], "accepted", 1, uuid4())
     revision = transition_build(database, context, build["id"], "testing", 1, uuid4())
     defect_id = record_defect(
-        database, context, build["id"], revision, "Expected stock", "Missing stock", context.actor.user_id, uuid4()
+        database,
+        context,
+        build["id"],
+        revision,
+        "Expected stock",
+        "Missing stock",
+        context.actor.user_id,
+        uuid4(),
     )
     with pytest.raises(ValueError, match="Illegal build"):
         transition_build(database, context, build["id"], "admin_preview", revision + 1, uuid4())
@@ -235,7 +261,14 @@ def test_lifecycle_defect_patch_release_and_rollback(database):
     revision = transition_build(database, context, fixed["id"], "testing", 1, uuid4())
     revision = transition_build(database, context, fixed["id"], "admin_preview", revision, uuid4())
     preview_defect = record_defect(
-        database, context, fixed["id"], revision, "Expected preview", "Wrong preview", context.actor.user_id, uuid4()
+        database,
+        context,
+        fixed["id"],
+        revision,
+        "Expected preview",
+        "Wrong preview",
+        context.actor.user_id,
+        uuid4(),
     )
     fixed_again = fix_defect(database, context, preview_defect, revision + 1, uuid4())
     assert fixed_again["build_revision"] == 3
@@ -247,28 +280,43 @@ def test_lifecycle_defect_patch_release_and_rollback(database):
     patch_release = publish(database, context, patch["id"], patch_revision, uuid4())
     assert patch["build_revision"] == 4
     assert rollback(database, context, patch_release, uuid4()) == first_release
-    assert database.execute(
-        "SELECT id FROM releases WHERE organization_id = %s AND state = 'active'",
-        (context.organization_id,),
-    ).fetchone()[0] == first_release
+    assert (
+        database.execute(
+            "SELECT id FROM releases WHERE organization_id = %s AND state = 'active'",
+            (context.organization_id,),
+        ).fetchone()[0]
+        == first_release
+    )
     with pytest.raises(ValueError, match="No rollback"):
         rollback(database, context, first_release, uuid4())
-    assert database.execute(
-        "SELECT blueprint_version FROM blueprints WHERE id = %s", (blueprint_id,)
-    ).fetchone()[0] == 1
-    assert database.execute(
-        "SELECT count(*) FROM releases WHERE organization_id = %s",
-        (context.organization_id,),
-    ).fetchone()[0] == 2
-    assert database.execute(
-        "SELECT state FROM builds WHERE organization_id = %s AND id = %s",
-        (context.organization_id, patch["id"]),
-    ).fetchone()[0] == "rolled_back"
-    assert database.execute(
-        "SELECT count(*) FROM lifecycle_events WHERE organization_id = %s "
-        "AND resource_type = 'release' AND correlation_id IS NOT NULL",
-        (context.organization_id,),
-    ).fetchone()[0] == 2
+    assert (
+        database.execute(
+            "SELECT blueprint_version FROM blueprints WHERE id = %s", (blueprint_id,)
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        database.execute(
+            "SELECT count(*) FROM releases WHERE organization_id = %s",
+            (context.organization_id,),
+        ).fetchone()[0]
+        == 2
+    )
+    assert (
+        database.execute(
+            "SELECT state FROM builds WHERE organization_id = %s AND id = %s",
+            (context.organization_id, patch["id"]),
+        ).fetchone()[0]
+        == "rolled_back"
+    )
+    assert (
+        database.execute(
+            "SELECT count(*) FROM lifecycle_events WHERE organization_id = %s "
+            "AND resource_type = 'release' AND correlation_id IS NOT NULL",
+            (context.organization_id,),
+        ).fetchone()[0]
+        == 2
+    )
 
 
 def test_expiry_boundary_review_owner_and_tenant_metrics(database):
@@ -286,21 +334,40 @@ def test_expiry_boundary_review_owner_and_tenant_metrics(database):
         "INSERT INTO semantic_revisions (organization_id, object_id, revision, "
         "owner_user_id, rationale, content, valid_from, valid_to) "
         "VALUES (%s, %s, 1, %s, 'fixture', '{}'::jsonb, %s, %s) RETURNING id",
-        (first.organization_id, object_id, first.actor.user_id,
-         fixed_time - timedelta(days=1), expires),
+        (
+            first.organization_id,
+            object_id,
+            first.actor.user_id,
+            fixed_time - timedelta(days=1),
+            expires,
+        ),
     ).fetchone()[0]
-    database.execute("INSERT INTO blueprint_members (organization_id, blueprint_id, "
-                     "revision_id) VALUES (%s, %s, %s)",
-                     (first.organization_id, blueprint_id, revision_id))
+    database.execute(
+        "INSERT INTO blueprint_members (organization_id, blueprint_id, "
+        "revision_id) VALUES (%s, %s, %s)",
+        (first.organization_id, blueprint_id, revision_id),
+    )
     build, revision = ready_build(database, first, blueprint_id)
     publish(database, first, build["id"], revision, uuid4())
     database.execute(
         "INSERT INTO capability_build_artifacts (organization_id, build_id, blueprint_hash, "
         "manifest, fixtures, rollback_plan) VALUES (%s, %s, %s, %s, '{}'::jsonb, 'restore')",
-        (first.organization_id, build["id"], "a" * 64,
-         Jsonb({"decision_tables": [{"id": str(revision_id),
-                                    "valid_to": expires.isoformat(),
-                                    "content": {"decision_key": "command.submit_order"}}]})),
+        (
+            first.organization_id,
+            build["id"],
+            "a" * 64,
+            Jsonb(
+                {
+                    "decision_tables": [
+                        {
+                            "id": str(revision_id),
+                            "valid_to": expires.isoformat(),
+                            "content": {"decision_key": "command.submit_order"},
+                        }
+                    ]
+                }
+            ),
+        ),
     )
     assert scan_policy_expiry(database, first, fixed_time - timedelta(microseconds=1)) == []
     scan_command_expiry(database, first, "submit_order", fixed_time)
@@ -316,12 +383,15 @@ def test_expiry_boundary_review_owner_and_tenant_metrics(database):
     record_metric(database, first, "task_cost_usd", 0.25)
     assert review_dashboard(database, first)["cost_per_resolved_task_usd"] == Decimal("0.25")
     assert review_dashboard(database, second)["metrics"] == {}
-    with tenant_transaction(database, first), pytest.raises(
-        psycopg.errors.InsufficientPrivilege
-    ), database.transaction():
+    with (
+        tenant_transaction(database, first),
+        pytest.raises(psycopg.errors.InsufficientPrivilege),
+        database.transaction(),
+    ):
         database.execute(
             "INSERT INTO operational_metrics (organization_id, metric, value) "
-            "VALUES (%s, 'retrieval_miss', 1)", (second.organization_id,),
+            "VALUES (%s, 'retrieval_miss', 1)",
+            (second.organization_id,),
         )
 
 
@@ -331,22 +401,56 @@ def test_feedback_triage_patch_versus_next_blueprint_case(database):
     build, revision = ready_build(database, context, blueprint_id)
     release_id = publish(database, context, build["id"], revision, uuid4())
     citation = [{"build_id": str(build["id"]), "blueprint_id": str(blueprint_id)}]
-    bug = triage_feedback(database, context, release_id, "implementation_bug",
-                          "approved result", "wrong result", citation)
-    assert triage_feedback(database, context, release_id, "implementation_bug",
-                           "approved result", "wrong result", citation) == bug
+    bug = triage_feedback(
+        database,
+        context,
+        release_id,
+        "implementation_bug",
+        "approved result",
+        "wrong result",
+        citation,
+    )
+    assert (
+        triage_feedback(
+            database,
+            context,
+            release_id,
+            "implementation_bug",
+            "approved result",
+            "wrong result",
+            citation,
+        )
+        == bug
+    )
     assert bug["blueprint_id"] == blueprint_id
-    assert database.execute("SELECT blueprint_id FROM builds WHERE id = %s",
-                            (bug["patch_build_id"],)).fetchone()[0] == blueprint_id
-    patch_revision = transition_build(database, context, bug["patch_build_id"],
-                                      "testing", 1, uuid4())
+    assert (
+        database.execute(
+            "SELECT blueprint_id FROM builds WHERE id = %s", (bug["patch_build_id"],)
+        ).fetchone()[0]
+        == blueprint_id
+    )
+    patch_revision = transition_build(
+        database, context, bug["patch_build_id"], "testing", 1, uuid4()
+    )
     with pytest.raises(ValueError, match="independent verification"):
-        transition_build(database, context, bug["patch_build_id"],
-                         "admin_preview", patch_revision, uuid4())
-    assert database.execute("SELECT count(*) FROM blueprints WHERE organization_id = %s",
-                            (context.organization_id,)).fetchone()[0] == 1
-    meaning = triage_feedback(database, context, release_id, "business_meaning_change",
-                              "new rule requested", "old rule followed", citation)
+        transition_build(
+            database, context, bug["patch_build_id"], "admin_preview", patch_revision, uuid4()
+        )
+    assert (
+        database.execute(
+            "SELECT count(*) FROM blueprints WHERE organization_id = %s", (context.organization_id,)
+        ).fetchone()[0]
+        == 1
+    )
+    meaning = triage_feedback(
+        database,
+        context,
+        release_id,
+        "business_meaning_change",
+        "new rule requested",
+        "old rule followed",
+        citation,
+    )
     assert meaning["active_blueprint_id"] == blueprint_id
     assert current_case(database, context)["id"] == meaning["clarification_case_id"]
     assert current_case(database, context)["state"] == "clarifying"
@@ -354,8 +458,15 @@ def test_feedback_triage_patch_versus_next_blueprint_case(database):
     with pytest.raises(ValueError, match="Classify"):
         triage_feedback(database, context, release_id, "unreviewed", "a", "b", citation)
     with pytest.raises(ValueError, match="citation is outside"):
-        triage_feedback(database, context, release_id, "implementation_bug", "a", "b",
-                        [{"build_id": str(uuid4())}])
+        triage_feedback(
+            database,
+            context,
+            release_id,
+            "implementation_bug",
+            "a",
+            "b",
+            [{"build_id": str(uuid4())}],
+        )
 
 
 def test_event_retry_transaction_and_inventory(database, tmp_path):
@@ -364,14 +475,27 @@ def test_event_retry_transaction_and_inventory(database, tmp_path):
     event_id = emit_event(
         database, context, "sample.created", "key", correlation, {"value": 1}, outbox_topic="sample"
     )
-    assert emit_event(
-        database, context, "sample.created", "key", correlation, {"value": 1}, outbox_topic="sample"
-    ) == event_id
+    assert (
+        emit_event(
+            database,
+            context,
+            "sample.created",
+            "key",
+            correlation,
+            {"value": 1},
+            outbox_topic="sample",
+        )
+        == event_id
+    )
     with pytest.raises(ValueError, match="Idempotency key"):
         emit_event(database, context, "sample.created", "key", correlation, {"value": 2})
-    assert database.execute(
-        "SELECT count(*) FROM outbox_jobs WHERE organization_id = %s", (context.organization_id,)
-    ).fetchone()[0] == 1
+    assert (
+        database.execute(
+            "SELECT count(*) FROM outbox_jobs WHERE organization_id = %s",
+            (context.organization_id,),
+        ).fetchone()[0]
+        == 1
+    )
     job = lease_job(database, context, "sample")
     assert job["attempts"] == 1
     assert lease_job(database, context, "sample") is None
@@ -385,9 +509,7 @@ def test_event_retry_transaction_and_inventory(database, tmp_path):
     failed_reviews = list_reviews(database, context)
     assert failed_reviews[0]["trigger"] == "failed_run"
     assert failed_reviews[0]["owner_user_id"] == context.actor.user_id
-    database.execute(
-        "UPDATE outbox_jobs SET available_at = now() WHERE id = %s", (job["id"],)
-    )
+    database.execute("UPDATE outbox_jobs SET available_at = now() WHERE id = %s", (job["id"],))
     retried = lease_job(database, context, "sample")
     assert retried["id"] == job["id"] and retried["attempts"] == 3
     finish_job(database, context, job["id"], True)
@@ -410,10 +532,13 @@ def test_event_retry_transaction_and_inventory(database, tmp_path):
     )
     assert record_legacy_inventory(database, context.organization_id, tmp_path) == {"record": 1}
     assert record_legacy_inventory(database, context.organization_id, tmp_path) == {}
-    assert database.execute(
-        "SELECT sha256 FROM legacy_inventory WHERE organization_id = %s",
-        (context.organization_id,),
-    ).fetchone()[0] == hashlib.sha256(record_path.read_bytes()).hexdigest()
+    assert (
+        database.execute(
+            "SELECT sha256 FROM legacy_inventory WHERE organization_id = %s",
+            (context.organization_id,),
+        ).fetchone()[0]
+        == hashlib.sha256(record_path.read_bytes()).hexdigest()
+    )
     assert read_records(database, context, department_id, tmp_path) == [{"id": "one", "value": 5}]
     other, _ = make_organization(database, "other-record")
     assert read_records(database, other, department_id, tmp_path) == []

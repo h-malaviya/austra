@@ -47,12 +47,15 @@ def organization(connection, slug):
     ).fetchone()[0]
     case = connection.execute(
         "INSERT INTO onboarding_cases (organization_id, created_event_id) VALUES (%s, %s) "
-        "RETURNING id", (org, uuid4())
+        "RETURNING id",
+        (org, uuid4()),
     ).fetchone()[0]
     return TenantContext.from_auth(AuthContext(user, org, "org_admin", True, True)), case
 
 
-def approved_source(connection, actor, case, root, name, content, *, version=1, key="returns_policy"):
+def approved_source(
+    connection, actor, case, root, name, content, *, version=1, key="returns_policy"
+):
     source = save_file(connection, actor, root, name, content.encode())
     while process_job(connection, actor, root, source["revision_id"])["state"] != "complete":
         pass
@@ -63,7 +66,8 @@ def approved_source(connection, actor, case, root, name, content, *, version=1, 
         ).fetchone()[0]
         claim = connection.execute(
             "INSERT INTO source_claims (organization_id, chunk_id, proposition, confidence) "
-            "VALUES (%s, %s, %s, 1) RETURNING id", (actor.organization_id, chunk, content)
+            "VALUES (%s, %s, %s, 1) RETURNING id",
+            (actor.organization_id, chunk, content),
         ).fetchone()[0]
         connection.execute(
             "INSERT INTO claim_decisions (organization_id, claim_id, decision, decided_by, rationale) "
@@ -72,17 +76,23 @@ def approved_source(connection, actor, case, root, name, content, *, version=1, 
         )
         obj = connection.execute(
             "INSERT INTO semantic_objects (organization_id, kind, stable_key) "
-            "VALUES (%s, 'policy', %s) RETURNING id", (actor.organization_id, key)
+            "VALUES (%s, 'policy', %s) RETURNING id",
+            (actor.organization_id, key),
         ).fetchone()[0]
         revision = connection.execute(
             "INSERT INTO semantic_revisions (organization_id, object_id, revision, rationale, "
             "content, valid_from) VALUES (%s, %s, 1, 'fixture', %s, %s) RETURNING id",
-            (actor.organization_id, obj, '{"description":"approved policy"}',
-             datetime(2020, 1, 1, tzinfo=UTC)),
+            (
+                actor.organization_id,
+                obj,
+                '{"description":"approved policy"}',
+                datetime(2020, 1, 1, tzinfo=UTC),
+            ),
         ).fetchone()[0]
         connection.execute(
             "INSERT INTO semantic_revision_claims (organization_id, revision_id, claim_id) "
-            "VALUES (%s, %s, %s)", (actor.organization_id, revision, claim)
+            "VALUES (%s, %s, %s)",
+            (actor.organization_id, revision, claim),
         )
         blueprint = connection.execute(
             "INSERT INTO blueprints (organization_id, blueprint_version, content_hash, "
@@ -91,7 +101,8 @@ def approved_source(connection, actor, case, root, name, content, *, version=1, 
         ).fetchone()[0]
         connection.execute(
             "INSERT INTO blueprint_members (organization_id, blueprint_id, revision_id) "
-            "VALUES (%s, %s, %s)", (actor.organization_id, blueprint, revision)
+            "VALUES (%s, %s, %s)",
+            (actor.organization_id, blueprint, revision),
         )
     return source, chunk, blueprint
 
@@ -100,11 +111,21 @@ def test_labeled_recall_versions_tenants_and_unknown(database, tmp_path):
     first, first_case = organization(database, "first")
     second, second_case = organization(database, "second")
     _source, first_chunk, first_blueprint = approved_source(
-        database, first, first_case, tmp_path, "returns.txt",
-        "Partial receipt of supplier orders leaves the undelivered balance open.")
+        database,
+        first,
+        first_case,
+        tmp_path,
+        "returns.txt",
+        "Partial receipt of supplier orders leaves the undelivered balance open.",
+    )
     _other, second_chunk, _second_blueprint = approved_source(
-        database, second, second_case, tmp_path, "returns.txt",
-        "Partial receipt of supplier orders closes the undelivered balance.")
+        database,
+        second,
+        second_case,
+        tmp_path,
+        "returns.txt",
+        "Partial receipt of supplier orders closes the undelivered balance.",
+    )
     queries = [
         ("paraphrase", "How is a partially received supplier order handled?", {first_chunk}),
         ("exact_id", "What does returns_policy say?", set()),
@@ -130,19 +151,33 @@ def test_labeled_recall_versions_tenants_and_unknown(database, tmp_path):
     assert median(latencies) >= 0
     p95 = quantiles(latencies, n=20, method="inclusive")[18]
     assert p95 >= median(latencies)
-    logger.info("retrieval evaluation recall=%s p50_ms=%.2f p95_ms=%.2f",
-                relevant_found / relevant_total, median(latencies), p95)
+    logger.info(
+        "retrieval evaluation recall=%s p50_ms=%.2f p95_ms=%.2f",
+        relevant_found / relevant_total,
+        median(latencies),
+        p95,
+    )
 
 
 def test_wrong_version_and_department_scope(database, tmp_path):
     actor, case = organization(database, "versioned")
     source, old_chunk, old_blueprint = approved_source(
-        database, actor, case, tmp_path, "old.txt", "Warranty approvals require owner review.")
+        database, actor, case, tmp_path, "old.txt", "Warranty approvals require owner review."
+    )
     with tenant_transaction(database, actor):
-        database.execute("UPDATE blueprints SET status = 'superseded' WHERE id = %s", (old_blueprint,))
+        database.execute(
+            "UPDATE blueprints SET status = 'superseded' WHERE id = %s", (old_blueprint,)
+        )
     _new, new_chunk, new_blueprint = approved_source(
-        database, actor, case, tmp_path, "new.txt", "Warranty approvals require manager review.",
-        version=2, key="warranty_new")
+        database,
+        actor,
+        case,
+        tmp_path,
+        "new.txt",
+        "Warranty approvals require manager review.",
+        version=2,
+        key="warranty_new",
+    )
     current = retrieve(database, actor, "warranty approvals review")
     historical = retrieve(database, actor, "warranty approvals review", blueprint_id=old_blueprint)
     assert current["blueprint_id"] == new_blueprint
@@ -150,7 +185,8 @@ def test_wrong_version_and_department_scope(database, tmp_path):
     assert old_chunk in historical["citations"] and new_chunk not in historical["citations"]
     department = database.execute(
         "INSERT INTO departments (organization_id, slug, name) VALUES (%s, 'sales', 'Sales') "
-        "RETURNING id", (actor.organization_id,)
+        "RETURNING id",
+        (actor.organization_id,),
     ).fetchone()[0]
     employee_id = database.execute(
         "INSERT INTO users (organization_id, username_normalized, role, password_hash, "
@@ -158,25 +194,45 @@ def test_wrong_version_and_department_scope(database, tmp_path):
         (actor.organization_id,),
     ).fetchone()[0]
     grant = DepartmentGrant(department, frozenset({"evidence.read", "policies.read"}))
-    employee = TenantContext.from_auth(AuthContext(
-        employee_id, actor.organization_id, "employee", True, True, grants=(grant,)))
+    employee = TenantContext.from_auth(
+        AuthContext(employee_id, actor.organization_id, "employee", True, True, grants=(grant,))
+    )
     with tenant_transaction(database, actor):
         database.execute(
-            "UPDATE evidence_sources SET access_label = 'owner', owner_user_id = %s "
-            "WHERE id = %s", (actor.actor.user_id, source["source_id"])
+            "UPDATE evidence_sources SET access_label = 'owner', owner_user_id = %s WHERE id = %s",
+            (actor.actor.user_id, source["source_id"]),
         )
-    assert retrieve(database, employee, "warranty approvals review", department_id=department)[
-        "status"] == "supported"
-    assert retrieve(database, employee, "warranty approvals review",
-                    department_id=department, blueprint_id=old_blueprint)["status"] == "unknown"
+    assert (
+        retrieve(database, employee, "warranty approvals review", department_id=department)[
+            "status"
+        ]
+        == "supported"
+    )
+    assert (
+        retrieve(
+            database,
+            employee,
+            "warranty approvals review",
+            department_id=department,
+            blueprint_id=old_blueprint,
+        )["status"]
+        == "unknown"
+    )
     with tenant_transaction(database, employee):
-        assert database.execute(
-            "SELECT count(*) FROM semantic_revisions sr JOIN blueprint_members bm "
-            "ON bm.revision_id = sr.id WHERE bm.blueprint_id = %s", (old_blueprint,)
-        ).fetchone()[0] == 0
-        assert database.execute(
-            "SELECT count(*) FROM source_claims c WHERE c.chunk_id = %s", (old_chunk,)
-        ).fetchone()[0] == 0
+        assert (
+            database.execute(
+                "SELECT count(*) FROM semantic_revisions sr JOIN blueprint_members bm "
+                "ON bm.revision_id = sr.id WHERE bm.blueprint_id = %s",
+                (old_blueprint,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            database.execute(
+                "SELECT count(*) FROM source_claims c WHERE c.chunk_id = %s", (old_chunk,)
+            ).fetchone()[0]
+            == 0
+        )
     with pytest.raises(PermissionError):
         retrieve(database, employee, "warranty approvals review")
 
@@ -184,10 +240,18 @@ def test_wrong_version_and_department_scope(database, tmp_path):
 def test_conflicting_sources_and_sql_total(database, tmp_path):
     actor, case = organization(database, "conflicting")
     _first, first_chunk, blueprint = approved_source(
-        database, actor, case, tmp_path, "first.txt", "Returns require manager review.")
+        database, actor, case, tmp_path, "first.txt", "Returns require manager review."
+    )
     _second, second_chunk, second_blueprint = approved_source(
-        database, actor, case, tmp_path, "second.txt", "Returns need no manager review.",
-        version=2, key="returns_exception")
+        database,
+        actor,
+        case,
+        tmp_path,
+        "second.txt",
+        "Returns need no manager review.",
+        version=2,
+        key="returns_exception",
+    )
     with tenant_transaction(database, actor):
         revision = database.execute(
             "SELECT revision_id FROM blueprint_members WHERE blueprint_id = %s",
@@ -195,7 +259,8 @@ def test_conflicting_sources_and_sql_total(database, tmp_path):
         ).fetchone()[0]
         database.execute(
             "INSERT INTO blueprint_members (organization_id, blueprint_id, revision_id) "
-            "VALUES (%s, %s, %s)", (actor.organization_id, blueprint, revision)
+            "VALUES (%s, %s, %s)",
+            (actor.organization_id, blueprint, revision),
         )
         first_claim = database.execute(
             "SELECT id FROM source_claims WHERE chunk_id = %s", (first_chunk,)
@@ -206,13 +271,16 @@ def test_conflicting_sources_and_sql_total(database, tmp_path):
         low, high = sorted((first_claim, second_claim))
         database.execute(
             "INSERT INTO claim_conflicts (organization_id, first_claim_id, second_claim_id, reason) "
-            "VALUES (%s, %s, %s, 'contradiction')", (actor.organization_id, low, high)
+            "VALUES (%s, %s, %s, 'contradiction')",
+            (actor.organization_id, low, high),
         )
-        database.execute("UPDATE blueprints SET status = 'superseded' WHERE id = %s",
-                         (second_blueprint,))
+        database.execute(
+            "UPDATE blueprints SET status = 'superseded' WHERE id = %s", (second_blueprint,)
+        )
     database.execute(
         "INSERT INTO business_objects (organization_id, kind, external_id, source_path) "
-        "VALUES (%s, 'record', 'SO-101', 'records/so-101.json')", (actor.organization_id,)
+        "VALUES (%s, 'record', 'SO-101', 'records/so-101.json')",
+        (actor.organization_id,),
     )
     conflict = retrieve(database, actor, "returns manager review", blueprint_id=blueprint)
     assert conflict["status"] == "unknown" and conflict["conflict_count"] == 1
@@ -236,18 +304,25 @@ class FakeMessages:
     def create(self, **_kwargs):
         block = type("Block", (), {"type": "text", "text": self.answer})()
         usage = type("Usage", (), {"output_tokens": 42})()
-        return type("Response", (), {"stop_reason": "end_turn", "content": [block],
-                                     "usage": usage})()
+        return type(
+            "Response", (), {"stop_reason": "end_turn", "content": [block], "usage": usage}
+        )()
 
 
 def test_citation_validity_numeric_claim_and_budget():
     citation = uuid4()
-    packet = {"status": "supported", "coverage": True, "blueprint_id": uuid4(),
-              "exact": [], "semantic": [], "passages": [
-                  {"id": citation, "text": "The policy limit is 100 USD."}]}
+    packet = {
+        "status": "supported",
+        "coverage": True,
+        "blueprint_id": uuid4(),
+        "exact": [],
+        "semantic": [],
+        "passages": [{"id": citation, "text": "The policy limit is 100 USD."}],
+    }
     valid = FakeMessages(f"The limit is 100 USD [{citation}].")
-    result = answer_packet(valid, "What is the limit?", packet,
-                           input_usd_per_million=3, output_usd_per_million=15)
+    result = answer_packet(
+        valid, "What is the limit?", packet, input_usd_per_million=3, output_usd_per_million=15
+    )
     assert result["status"] == "supported" and valid.counts == 1
     assert result["input_tokens"] <= INPUT_TARGET < INPUT_HARD_CAP
     assert result["estimated_cost_usd"] > 0

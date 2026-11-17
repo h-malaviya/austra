@@ -10,8 +10,13 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Action = Literal[
-    "submit_order", "reserve_stock", "draft_po", "approve_po",
-    "propose_email", "approve_email", "transition_record",
+    "submit_order",
+    "reserve_stock",
+    "draft_po",
+    "approve_po",
+    "propose_email",
+    "approve_email",
+    "transition_record",
 ]
 Quantity = Annotated[Decimal, Field(gt=0, max_digits=18, decimal_places=6)]
 Money = Annotated[Decimal, Field(ge=0, max_digits=18, decimal_places=6)]
@@ -85,7 +90,15 @@ class CapabilityCommand(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=200)
     correlation_id: UUID
     expected_revisions: dict[UUID, int] = Field(default_factory=dict)
-    payload: OrderPayload | ReservePayload | PurchasePayload | ApprovePurchasePayload | EmailPayload | ApproveEmailPayload | TransitionPayload
+    payload: (
+        OrderPayload
+        | ReservePayload
+        | PurchasePayload
+        | ApprovePurchasePayload
+        | EmailPayload
+        | ApproveEmailPayload
+        | TransitionPayload
+    )
     occurred_at: datetime | None = None
 
     @field_validator("expected_revisions")
@@ -112,4 +125,6 @@ class CapabilityCommand(BaseModel):
 
     def digest(self) -> str:
         data = self.model_dump(mode="json", exclude={"correlation_id"})
-        return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return hashlib.sha256(
+            json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()

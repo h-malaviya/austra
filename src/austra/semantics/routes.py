@@ -69,9 +69,11 @@ class AnswerInput(BaseModel):
 def install_semantic_routes(app: FastAPI, identity: SaasIdentity) -> None:
     def admin_context(request: Request) -> TenantContext:
         actor, _remaining = identity.session(request.cookies.get("austra_session"))
-        if actor is None or actor.role != "org_admin" or request.state.organization_slug in {
-            None, "platform"
-        }:
+        if (
+            actor is None
+            or actor.role != "org_admin"
+            or request.state.organization_slug in {None, "platform"}
+        ):
             raise HTTPException(status_code=403, detail="Organization admin required")
         try:
             return TenantContext.from_auth(actor)
@@ -94,14 +96,19 @@ def install_semantic_routes(app: FastAPI, identity: SaasIdentity) -> None:
 
     @app.post("/api/org/semantic-claims/{claim_id}/decisions", status_code=201)
     def claim_decision(claim_id: UUID, payload: ClaimDecisionInput, request: Request):
-        return run(request, lambda db, actor: {"id": decide_claim(
-            db, actor, claim_id, payload.decision, payload.rationale)})
+        return run(
+            request,
+            lambda db, actor: {
+                "id": decide_claim(db, actor, claim_id, payload.decision, payload.rationale)
+            },
+        )
 
     @app.post("/api/org/semantic-claims/conflicts", status_code=201)
     def conflict(payload: ConflictInput, request: Request):
         def save(db, actor):
             record_conflict(db, actor, **payload.model_dump())
             return {"recorded": True}
+
         return run(request, save)
 
     @app.post("/api/org/semantic-revisions", status_code=201)
@@ -114,8 +121,12 @@ def install_semantic_routes(app: FastAPI, identity: SaasIdentity) -> None:
 
     @app.post("/api/org/onboarding-cases/{case_id}/candidate", status_code=201)
     def candidate(case_id: UUID, payload: CandidateInput, request: Request):
-        return run(request, lambda db, actor: propose_candidate(
-            db, actor, case_id, payload.model_dump(mode="json")))
+        return run(
+            request,
+            lambda db, actor: propose_candidate(
+                db, actor, case_id, payload.model_dump(mode="json")
+            ),
+        )
 
     @app.get("/api/org/onboarding-cases/{case_id}/candidate")
     def candidate_review(case_id: UUID, request: Request):
@@ -126,10 +137,15 @@ def install_semantic_routes(app: FastAPI, identity: SaasIdentity) -> None:
 
     @app.post("/api/org/onboarding-cases/{case_id}/candidate/answers", status_code=201)
     def answer(case_id: UUID, payload: AnswerInput, request: Request):
-        return run(request, lambda db, actor: answer_question(
-            db, actor, case_id, payload.question_index, payload.answer))
+        return run(
+            request,
+            lambda db, actor: answer_question(
+                db, actor, case_id, payload.question_index, payload.answer
+            ),
+        )
 
     @app.post("/api/org/onboarding-cases/{case_id}/candidate/confirm")
     def confirm(case_id: UUID, payload: ConfirmInput, request: Request):
-        return run(request, lambda db, actor: confirm_candidate(
-            db, actor, case_id, payload.content_hash))
+        return run(
+            request, lambda db, actor: confirm_candidate(db, actor, case_id, payload.content_hash)
+        )

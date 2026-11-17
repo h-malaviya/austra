@@ -252,9 +252,7 @@ def install_tenant_routes(app: FastAPI, identity: SaasIdentity) -> None:
             row = department(connection, context.organization_id, department_id)
             if row[3] is not None:
                 raise HTTPException(status_code=404, detail="Department not found")
-            rows = catalog_objects(
-                connection, TenantContext.from_auth(context), department_id
-            )
+            rows = catalog_objects(connection, TenantContext.from_auth(context), department_id)
         required = {
             "chat": "chat.use",
             "record": "records.read",

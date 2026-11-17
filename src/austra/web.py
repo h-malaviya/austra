@@ -1160,7 +1160,9 @@ def create_app(
     )
     def call_mcp_tool(name: str, tool_name: str, payload: McpToolInput) -> dict[str, Any]:
         if saas:
-            raise HTTPException(status_code=409, detail="Use the approved organization action gateway")
+            raise HTTPException(
+                status_code=409, detail="Use the approved organization action gateway"
+            )
         try:
             result = mcp_connections.call(name, tool_name, payload.arguments)
         except KeyError as error:

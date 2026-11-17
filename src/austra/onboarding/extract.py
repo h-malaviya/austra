@@ -21,7 +21,8 @@ MAX_CHARS_PER_CHUNK = 5000
 def validate_file(name: str, content: bytes) -> str:
     suffix = name.lower().rsplit(".", 1)[-1]
     media = {
-        "txt": "text/plain", "pdf": "application/pdf",
+        "txt": "text/plain",
+        "pdf": "application/pdf",
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "csv": "text/csv",
         "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -72,9 +73,11 @@ def _docx_units(content: bytes) -> Iterator[tuple[str, str]]:
             continue
         headers = [cell.text.strip() for cell in rows[0].cells]
         for start in range(1, len(rows), MAX_ROWS_PER_GROUP):
-            group = rows[start:start + MAX_ROWS_PER_GROUP]
-            value = " | ".join(headers) + "\n" + "\n".join(
-                " | ".join(cell.text.strip() for cell in row.cells) for row in group
+            group = rows[start : start + MAX_ROWS_PER_GROUP]
+            value = (
+                " | ".join(headers)
+                + "\n"
+                + "\n".join(" | ".join(cell.text.strip() for cell in row.cells) for row in group)
             )
             yield f"table {table_index} · rows {start + 1}-{start + len(group)}", value
 
@@ -89,10 +92,16 @@ def _csv_units(content: bytes) -> Iterator[tuple[str, str]]:
     for row_number, row in enumerate(reader, 2):
         group.append(" | ".join(row))
         if len(group) == MAX_ROWS_PER_GROUP:
-            yield f"table 1 · rows {start}-{row_number}", " | ".join(headers) + "\n" + "\n".join(group)
+            yield (
+                f"table 1 · rows {start}-{row_number}",
+                " | ".join(headers) + "\n" + "\n".join(group),
+            )
             group, start = [], row_number + 1
     if group:
-        yield f"table 1 · rows {start}-{start + len(group) - 1}", " | ".join(headers) + "\n" + "\n".join(group)
+        yield (
+            f"table 1 · rows {start}-{start + len(group) - 1}",
+            " | ".join(headers) + "\n" + "\n".join(group),
+        )
 
 
 def _xlsx_units(content: bytes) -> Iterator[tuple[str, str]]:
@@ -109,10 +118,16 @@ def _xlsx_units(content: bytes) -> Iterator[tuple[str, str]]:
             for row_number, row in enumerate(rows, 2):
                 group.append(" | ".join("" if value is None else str(value) for value in row))
                 if len(group) == MAX_ROWS_PER_GROUP:
-                    yield f"sheet {sheet.title} · rows {start}-{row_number}", header_line + "\n" + "\n".join(group)
+                    yield (
+                        f"sheet {sheet.title} · rows {start}-{row_number}",
+                        header_line + "\n" + "\n".join(group),
+                    )
                     group, start = [], row_number + 1
             if group:
-                yield f"sheet {sheet.title} · rows {start}-{start + len(group) - 1}", header_line + "\n" + "\n".join(group)
+                yield (
+                    f"sheet {sheet.title} · rows {start}-{start + len(group) - 1}",
+                    header_line + "\n" + "\n".join(group),
+                )
     finally:
         workbook.close()
 
@@ -140,9 +155,11 @@ def chunks(locator: str, content: str) -> Iterator[tuple[str, str]]:
             for match in re.finditer(r"\S+", clause):
                 raw_word = match.group()
                 for start in range(0, len(raw_word), MAX_CHARS_PER_CHUNK):
-                    word = raw_word[start:start + MAX_CHARS_PER_CHUNK]
-                    if words and (len(words) >= MAX_WORDS_PER_CHUNK
-                                  or character_count + len(word) + 1 > MAX_CHARS_PER_CHUNK):
+                    word = raw_word[start : start + MAX_CHARS_PER_CHUNK]
+                    if words and (
+                        len(words) >= MAX_WORDS_PER_CHUNK
+                        or character_count + len(word) + 1 > MAX_CHARS_PER_CHUNK
+                    ):
                         part += 1
                         yield f"{locator} · part {part}", " ".join(words)
                         words = []

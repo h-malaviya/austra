@@ -56,8 +56,11 @@ def gmail_exchange_code(code: str, redirect_uri: str) -> dict[str, str]:
     refresh_token = tokens.get("refresh_token")
     if not isinstance(access_token, str) or not isinstance(refresh_token, str):
         raise TypeError("Google did not grant offline access")
-    return {"refresh_token": refresh_token, "email": _gmail_profile(access_token),
-            "scopes": tokens.get("scope", "")}
+    return {
+        "refresh_token": refresh_token,
+        "email": _gmail_profile(access_token),
+        "scopes": tokens.get("scope", ""),
+    }
 
 
 @mcp.tool()
@@ -153,8 +156,10 @@ def slack_verify() -> dict[str, str]:
     identity = response.json()
     if not isinstance(identity, dict) or not identity.get("ok") or not identity.get("bot_id"):
         raise ValueError("Slack rejected the bot token")
-    return {"team_id": identity.get("team_id", ""),
-            "scopes": response.headers.get("x-oauth-scopes", "")}
+    return {
+        "team_id": identity.get("team_id", ""),
+        "scopes": response.headers.get("x-oauth-scopes", ""),
+    }
 
 
 @mcp.tool()

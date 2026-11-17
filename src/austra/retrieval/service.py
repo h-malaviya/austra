@@ -16,10 +16,40 @@ EVIDENCE_TOKEN_LIMIT = 4000
 FUSION_OFFSET = 60
 IDENTIFIER = re.compile(r"\b[A-Za-z]{1,12}[-_][A-Za-z0-9_-]{2,64}\b")
 WORDS = re.compile(r"[a-z0-9_]{3,}")
-STOP_WORDS = frozenset({"the", "and", "for", "how", "what", "why", "who", "when", "was",
-                        "are", "does", "did", "can", "our", "with", "from", "this", "that"})
-KINDS = ("capability", "actor", "authority", "policy", "knowledge", "event",
-         "workflow", "business_object", "integration", "projection")
+STOP_WORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "how",
+        "what",
+        "why",
+        "who",
+        "when",
+        "was",
+        "are",
+        "does",
+        "did",
+        "can",
+        "our",
+        "with",
+        "from",
+        "this",
+        "that",
+    }
+)
+KINDS = (
+    "capability",
+    "actor",
+    "authority",
+    "policy",
+    "knowledge",
+    "event",
+    "workflow",
+    "business_object",
+    "integration",
+    "projection",
+)
 
 
 def classify(question: str, requested_time: datetime | None) -> str:
@@ -124,24 +154,34 @@ def retrieve(
     recorded_time = recorded_time or datetime.now(UTC)
     started = perf_counter()
     plan = classify(question, valid_time if historical else None)
-    parameters = {"organization_id": context.organization_id, "blueprint_id": blueprint_id,
-                  "valid_time": valid_time, "recorded_time": recorded_time,
-                  "question": question, "embedding_model": EMBEDDING_MODEL,
-                  "query_embedding": _embedding(question)}
+    parameters = {
+        "organization_id": context.organization_id,
+        "blueprint_id": blueprint_id,
+        "valid_time": valid_time,
+        "recorded_time": recorded_time,
+        "question": question,
+        "embedding_model": EMBEDDING_MODEL,
+        "query_embedding": _embedding(question),
+    }
     with tenant_transaction(connection, context):
         aggregate = None
         if re.search(r"\b(?:total|how many)\s+(?:active\s+)?records\b", question.casefold()):
             if historical:
-                return {"status": "unknown", "reason": "Historical record totals are unavailable",
-                        "plan": plan, "passages": [], "citations": [], "coverage": False}
+                return {
+                    "status": "unknown",
+                    "reason": "Historical record totals are unavailable",
+                    "plan": plan,
+                    "passages": [],
+                    "citations": [],
+                    "coverage": False,
+                }
             count = connection.execute(
                 "SELECT count(*) FROM business_objects WHERE organization_id = %s "
                 "AND kind = 'record' AND archived_at IS NULL "
                 "AND (%s::uuid IS NULL OR department_id = %s::uuid)",
                 (context.organization_id, department_id, department_id),
             ).fetchone()[0]
-            aggregate = {"measure": "active_record_count", "value": count,
-                         "method": "sql_count"}
+            aggregate = {"measure": "active_record_count", "value": count, "method": "sql_count"}
         if blueprint_id:
             blueprint = connection.execute(
                 "SELECT id, blueprint_version FROM blueprints WHERE organization_id = %s "
@@ -158,17 +198,36 @@ def retrieve(
                 (context.organization_id, recorded_time, valid_time),
             ).fetchone()
         if blueprint is None:
-            return {"status": "unknown", "reason": "No applicable published blueprint",
-                    "plan": plan, "passages": [], "citations": [], "coverage": False}
+            return {
+                "status": "unknown",
+                "reason": "No applicable published blueprint",
+                "plan": plan,
+                "passages": [],
+                "citations": [],
+                "coverage": False,
+            }
         parameters["blueprint_id"] = blueprint[0]
         if aggregate is not None:
-            return {"status": "supported", "plan": plan, "blueprint_id": blueprint[0],
-                    "aggregate": aggregate, "passages": [], "citations": [],
-                    "coverage": True, "latency_ms": round((perf_counter() - started) * 1000, 2)}
+            return {
+                "status": "supported",
+                "plan": plan,
+                "blueprint_id": blueprint[0],
+                "aggregate": aggregate,
+                "passages": [],
+                "citations": [],
+                "coverage": True,
+                "latency_ms": round((perf_counter() - started) * 1000, 2),
+            }
         if "total" in question.casefold() or "how many" in question.casefold():
-            return {"status": "unknown", "reason": "No typed SQL aggregate for this total",
-                    "plan": plan, "blueprint_id": blueprint[0], "passages": [],
-                    "citations": [], "coverage": False}
+            return {
+                "status": "unknown",
+                "reason": "No typed SQL aggregate for this total",
+                "plan": plan,
+                "blueprint_id": blueprint[0],
+                "passages": [],
+                "citations": [],
+                "coverage": False,
+            }
         conflicts = connection.execute(
             "SELECT count(*) FROM claim_conflicts cc "
             "JOIN source_claims first_claim ON first_claim.id = cc.first_claim_id "
@@ -185,11 +244,19 @@ def retrieve(
             (context.organization_id, blueprint[0], blueprint[0]),
         ).fetchone()[0]
         if conflicts:
-            return {"status": "unknown", "reason": "Approved sources conflict",
-                    "plan": plan, "blueprint_id": blueprint[0], "passages": [],
-                    "citations": [], "coverage": False, "conflict_count": conflicts}
+            return {
+                "status": "unknown",
+                "reason": "Approved sources conflict",
+                "plan": plan,
+                "blueprint_id": blueprint[0],
+                "passages": [],
+                "citations": [],
+                "coverage": False,
+                "conflict_count": conflicts,
+            }
         identifiers = IDENTIFIER.findall(question)
-        exact = _rows(connection,
+        exact = _rows(
+            connection,
             "SELECT sr.id, so.kind, so.stable_key, sr.content, sr.rationale, "
             "sr.valid_from, sr.valid_to, sr.recorded_at "
             "FROM semantic_objects so JOIN semantic_revisions sr ON sr.object_id = so.id "
@@ -201,45 +268,68 @@ def retrieve(
             + _semantic_visible()
             + "AND (so.stable_key = ANY(%(identifiers)s) OR so.stable_key = %(question)s) "
             "ORDER BY so.kind, so.stable_key LIMIT 8",
-            {**parameters, "identifiers": [item.casefold().replace('-', '_') for item in identifiers]},
+            {
+                **parameters,
+                "identifiers": [item.casefold().replace("-", "_") for item in identifiers],
+            },
         )
         record_matches = []
         if identifiers and not exact:
             context.require("records.read", department_id)
-            record_matches = _rows(connection,
+            record_matches = _rows(
+                connection,
                 "SELECT id, kind, external_id, department_id FROM business_objects "
                 "WHERE organization_id = %(organization_id)s AND archived_at IS NULL "
                 "AND external_id = ANY(%(identifiers)s) LIMIT 8",
                 {**parameters, "identifiers": identifiers},
             )
         common = _visible_sql()
-        columns = ("SELECT c.id, c.revision_id, c.locator, c.text, c.content_hash, "
-                   "c.token_count, s.display_name, s.kind AS source_kind, r.captured_at "
-                   "FROM evidence_chunks c JOIN visible_revisions v ON v.id = c.revision_id "
-                   "JOIN evidence_revisions r ON r.id = c.revision_id "
-                   "JOIN evidence_sources s ON s.id = r.source_id ")
-        lexical = _rows(connection, common + columns +
-            "WHERE c.organization_id = %(organization_id)s AND c.search_vector @@ "
+        columns = (
+            "SELECT c.id, c.revision_id, c.locator, c.text, c.content_hash, "
+            "c.token_count, s.display_name, s.kind AS source_kind, r.captured_at "
+            "FROM evidence_chunks c JOIN visible_revisions v ON v.id = c.revision_id "
+            "JOIN evidence_revisions r ON r.id = c.revision_id "
+            "JOIN evidence_sources s ON s.id = r.source_id "
+        )
+        lexical = _rows(
+            connection,
+            common
+            + columns
+            + "WHERE c.organization_id = %(organization_id)s AND c.search_vector @@ "
             "websearch_to_tsquery('english', %(question)s) "
             "ORDER BY ts_rank_cd(c.search_vector, websearch_to_tsquery('english', %(question)s)) "
-            "DESC, c.id LIMIT 30", parameters)
+            "DESC, c.id LIMIT 30",
+            parameters,
+        )
         if not lexical:
-            terms = sorted({word for word in WORDS.findall(question.casefold())
-                            if word not in STOP_WORDS})[:12]
+            terms = sorted(
+                {word for word in WORDS.findall(question.casefold()) if word not in STOP_WORDS}
+            )[:12]
             if terms:
                 broad = {**parameters, "term_query": " | ".join(terms)}
-                lexical = _rows(connection, common + columns +
-                    "WHERE c.organization_id = %(organization_id)s AND c.search_vector @@ "
+                lexical = _rows(
+                    connection,
+                    common
+                    + columns
+                    + "WHERE c.organization_id = %(organization_id)s AND c.search_vector @@ "
                     "to_tsquery('english', %(term_query)s) "
                     "ORDER BY ts_rank_cd(c.search_vector, to_tsquery('english', %(term_query)s)) "
-                    "DESC, c.id LIMIT 30", broad)
-        vector = _rows(connection, common + columns +
-            "WHERE c.organization_id = %(organization_id)s AND c.embedding_model = %(embedding_model)s "
+                    "DESC, c.id LIMIT 30",
+                    broad,
+                )
+        vector = _rows(
+            connection,
+            common
+            + columns
+            + "WHERE c.organization_id = %(organization_id)s AND c.embedding_model = %(embedding_model)s "
             "AND c.embedding IS NOT NULL "
             "AND c.embedding OPERATOR(public.<=>) %(query_embedding)s::public.vector <= 0.8 "
             "ORDER BY c.embedding OPERATOR(public.<=>) %(query_embedding)s::public.vector, "
-            "c.id LIMIT 30", parameters)
-        semantic = _rows(connection,
+            "c.id LIMIT 30",
+            parameters,
+        )
+        semantic = _rows(
+            connection,
             "SELECT sr.id, so.kind, so.stable_key, sr.content, sr.rationale, "
             "sr.valid_from, sr.valid_to, sr.recorded_at FROM semantic_revision_embeddings se "
             "JOIN semantic_revisions sr ON sr.id = se.revision_id "
@@ -251,10 +341,11 @@ def retrieve(
             "AND (sr.valid_to IS NULL OR sr.valid_to > %(valid_time)s) "
             "AND sr.recorded_at <= %(recorded_time)s "
             + _semantic_visible()
-            +
-            "AND se.embedding OPERATOR(public.<=>) %(query_embedding)s::public.vector <= 0.8 "
+            + "AND se.embedding OPERATOR(public.<=>) %(query_embedding)s::public.vector <= 0.8 "
             "ORDER BY se.embedding OPERATOR(public.<=>) %(query_embedding)s::public.vector "
-            "LIMIT 3", parameters)
+            "LIMIT 3",
+            parameters,
+        )
     seen_hashes = set()
     passages = []
     token_count = 0
@@ -265,20 +356,45 @@ def retrieve(
             continue
         seen_hashes.add(row["content_hash"])
         token_count += row["token_count"]
-        passages.append({key: row[key] for key in ("id", "revision_id", "locator", "text",
-                        "display_name", "source_kind", "captured_at")})
+        passages.append(
+            {
+                key: row[key]
+                for key in (
+                    "id",
+                    "revision_id",
+                    "locator",
+                    "text",
+                    "display_name",
+                    "source_kind",
+                    "captured_at",
+                )
+            }
+        )
     covered = _covered(question, exact, passages) or bool(
-        record_matches and re.search(r"\b(?:exist|exists|find|locate)\b", question.casefold()))
+        record_matches and re.search(r"\b(?:exist|exists|find|locate)\b", question.casefold())
+    )
     if identifiers and not exact and not record_matches:
         covered = False
-    return {"status": "supported" if covered else "unknown", "reason": "" if covered else
-            "No approved visible evidence covers every part of this question", "plan": plan,
-            "organization_id": context.organization_id, "actor_id": context.actor.user_id,
-            "department_id": department_id, "blueprint_id": blueprint[0],
-            "blueprint_version": blueprint[1], "valid_time": valid_time,
-            "recorded_time": recorded_time, "exact": exact, "exact_records": record_matches,
-            "semantic": semantic,
-            "passages": passages, "citations": [row["id"] for row in passages],
-            "coverage": covered, "selected_tokens": token_count,
-            "candidate_counts": {"lexical": len(lexical), "vector": len(vector)},
-            "latency_ms": round((perf_counter() - started) * 1000, 2)}
+    return {
+        "status": "supported" if covered else "unknown",
+        "reason": ""
+        if covered
+        else "No approved visible evidence covers every part of this question",
+        "plan": plan,
+        "organization_id": context.organization_id,
+        "actor_id": context.actor.user_id,
+        "department_id": department_id,
+        "blueprint_id": blueprint[0],
+        "blueprint_version": blueprint[1],
+        "valid_time": valid_time,
+        "recorded_time": recorded_time,
+        "exact": exact,
+        "exact_records": record_matches,
+        "semantic": semantic,
+        "passages": passages,
+        "citations": [row["id"] for row in passages],
+        "coverage": covered,
+        "selected_tokens": token_count,
+        "candidate_counts": {"lexical": len(lexical), "vector": len(vector)},
+        "latency_ms": round((perf_counter() - started) * 1000, 2),
+    }

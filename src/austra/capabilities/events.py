@@ -61,9 +61,7 @@ def emit_event(
     return event_id
 
 
-def lease_job(
-    connection: psycopg.Connection, context: TenantContext, topic: str
-) -> dict | None:
+def lease_job(connection: psycopg.Connection, context: TenantContext, topic: str) -> dict | None:
     context.require("workflows.approve")
     with tenant_transaction(connection, context):
         row = connection.execute(
@@ -101,10 +99,14 @@ def finish_job(
         if not success:
             release = connection.execute(
                 "SELECT blueprint_id, approved_by FROM releases WHERE organization_id = %s "
-                "AND state = 'active'", (context.organization_id,),
+                "AND state = 'active'",
+                (context.organization_id,),
             ).fetchone()
             open_review(
-                connection, context, trigger="failed_run", subject_id=job_id,
+                connection,
+                context,
+                trigger="failed_run",
+                subject_id=job_id,
                 owner_user_id=release[1] if release else context.actor.user_id,
                 blueprint_id=release[0] if release else None,
                 citations=[{"job_id": str(job_id), "runtime_event_id": str(row[1])}],

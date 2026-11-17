@@ -62,14 +62,19 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
             input_price = os.getenv("AUSTRA_INPUT_USD_PER_MILLION")
             output_price = os.getenv("AUSTRA_OUTPUT_USD_PER_MILLION")
             answer = answer_packet(
-                Anthropic(api_key=key), payload.question, evidence,
+                Anthropic(api_key=key),
+                payload.question,
+                evidence,
                 input_usd_per_million=float(input_price) if input_price else None,
                 output_usd_per_million=float(output_price) if output_price else None,
             )
         except ValueError as error:
-            _measure(request, task_id,
-                     {"status": "token_budget_breach" if "token" in str(error).lower()
-                      else "unknown"}, started)
+            _measure(
+                request,
+                task_id,
+                {"status": "token_budget_breach" if "token" in str(error).lower() else "unknown"},
+                started,
+            )
             raise HTTPException(status_code=422, detail=str(error)) from error
         _measure(request, task_id, answer, started)
         return {"evidence": evidence, "answer": answer}
@@ -78,13 +83,19 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
         actor, _remaining = identity.session(request.cookies.get("austra_session"))
         context = TenantContext.from_auth(actor)
         with identity.connect() as connection:
-            record_metric(connection, context, "task_latency_ms",
-                          round((perf_counter() - started) * 1000, 3), task_id)
+            record_metric(
+                connection,
+                context,
+                "task_latency_ms",
+                round((perf_counter() - started) * 1000, 3),
+                task_id,
+            )
             if answer["status"] == "supported":
                 record_metric(connection, context, "task_resolved", task_id=task_id)
             if answer.get("estimated_cost_usd") is not None:
-                record_metric(connection, context, "task_cost_usd",
-                              answer["estimated_cost_usd"], task_id)
+                record_metric(
+                    connection, context, "task_cost_usd", answer["estimated_cost_usd"], task_id
+                )
             if answer["status"] == "token_budget_breach":
                 record_metric(connection, context, "token_budget_breach", task_id=task_id)
             elif answer.get("failure_reason") == "citation":

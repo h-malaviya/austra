@@ -24,36 +24,69 @@ def compile_projections(revisions: list[dict], definitions: list[dict]) -> list[
         kind = content.get("view")
         fields = content.get("fields", [])
         allowed = {item["key"] for item in capability["fields"]} | {"external_id", "state"}
-        if (not key or key in keys or kind not in VIEW_KINDS
-            or not isinstance(fields, list) or not fields or any(field not in allowed for field in fields)
-            or not content.get("roles") or any(role not in {"org_admin", "employee"}
-                                               for role in content["roles"])
-            or any(state not in capability["states"] for state in content.get("states", []))):
+        if (
+            not key
+            or key in keys
+            or kind not in VIEW_KINDS
+            or not isinstance(fields, list)
+            or not fields
+            or any(field not in allowed for field in fields)
+            or not content.get("roles")
+            or any(role not in {"org_admin", "employee"} for role in content["roles"])
+            or any(state not in capability["states"] for state in content.get("states", []))
+        ):
             raise ValueError("Invalid projection descriptor")
         measure = content.get("measure")
         field_spec = next((item for item in capability["fields"] if item["key"] == measure), None)
-        if kind in {"chart", "dashboard", "report"} and (not field_spec or field_spec["type"] != "decimal"
-                                                     or content.get("unit") != field_spec["unit"]):
+        if kind in {"chart", "dashboard", "report"} and (
+            not field_spec
+            or field_spec["type"] != "decimal"
+            or content.get("unit") != field_spec["unit"]
+        ):
             raise ValueError("Aggregate projection needs an approved decimal field and unit")
-        if kind == "form" and (content.get("transition") not in
-                               {item["key"] for item in capability["transitions"]}):
+        if kind == "form" and (
+            content.get("transition") not in {item["key"] for item in capability["transitions"]}
+        ):
             raise ValueError("Form needs an approved transition")
         keys.add(key)
-        descriptors.append({"key": key, "view": kind, "capability": capability["key"],
-                            "record_kind": capability["record_kind"], "fields": fields,
-                            "roles": content["roles"], "states": content.get("states", []),
-                            "measure": measure, "unit": content.get("unit"),
-                            "transition": content.get("transition")})
+        descriptors.append(
+            {
+                "key": key,
+                "view": kind,
+                "capability": capability["key"],
+                "record_kind": capability["record_kind"],
+                "fields": fields,
+                "roles": content["roles"],
+                "states": content.get("states", []),
+                "measure": measure,
+                "unit": content.get("unit"),
+                "transition": content.get("transition"),
+            }
+        )
     return descriptors
 
 
-def projection_data(connection: psycopg.Connection, context: TenantContext,
-                    department_id: UUID, key: str, manifest: dict,
-                    *, offset: int = 0) -> dict:
-    context.require("reports.read" if any(item.get("key") == key and item.get("view") in
-                  {"chart", "dashboard", "report"} for item in manifest.get("projections", []))
-                  else "workflows.read", department_id)
-    descriptor = next((item for item in manifest.get("projections", []) if item["key"] == key), None)
+def projection_data(
+    connection: psycopg.Connection,
+    context: TenantContext,
+    department_id: UUID,
+    key: str,
+    manifest: dict,
+    *,
+    offset: int = 0,
+) -> dict:
+    context.require(
+        "reports.read"
+        if any(
+            item.get("key") == key and item.get("view") in {"chart", "dashboard", "report"}
+            for item in manifest.get("projections", [])
+        )
+        else "workflows.read",
+        department_id,
+    )
+    descriptor = next(
+        (item for item in manifest.get("projections", []) if item["key"] == key), None
+    )
     if descriptor is None or context.actor.role not in descriptor["roles"]:
         raise PermissionError("Projection is unavailable to this role")
     if offset < 0:
@@ -67,32 +100,51 @@ def projection_data(connection: psycopg.Connection, context: TenantContext,
             params.append(states)
         demo = connection.execute(
             f"SELECT count(*) FROM capability_records WHERE {base_where} "
-            "AND data->>'source_label' IN ('synthetic_demo', 'demo')", params,
+            "AND data->>'source_label' IN ('synthetic_demo', 'demo')",
+            params,
         ).fetchone()[0]
         held = connection.execute(
             f"SELECT count(*) FROM capability_records WHERE {base_where} "
             "AND coalesce(data->>'source_label', 'live') NOT IN ('synthetic_demo', 'demo') "
             "AND (coalesce(data->>'verification_status', 'verified') <> 'verified' "
-            "OR coalesce(data->>'qc_status', 'released') <> 'released')", params,
+            "OR coalesce(data->>'qc_status', 'released') <> 'released')",
+            params,
         ).fetchone()[0]
-        where = (base_where + " "
-                 "AND (coalesce(data->>'source_label', 'live') NOT IN ('synthetic_demo', 'demo')) "
-                 "AND (coalesce(data->>'verification_status', 'verified') = 'verified') "
-                 "AND (coalesce(data->>'qc_status', 'released') = 'released')")
-        count = connection.execute(f"SELECT count(*) FROM capability_records WHERE {where}", params).fetchone()[0]
+        where = (
+            base_where + " "
+            "AND (coalesce(data->>'source_label', 'live') NOT IN ('synthetic_demo', 'demo')) "
+            "AND (coalesce(data->>'verification_status', 'verified') = 'verified') "
+            "AND (coalesce(data->>'qc_status', 'released') = 'released')"
+        )
+        count = connection.execute(
+            f"SELECT count(*) FROM capability_records WHERE {where}", params
+        ).fetchone()[0]
         rows = connection.execute(
             f"SELECT id, external_id, revision, state, data FROM capability_records WHERE {where} "
-            "ORDER BY created_at, id LIMIT %s OFFSET %s", (*params, MAX_ROWS, offset)
+            "ORDER BY created_at, id LIMIT %s OFFSET %s",
+            (*params, MAX_ROWS, offset),
         ).fetchall()
-        result = {"descriptor": descriptor, "record_count": count,
-                  "excluded_demo_count": demo, "excluded_hold_count": held,
-                  "complete": offset == 0 and len(rows) == count,
-                  "offset": offset,
-                  "records": [{"id": str(row[0]), "external_id": row[1],
-                               "revision": row[2], "state": row[3],
-                               "values": {field: row[4].get(field) if field != "state" else row[3]
-                                          for field in descriptor["fields"]}}
-                              for row in rows]}
+        result = {
+            "descriptor": descriptor,
+            "record_count": count,
+            "excluded_demo_count": demo,
+            "excluded_hold_count": held,
+            "complete": offset == 0 and len(rows) == count,
+            "offset": offset,
+            "records": [
+                {
+                    "id": str(row[0]),
+                    "external_id": row[1],
+                    "revision": row[2],
+                    "state": row[3],
+                    "values": {
+                        field: row[4].get(field) if field != "state" else row[3]
+                        for field in descriptor["fields"]
+                    },
+                }
+                for row in rows
+            ],
+        }
         if descriptor["measure"]:
             measure = descriptor["measure"]
             # A missing or malformed quantity is an unresolved source, never zero.

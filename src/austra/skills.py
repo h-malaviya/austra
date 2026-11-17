@@ -40,7 +40,10 @@ def skill_cards() -> tuple[SkillCard, ...]:
 
 
 def load_skill(skill_id: str) -> str:
-    if skill_id not in PLATFORM_SKILLS + REVIEWED_SEMANTIC_SKILLS + RETRIEVAL_SKILLS + SUPERVISOR_SKILLS:
+    if (
+        skill_id
+        not in PLATFORM_SKILLS + REVIEWED_SEMANTIC_SKILLS + RETRIEVAL_SKILLS + SUPERVISOR_SKILLS
+    ):
         raise KeyError(skill_id)
     return (SKILL_ROOT / skill_id / "SKILL.md").read_text(encoding="utf-8")
 
@@ -48,8 +51,11 @@ def load_skill(skill_id: str) -> str:
 def semantic_skill_cards() -> tuple[SkillCard, ...]:
     """Reviewed semantic procedures are selected explicitly; legacy loading is unchanged."""
     return tuple(
-        SkillCard(name, f"platform_skills/{name}/SKILL.md",
-                  sha256((SKILL_ROOT / name / "SKILL.md").read_bytes()).hexdigest())
+        SkillCard(
+            name,
+            f"platform_skills/{name}/SKILL.md",
+            sha256((SKILL_ROOT / name / "SKILL.md").read_bytes()).hexdigest(),
+        )
         for name in REVIEWED_SEMANTIC_SKILLS
     )
 

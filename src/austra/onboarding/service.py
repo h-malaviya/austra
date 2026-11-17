@@ -36,8 +36,7 @@ def open_case(
             (str(organization_id),),
         )
         row = connection.execute(
-            "SELECT id FROM onboarding_cases WHERE organization_id = %s "
-            "AND created_event_id = %s",
+            "SELECT id FROM onboarding_cases WHERE organization_id = %s AND created_event_id = %s",
             (organization_id, created_event_id),
         ).fetchone()
         if row is None:
@@ -84,8 +83,14 @@ def current_case(connection: psycopg.Connection, context: TenantContext) -> dict
         ).fetchone()
     if row is None:
         return None
-    return {"id": row[0], "state": row[1], "revision": row[2], "blueprint_id": row[3],
-            "business_description": row[4], "desired_outcome": row[5]}
+    return {
+        "id": row[0],
+        "state": row[1],
+        "revision": row[2],
+        "blueprint_id": row[3],
+        "business_description": row[4],
+        "desired_outcome": row[5],
+    }
 
 
 def transition_case(
@@ -125,6 +130,13 @@ def transition_case(
             "INSERT INTO lifecycle_events (organization_id, actor_user_id, resource_type, "
             "resource_id, from_state, to_state, correlation_id) "
             "VALUES (%s, %s, 'onboarding', %s, %s, %s, %s)",
-            (context.organization_id, context.actor.user_id, case_id, state, target, correlation_id),
+            (
+                context.organization_id,
+                context.actor.user_id,
+                case_id,
+                state,
+                target,
+                correlation_id,
+            ),
         )
     return {"id": case_id, "state": target, "revision": revision + 1, "blueprint_id": blueprint_id}
