@@ -69,6 +69,35 @@ class Surface:
         ]
 
 
+def capability_decision_surface(decision: dict[str, Any]) -> dict[str, Any] | None:
+    """Render only an approved projection descriptor and typed runtime fields."""
+    if not any(item.get("key") == "journey" for item in decision.get("projection", [])):
+        return None
+    surface = Surface(f"capability_{decision['event_id']}", REPORT_CATALOG_ID)
+    children = [surface.text("SO to purchase proposal", "h4")]
+    for key in ("record", "order", "lot"):
+        record = decision.get(key)
+        if record:
+            children.append(surface.text(
+                f"{record['kind'].replace('_', ' ').title()} {record['external_id']}: "
+                f"{record['state']} (revision {record['revision']})"
+            ))
+    preview = decision.get("preview")
+    if preview:
+        children.extend([
+            surface.text(f"To: {preview['recipient']}"),
+            surface.text(f"Subject: {preview['subject']}"),
+            surface.text(preview["body"]),
+            surface.text("Approval required before sending."),
+        ])
+    if decision.get("escalation_required"):
+        children.append(surface.text("Approval limit exceeded; escalation required."))
+    if decision.get("effect") == "repair_connection":
+        children.append(surface.text("Reconnect the email provider to send this proposal."))
+    return {"id": surface.id, "kind": "capability", "messages": surface.messages(
+        surface.card(children))}
+
+
 def _draft_card(surface: Surface, draft: dict[str, Any]) -> str:
     children = [
         surface.text(f"{draft['kind'].replace('_', ' ').title()} · {draft['name']}", "h4"),

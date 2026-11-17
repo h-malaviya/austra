@@ -52,10 +52,13 @@ from austra.agent import (
     analyze,
     verify_anthropic_key,
 )
+from austra.build_release.routes import install_monitoring_routes
+from austra.capabilities.routes import install_capability_routes
 from austra.connectors import VERIFIERS, Verifier, exchange_gmail_code, gmail_authorization_url
 from austra.files import SECRET_PATTERN, Files
 from austra.imports import import_chat_tables, inspect_chat_table
 from austra.infrastructure import Infrastructure, InfrastructureError
+from austra.integrations.routes import install_integration_routes
 from austra.mail_draft import is_requirement_mail_request, requirement_email, requirement_pdf
 from austra.material_plan import (
     build_material_plan,
@@ -66,6 +69,7 @@ from austra.material_plan import (
 )
 from austra.mcp_connections import McpConnections
 from austra.mcp_gateway import ExternalToolError, call_external
+from austra.onboarding.routes import install_onboarding_routes
 from austra.pdf_text import PDFExtractionError, extract_pdf_text
 from austra.platform.auth import SaasIdentity
 from austra.platform.routes import install_platform_routes
@@ -75,6 +79,8 @@ from austra.reports import (
     stock_display_unit,
     stock_report,
 )
+from austra.retrieval.routes import install_retrieval_routes
+from austra.semantics.routes import install_semantic_routes
 from austra.skills import PLATFORM_SKILLS
 from austra.slack import event_message, verify_signature
 from austra.slack_socket import run_socket_mode
@@ -260,6 +266,12 @@ def create_app(
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     if saas:
         install_platform_routes(app, saas)
+        install_onboarding_routes(app, saas)
+        install_semantic_routes(app, saas)
+        install_retrieval_routes(app, saas)
+        install_capability_routes(app, saas)
+        install_monitoring_routes(app, saas)
+        install_integration_routes(app, saas, workspace)
         install_tenant_routes(app, saas)
         install_manager_routes(app, saas)
 
@@ -758,17 +770,44 @@ def create_app(
                 )
                 analysis_error = result.reply
         if result.external_calls:
-            if files.chat(chat_id)["source"] != "ui" or latest.get("sender") != "Admin":
+            if saas:
+                result.reply += "\n\nUse an approved organization connection and action preview."
+            elif files.chat(chat_id)["source"] != "ui" or latest.get("sender") != "Admin":
                 result.reply += "\n\nExternal actions require an administrator chat in the app."
             else:
                 outcomes = []
                 call_dir = files.root / "external_calls"
                 call_dir.mkdir(exist_ok=True)
                 for call in result.external_calls:
+                    marker = None
                     try:
                         arguments = json.loads(call.arguments_json)
                         if not isinstance(arguments, dict):
                             raise TypeError("Tool arguments must be a JSON object")
+                        if (
+                            call.connection == "gmail"
+                            and call.tool == "send_email"
+                            and re.search(r"\b(?:pdf|attachment)\b", latest_text, re.IGNORECASE)
+                            and not arguments.get("attachment_id")
+                        ):
+                            raise ValueError(
+                                "The requested PDF attachment was not selected; no email was sent"
+                            )
+                        if (
+                            call.connection == "gmail"
+                            and call.tool == "send_email"
+                            and arguments.get("attachment_id") == "material_requirements_pdf"
+                        ):
+                            plan = build_material_plan(files)
+                            prepared = files.add_generated_attachment_message(
+                                chat_id,
+                                "Prepared the current material requirements PDF for email.",
+                                "material-requirements.pdf",
+                                requirement_pdf(plan),
+                            )
+                            arguments["attachment_id"] = prepared["messages"][-1]["attachments"][0][
+                                "id"
+                            ]
                         identity = (
                             f"{latest['id']}:{call.connection}:{call.tool}:{call.arguments_json}"
                         )
@@ -778,7 +817,9 @@ def create_app(
                         except FileExistsError:
                             outcomes.append(f"{call.connection}.{call.tool}: already requested")
                             continue
-                        response = mcp_connections.call(call.connection, call.tool, arguments)
+                        response = mcp_connections.call(
+                            call.connection, call.tool, arguments, chat_id=chat_id
+                        )
                         details = json.dumps(response, ensure_ascii=False, default=str)[:2000]
                         if SECRET_PATTERN.search(details):
                             details = "Completed; sensitive output omitted"
@@ -792,6 +833,12 @@ def create_app(
                             details={"tool": call.tool},
                         )
                     except (ExternalToolError, KeyError, TypeError, ValueError) as error:
+                        if marker is not None and (
+                            isinstance(error, (KeyError, TypeError, ValueError))
+                            or "Gmail authorization expired or was revoked" in str(error)
+                            or "Reconnect Gmail" in str(error)
+                        ):
+                            marker.unlink(missing_ok=True)
                         outcomes.append(f"{call.connection}.{call.tool}: failed ({error})")
                         files.record_event(
                             "mcp.tool_failed",
@@ -928,6 +975,8 @@ def create_app(
     @app.get("/organization/departments")
     @app.get("/organization/departments/{department_id}")
     @app.get("/organization/people")
+    @app.get("/organization/connections")
+    @app.get("/organization/monitoring")
     def organization_page(request: Request, department_id: str | None = None) -> FileResponse:
         if not saas or request.state.organization_slug in {None, "platform"}:
             raise HTTPException(status_code=404, detail="Page not found")
@@ -1110,6 +1159,8 @@ def create_app(
         dependencies=[Depends(require_admin)],
     )
     def call_mcp_tool(name: str, tool_name: str, payload: McpToolInput) -> dict[str, Any]:
+        if saas:
+            raise HTTPException(status_code=409, detail="Use the approved organization action gateway")
         try:
             result = mcp_connections.call(name, tool_name, payload.arguments)
         except KeyError as error:

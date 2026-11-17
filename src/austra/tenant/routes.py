@@ -1,6 +1,5 @@
 """Organization administration over tenant scoped identity tables."""
 
-import json
 import os
 from uuid import UUID
 
@@ -10,8 +9,11 @@ from pydantic import BaseModel, Field
 
 from austra.platform.auth import SaasIdentity, normalize_username, password_hash, temporary_password
 from austra.tenant.audit import record_event
+from austra.tenant.context import TenantContext
 from austra.tenant.permissions.evaluator import AuthContext, permits
 from austra.tenant.permissions.keys import DEPARTMENT_PERMISSIONS
+from austra.tenant.repository import list_objects as catalog_objects
+from austra.tenant.repository import read_records
 
 COOKIE = "austra_session"
 
@@ -250,12 +252,9 @@ def install_tenant_routes(app: FastAPI, identity: SaasIdentity) -> None:
             row = department(connection, context.organization_id, department_id)
             if row[3] is not None:
                 raise HTTPException(status_code=404, detail="Department not found")
-            rows = connection.execute(
-                "SELECT kind, external_id, source_path FROM business_objects "
-                "WHERE organization_id = %s AND department_id = %s AND archived_at IS NULL "
-                "ORDER BY kind, external_id",
-                (context.organization_id, department_id),
-            ).fetchall()
+            rows = catalog_objects(
+                connection, TenantContext.from_auth(context), department_id
+            )
         required = {
             "chat": "chat.use",
             "record": "records.read",
@@ -283,24 +282,9 @@ def install_tenant_routes(app: FastAPI, identity: SaasIdentity) -> None:
             row = department(connection, context.organization_id, department_id)
             if row[3] is not None:
                 raise HTTPException(status_code=404, detail="Department not found")
-            paths = connection.execute(
-                "SELECT source_path FROM business_objects WHERE organization_id = %s "
-                "AND department_id = %s AND kind = 'record' AND archived_at IS NULL",
-                (context.organization_id, department_id),
-            ).fetchall()
-        records = []
-        root = identity.legacy_root.resolve()
-        for (source_path,) in paths:
-            path = (root / source_path).resolve()
-            if not path.is_relative_to(root):
-                raise HTTPException(status_code=500, detail="Invalid catalog path")
-            try:
-                item = json.loads(path.read_text(encoding="utf-8"))
-            except FileNotFoundError:
-                continue
-            if not item.get("deleted_at"):
-                records.append(item)
-        return records
+            return read_records(
+                connection, TenantContext.from_auth(context), department_id, identity.legacy_root
+            )
 
     @app.get("/api/org/users")
     def list_users(request: Request):
