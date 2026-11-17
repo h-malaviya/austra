@@ -8,6 +8,7 @@ import psycopg
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
+from austra.onboarding.service import open_case
 from austra.platform.auth import SaasIdentity, normalize_username, password_hash, temporary_password
 from austra.tenant.permissions.evaluator import AuthContext, permits
 
@@ -196,12 +197,14 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                         clean_contact(payload.admin_contact_number),
                     ),
                 )
-                connection.execute(
+                created_event_id = connection.execute(
                     "INSERT INTO audit_events (organization_id, actor_user_id, channel, "
                     "action, resource_id, outcome, correlation_id) "
-                    "VALUES (%s, %s, 'api', 'organization.created', %s, 'success', gen_random_uuid())",
+                    "VALUES (%s, %s, 'api', 'organization.created', %s, 'success', gen_random_uuid()) "
+                    "RETURNING id",
                     (row[0], actor.user_id, row[0]),
-                )
+                ).fetchone()[0]
+                open_case(connection, row[0], created_event_id)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         except psycopg.errors.UniqueViolation as error:

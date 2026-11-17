@@ -359,12 +359,18 @@ def analyze(
         "saved_record_summary": _record_summary(records),
         "recovery_lessons": files.recovery_lessons(),
         "saved_read_plans": files.read_plans(),
-        "connector_status": access.configured(),
+        "connector_credentials_present": access.configured(),
         "mcp_connections": {
             name: [tool["name"] for tool in connection["tools"]]
             for name, connection in mcp_catalog.items()
-            if not connection["built_in"]
+            if connection["tools"] and name != "microsoft_learn"
         },
+        "email_pdf_attachments": [
+            {"id": attachment["id"], "name": attachment["name"]}
+            for message in chat["messages"]
+            for attachment in message.get("attachments", [])
+            if attachment["name"].lower().endswith(".pdf")
+        ][-20:],
     }
     if verified_material_plan is not None:
         context["verified_material_plan"] = verified_material_plan

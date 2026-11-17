@@ -435,6 +435,7 @@ function accessPrompt(setup) {
       else await testSavedModel();
       showGmailOauthResult();
       if (currentConfig.role === "org_admin" && organizationRoute()) await showDepartments(false);
+      else await showOnboardingOnFirstEntry();
     } catch (error) {
       feedback.textContent = error.message;
       status(error.message, true);
@@ -664,6 +665,20 @@ async function sendMessage() {
   const thinking = thinkingBubble();
   scrollBottom();
   try {
+    if (currentConfig?.saas_mode && text.startsWith("/capability ")) {
+      if (selectedFiles.length) throw new Error("Capability commands cannot include attachments.");
+      const command = JSON.parse(text.slice("/capability ".length));
+      const decision = await api("/api/org/capability-chat/commands", {
+        method: "POST", body: JSON.stringify(command)
+      });
+      if (requestGeneration !== authGeneration) return;
+      thinking.remove();
+      const records = [decision.record, decision.order, decision.lot].filter(Boolean);
+      const outcome = records.map(record => `${record.external_id}: ${record.state}`).join("; ");
+      bubble(`${outcome || decision.effect || "Decision recorded"}. Event ${decision.event_id}.`, "assistant");
+      status("");
+      return;
+    }
     const form = new FormData();
     form.append("body", text);
     if (currentChatId) form.append("chat_id", currentChatId);
@@ -1106,6 +1121,19 @@ async function showDepartments(pushRoute = true) {
   await window.renderOrganizationManagement();
 }
 
+async function showOnboardingOnFirstEntry() {
+  if (currentConfig?.role !== "org_admin" || organizationRoute()) return;
+  try {
+    const caseData = await api("/api/org/onboarding-cases/current");
+    if (caseData.state === "created" || !caseData.business_description || !caseData.desired_outcome) {
+      window.history.pushState({}, "", "/organization/onboarding");
+      await showDepartments(false);
+    }
+  } catch (error) {
+    if (!error.message.includes("No onboarding case")) status(error.message, true);
+  }
+}
+
 async function showInfrastructure() {
   try {
     const result = await api("/api/infrastructure");
@@ -1215,6 +1243,7 @@ async function start() {
       else await testSavedModel();
       showGmailOauthResult();
       if (currentConfig.role === "org_admin" && organizationRoute()) await showDepartments(false);
+      else await showOnboardingOnFirstEntry();
     }
   } catch (error) { status(error.message, true); }
 }
