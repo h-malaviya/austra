@@ -3,13 +3,115 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from psycopg import sql
 
 from austra.access import Access
+from austra.agent import ConnectionCheckError
 from austra.files import Files
 from austra.platform import auth as platform_auth
+from austra.platform.auth import password_hash
 from austra.web import create_app
+
+
+def test_organization_model_key_is_private_and_testable(tmp_path, monkeypatch):
+    url = os.environ.get("AUSTRA_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("AUSTRA_TEST_DATABASE_URL is required for PostgreSQL integration tests")
+    schema = f"model_connection_test_{uuid4().hex}"
+    with psycopg.connect(url, autocommit=True) as admin_connection:
+        admin_connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+        try:
+            database_url = psycopg.conninfo.make_conninfo(url, options=f"-c search_path={schema}")
+            monkeypatch.setenv("AUSTRA_DATABASE_URL", database_url)
+            monkeypatch.setenv("AUSTRA_SUPER_ADMIN_USERNAME", "superadmin")
+            monkeypatch.setenv("AUSTRA_SUPER_ADMIN_PASSWORD", "test platform password 123")
+            monkeypatch.setenv("AUSTRA_LEGACY_ORGANIZATION_SLUG", "legacy")
+            monkeypatch.setenv("AUSTRA_CONNECTION_ENCRYPTION_KEY", Fernet.generate_key().decode())
+            verified = []
+
+            def verify(key):
+                verified.append(key)
+                if key != "fixture-model-key":
+                    raise ConnectionCheckError("Model rejected the key", 400)
+
+            app = create_app(tmp_path, anthro_verifier=verify)
+            with psycopg.connect(database_url) as db:
+                first = db.execute(
+                    "INSERT INTO organizations (slug, name) VALUES ('bt', 'BT') RETURNING id"
+                ).fetchone()[0]
+                second = db.execute(
+                    "INSERT INTO organizations (slug, name) VALUES ('other', 'Other') RETURNING id"
+                ).fetchone()[0]
+                for organization_id in (first, second):
+                    db.execute(
+                        "INSERT INTO users (organization_id, username_normalized, "
+                        "role, password_hash, must_change_password) "
+                        "VALUES (%s, 'admin', 'org_admin', %s, false)",
+                        (organization_id, password_hash("fixture admin password")),
+                    )
+                db.execute(
+                    "INSERT INTO users (organization_id, username_normalized, "
+                    "role, password_hash, must_change_password) "
+                    "VALUES (%s, 'worker', 'employee', %s, false)",
+                    (first, password_hash("fixture worker password")),
+                )
+            headers = {"X-Austra-Request": "1"}
+            first_client = TestClient(app, base_url="http://bt.localhost:8000")
+            assert (
+                first_client.post("/api/connections/anthropic/test", headers=headers).status_code
+                == 401
+            )
+            assert (
+                first_client.post(
+                    "/api/login", json={"username": "admin", "password": "fixture admin password"}
+                ).status_code
+                == 200
+            )
+            assert first_client.get("/api/config").json()["connectors"]["anthropic"] is False
+            assert (
+                first_client.post("/api/connections/anthropic/test", headers=headers).status_code
+                == 400
+            )
+            saved = first_client.post(
+                "/api/credentials/anthropic",
+                headers=headers,
+                json={"values": {"ANTHROPIC_API_KEY": "fixture-model-key"}},
+            )
+            assert saved.status_code == 200
+            assert first_client.post("/api/connections/anthropic/test", headers=headers).json() == {
+                "connected": True
+            }
+            assert first_client.post("/api/credentials/anthropic/test", headers=headers).json() == {
+                "connected": True
+            }
+            assert first_client.get("/api/config").json()["connectors"]["anthropic"] is True
+            second_client = TestClient(app, base_url="http://other.localhost:8000")
+            second_client.post(
+                "/api/login", json={"username": "admin", "password": "fixture admin password"}
+            )
+            assert second_client.get("/api/config").json()["connectors"]["anthropic"] is False
+            assert (
+                second_client.post("/api/connections/anthropic/test", headers=headers).status_code
+                == 400
+            )
+            worker = TestClient(app, base_url="http://bt.localhost:8000")
+            worker.post(
+                "/api/login", json={"username": "worker", "password": "fixture worker password"}
+            )
+            assert (
+                worker.post("/api/connections/anthropic/test", headers=headers).status_code == 403
+            )
+            assert verified == ["fixture-model-key"] * 3
+            assert (
+                b"fixture-model-key"
+                not in next((tmp_path / "integration_secrets" / str(first)).iterdir()).read_bytes()
+            )
+        finally:
+            admin_connection.execute(
+                sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema))
+            )
 
 
 def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch):
@@ -548,6 +650,10 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             assert current_case.status_code == 200
             assert current_case.json()["state"] == "created"
             assert current_case.json()["next_actions"] == ["start_collecting"]
+            assert other_admin.get("/api/config").json()["legacy_workspace"] is False
+            assert client.get("/api/config").json()["legacy_workspace"] is True
+            assert other_admin.get("/organization/onboarding").status_code == 200
+            assert other_admin.get("/organization/capability").status_code == 200
             assert other_admin.get("/api/chats").status_code == 403
             assert client.post("/api/org/users", json={"username": "unsafe"}).status_code == 403
             new_employee = client.post(

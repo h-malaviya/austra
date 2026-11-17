@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from uuid import UUID, uuid4
 
 from docx import Document
 from docx.table import Table
@@ -58,6 +59,7 @@ from austra.connectors import VERIFIERS, Verifier, exchange_gmail_code, gmail_au
 from austra.files import SECRET_PATTERN, Files
 from austra.imports import import_chat_tables, inspect_chat_table
 from austra.infrastructure import Infrastructure, InfrastructureError
+from austra.integrations.model_credentials import ModelCredentials
 from austra.integrations.routes import install_integration_routes
 from austra.mail_draft import is_requirement_mail_request, requirement_email, requirement_pdf
 from austra.material_plan import (
@@ -227,6 +229,7 @@ def create_app(
     workspace = Path(root or os.getenv("AUSTRA_WORKSPACE", "data/blank"))
     files = Files(workspace)
     access = Access(workspace)
+    model_credentials = ModelCredentials(workspace)
     database_url = os.getenv("AUSTRA_DATABASE_URL")
     saas = SaasIdentity(database_url, workspace) if database_url else None
     if saas:
@@ -366,6 +369,42 @@ def create_app(
             return
         if not access.authenticated(request.cookies.get(SESSION_COOKIE)):
             raise HTTPException(status_code=401, detail="Administrator sign in required")
+
+    def require_model_admin(request: Request) -> UUID | None:
+        if not saas:
+            require_admin(request)
+            return None
+        context, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+        if context is None:
+            raise HTTPException(status_code=401, detail="Sign in required")
+        if (
+            context.role != "org_admin"
+            or not context.user_active
+            or not context.organization_active
+            or context.must_change_password
+            or context.organization_id is None
+            or request.state.organization_slug in {None, "platform"}
+        ):
+            raise HTTPException(status_code=403, detail="Organization admin access required")
+        if request.state.organization_slug == os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG"):
+            require_admin(request)
+            return None
+        return context.organization_id
+
+    def require_connector_admin(connector: str, request: Request) -> UUID | None:
+        if connector == "anthropic":
+            return require_model_admin(request)
+        require_admin(request)
+        return None
+
+    def audit_model_connection(request: Request, action: str, outcome: str) -> None:
+        context, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+        with saas.connect() as connection:
+            connection.execute(
+                "INSERT INTO audit_events (organization_id, actor_user_id, channel, "
+                "action, outcome, correlation_id) VALUES (%s, %s, 'web', %s, %s, %s)",
+                (context.organization_id, context.user_id, action, outcome, uuid4()),
+            )
 
     def analyzed_chat(
         chat_id: str, progress: Callable[[str], None] | None = None
@@ -975,6 +1014,8 @@ def create_app(
     @app.get("/organization/departments")
     @app.get("/organization/departments/{department_id}")
     @app.get("/organization/people")
+    @app.get("/organization/onboarding")
+    @app.get("/organization/capability")
     @app.get("/organization/connections")
     @app.get("/organization/monitoring")
     def organization_page(request: Request, department_id: str | None = None) -> FileResponse:
@@ -996,6 +1037,16 @@ def create_app(
                     (context.organization_id,),
                 ).fetchone()
                 organization_name = row[0] if row else None
+        connectors = access.configured()
+        missing = {name: access.missing(name) for name in CONNECTORS}
+        if saas and request.state.organization_slug != os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG"):
+            model_ready = bool(
+                context
+                and context.organization_id
+                and model_credentials.get(context.organization_id)
+            )
+            connectors["anthropic"] = model_ready
+            missing["anthropic"] = [] if model_ready else ["ANTHROPIC_API_KEY"]
         return {
             "admin_ready": True if saas else access.ready,
             "authenticated": (
@@ -1011,6 +1062,8 @@ def create_app(
             if saas
             else access.session_seconds_remaining(session),
             "saas_mode": bool(saas),
+            "legacy_workspace": not saas
+            or request.state.organization_slug == os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG"),
             "organization_slug": request.state.organization_slug if saas else None,
             "role": context.role if context else None,
             "must_change_password": context.must_change_password if context else False,
@@ -1018,9 +1071,9 @@ def create_app(
             if context and context.organization_id
             else None,
             "organization_name": organization_name,
-            "connectors": access.configured(),
+            "connectors": connectors,
             "guides": GUIDES,
-            "missing": {name: access.missing(name) for name in CONNECTORS},
+            "missing": missing,
             "fields": {
                 name: list(VISIBLE_FIELDS.get(name, fields)) for name, fields in CONNECTORS.items()
             },
@@ -1086,46 +1139,81 @@ def create_app(
         files.record_event("admin.logout", "Admin", "access", "administrator")
         return {"authenticated": False}
 
-    @app.post("/api/credentials/{connector}", dependencies=[Depends(require_admin)])
-    def save_credentials(connector: str, payload: Credentials) -> dict[str, Any]:
+    @app.post("/api/credentials/{connector}")
+    def save_credentials(
+        connector: str,
+        payload: Credentials,
+        request: Request,
+        model_organization_id: Annotated[UUID | None, Depends(require_connector_admin)],
+    ) -> dict[str, Any]:
         try:
             if connector == "anthropic":
                 key = payload.values.get("ANTHROPIC_API_KEY", "")
-                if not key:
+                if not key or (
+                    model_organization_id and set(payload.values) != {"ANTHROPIC_API_KEY"}
+                ):
                     raise ValueError("Enter an Anthropic API key")
                 if len(key) > 8000 or "\n" in key or "\r" in key:
                     raise ValueError("Credential values must be nonempty single lines")
                 anthro_verifier(key)
-            missing = access.save(connector, payload.values)
-            files.record_event("credential.updated", "Admin", "connector", connector)
+            if model_organization_id:
+                model_credentials.save(model_organization_id, key)
+                missing = []
+                audit_model_connection(request, "credential.updated", "success")
+            else:
+                missing = access.save(connector, payload.values)
+                files.record_event("credential.updated", "Admin", "connector", connector)
         except ConnectionCheckError as error:
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         return {"connector": connector, "configured": not missing, "missing": missing}
 
-    @app.post("/api/credentials/anthropic/test", dependencies=[Depends(require_admin)])
-    def test_anthropic_connection() -> dict[str, bool]:
-        return test_connection("anthropic")
+    @app.post("/api/credentials/anthropic/test")
+    def test_anthropic_connection(
+        request: Request,
+        model_organization_id: Annotated[UUID | None, Depends(require_model_admin)],
+    ) -> dict[str, bool]:
+        return test_connection("anthropic", request, model_organization_id)
 
-    @app.post("/api/connections/{connector}/test", dependencies=[Depends(require_admin)])
-    def test_connection(connector: str) -> dict[str, bool]:
+    @app.post("/api/connections/{connector}/test")
+    def test_connection(
+        connector: str,
+        request: Request,
+        model_organization_id: Annotated[UUID | None, Depends(require_connector_admin)],
+    ) -> dict[str, bool]:
         if connector not in CONNECTORS:
             raise HTTPException(status_code=404, detail="Unknown connection")
-        missing = access.missing(connector)
+        if model_organization_id:
+            missing = [] if model_credentials.get(model_organization_id) else ["ANTHROPIC_API_KEY"]
+        else:
+            missing = access.missing(connector)
         if missing:
             raise HTTPException(status_code=400, detail="Complete all connection fields first")
         try:
             if connector == "anthropic":
-                anthro_verifier(access.get("ANTHROPIC_API_KEY"))
+                key = (
+                    model_credentials.get(model_organization_id)
+                    if model_organization_id
+                    else access.get("ANTHROPIC_API_KEY")
+                )
+                anthro_verifier(key)
             else:
                 verifiers[connector]({name: access.get(name) for name in CONNECTORS[connector]})
         except ConnectionCheckError as error:
-            files.record_event(
-                "connection.tested", "Admin", "connector", connector, outcome="failed"
-            )
+            if model_organization_id:
+                audit_model_connection(request, "connection.tested", "failed")
+            else:
+                files.record_event(
+                    "connection.tested", "Admin", "connector", connector, outcome="failed"
+                )
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
-        files.record_event("connection.tested", "Admin", "connector", connector)
+        if model_organization_id:
+            audit_model_connection(request, "connection.tested", "success")
+        else:
+            files.record_event("connection.tested", "Admin", "connector", connector)
         return {"connected": True}
 
     @app.get("/api/mcp/connections", dependencies=[Depends(require_admin)])

@@ -34,7 +34,7 @@ beforeEach(() => {
   window.eval(fs.readFileSync(path.join(staticRoot, "organization-admin-actions.js"), "utf8"));
   const app = fs.readFileSync(path.join(staticRoot, "app.js"), "utf8");
   window.eval(app.replace(/\nstart\(\);\s*$/,
-    "\nwindow.orgTest = { refreshConfig, showDepartments, showSignedOut };"));
+    "\nwindow.orgTest = { refreshConfig, showDepartments, showSignedOut, showChatView, sendMessage, start };"));
   window.fetch = jest.fn(async (url, options = {}) => {
     if (url === "/api/config") return response({
       admin_ready: true, authenticated: true, saas_mode: true, role: "org_admin",
@@ -85,6 +85,36 @@ test("department directory opens a dedicated detail page with working tabs", asy
     .find(button => button.textContent === "Saved items").click();
   await new Promise(resolve => setTimeout(resolve, 0));
   expect(document.querySelector(".org-detail-section").textContent).toContain("stock-1");
+});
+
+test("new organization opens onboarding and asks without legacy workspace calls", async () => {
+  const originalFetch = window.fetch;
+  window.fetch = jest.fn((url, options) => {
+    if (url === "/api/config") return response({
+      admin_ready: true, authenticated: true, saas_mode: true, legacy_workspace: false,
+      role: "org_admin", organization_name: "New Works", organization_slug: "new-works",
+      session_seconds_remaining: 3600, connectors: { anthropic: false },
+      guides: { anthropic: { title: "Austra model" } }
+    });
+    if (url === "/api/org/ask") return response({
+      answer: { status: "unknown", answer: "I don't have approved evidence for that answer." }
+    });
+    return originalFetch(url, options);
+  });
+  await window.orgTest.start();
+  expect(window.location.pathname).toBe("/organization/onboarding");
+  expect(window.fetch).not.toHaveBeenCalledWith("/api/chats", expect.anything());
+  expect(window.fetch).not.toHaveBeenCalledWith("/api/jobs", expect.anything());
+  expect(document.getElementById("chatList").hidden).toBe(true);
+  window.orgTest.showChatView();
+  document.getElementById("messageInput").value = "What is our policy?";
+  await window.orgTest.sendMessage();
+  expect(window.fetch).toHaveBeenCalledWith("/api/org/ask", expect.objectContaining({
+    method: "POST", body: JSON.stringify({ question: "What is our policy?" })
+  }));
+  expect(document.getElementById("messages").textContent)
+    .toContain("I don't have approved evidence for that answer.");
+  expect(window.fetch).not.toHaveBeenCalledWith("/api/messages/background", expect.anything());
 });
 
 test("onboarding interview saves admin answers without loading directory data", async () => {

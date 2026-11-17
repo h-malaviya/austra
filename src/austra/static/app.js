@@ -239,12 +239,15 @@ function thinkingBubble() {
 function renderWelcome() {
   currentChatId = null;
   clearPendingFiles();
-  byId("chatTitle").textContent = "New chat";
+  const organizationWorkspace = currentConfig?.legacy_workspace === false;
+  byId("chatTitle").textContent = organizationWorkspace ? "New question" : "New chat";
   byId("messages").replaceChildren();
   const welcome = add(byId("messages"), "div", "", "welcome");
   add(welcome, "div", "✦", "welcome-icon");
   add(welcome, "h1", "Work with your business");
-  add(welcome, "p", "Ask about saved records and workflows, or describe a change for Austra to draft and review.");
+  add(welcome, "p", organizationWorkspace
+    ? "Ask about approved business evidence and workflows. Set up your organization through Onboarding."
+    : "Ask about saved records and workflows, or describe a change for Austra to draft and review.");
   thread();
 }
 
@@ -344,6 +347,13 @@ async function refreshConfig() {
   currentConfig = config;
   byId("organizationLabel").textContent = config.organization_name || "Business workspace";
   byId("departmentsButton").hidden = !(config.saas_mode && config.role === "org_admin");
+  const legacyWorkspace = config.legacy_workspace !== false;
+  byId("workspaceButton").hidden = !legacyWorkspace;
+  byId("infrastructureButton").hidden = !legacyWorkspace;
+  byId("attachButton").hidden = !legacyWorkspace;
+  byId("chatList").hidden = !legacyWorkspace;
+  byId("chatListLabel").hidden = !legacyWorkspace;
+  byId("newChat").textContent = legacyWorkspace ? "＋ New chat" : "＋ New question";
   byId("appShell").classList.toggle(
     "signed-out", !config.authenticated || config.must_change_password || config.role === "super_admin"
   );
@@ -428,12 +438,12 @@ function accessPrompt(setup) {
       if (currentConfig.must_change_password) { renderPasswordChange(); return; }
       if (currentConfig.role === "super_admin") { renderPlatform(); return; }
       renderWelcome();
-      await loadChats();
+      if (currentConfig.legacy_workspace !== false) await loadChats();
       if (!currentConfig.authenticated) return;
-      startProcessPolling();
+      if (currentConfig.legacy_workspace !== false) startProcessPolling();
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
       else await testSavedModel();
-      showGmailOauthResult();
+      if (currentConfig.legacy_workspace !== false) showGmailOauthResult();
       if (currentConfig.role === "org_admin" && organizationRoute()) await showDepartments(false);
       else await showOnboardingOnFirstEntry();
     } catch (error) {
@@ -647,6 +657,10 @@ async function sendMessage() {
   const text = input.value.trim();
   const selectedFiles = [...pendingFiles];
   if (!text && !selectedFiles.length) return;
+  if (currentConfig.legacy_workspace === false && selectedFiles.length) {
+    status("Add business files through Onboarding.", true);
+    return;
+  }
   if (/sk-ant-|xox[baprs]-|-----BEGIN .*PRIVATE KEY-----/i.test(text)) {
     status("Use Connections to enter credentials privately.", true);
     return;
@@ -665,6 +679,15 @@ async function sendMessage() {
   const thinking = thinkingBubble();
   scrollBottom();
   try {
+    if (currentConfig.legacy_workspace === false && !text.startsWith("/capability ")) {
+      const result = await api("/api/org/ask", {
+        method: "POST", body: JSON.stringify({ question: text })
+      });
+      if (requestGeneration !== authGeneration) return;
+      thinking.remove();
+      bubble(result.answer.answer, "assistant");
+      return;
+    }
     if (currentConfig?.saas_mode && text.startsWith("/capability ")) {
       if (selectedFiles.length) throw new Error("Capability commands cannot include attachments.");
       const command = JSON.parse(text.slice("/capability ".length));
@@ -752,12 +775,14 @@ function renderConnectionList() {
   const list = byId("connectionList");
   list.replaceChildren();
   Object.entries(currentConfig.guides).forEach(([name, guide]) => {
+    if (currentConfig.legacy_workspace === false && name !== "anthropic") return;
     const button = add(list, "button", "", `connection-option${name === selectedConnector ? " active" : ""}`);
     button.type = "button";
     add(button, "strong", guide.title);
     add(button, "small", currentConfig.connectors[name] ? "Saved" : "Setup needed");
     button.onclick = () => { selectedConnector = name; renderConnectionList(); renderConnectionDetail(); };
   });
+  if (currentConfig.legacy_workspace === false) return;
   const mcpButton = add(list, "button", "", `connection-option${selectedConnector === "mcp" ? " active" : ""}`);
   mcpButton.type = "button";
   add(mcpButton, "strong", "Other apps via MCP");
@@ -1004,7 +1029,8 @@ function showGmailOauthResult() {
 function showConnections(connector = "anthropic") {
   if (!currentConfig?.authenticated) return;
   leaveOrganizationRoute();
-  selectedConnector = connector === "mcp" || currentConfig.guides[connector] ? connector : "anthropic";
+  selectedConnector = currentConfig.legacy_workspace === false ? "anthropic"
+    : connector === "mcp" || currentConfig.guides[connector] ? connector : "anthropic";
   byId("chatArea").hidden = true;
   byId("workspacePage").hidden = true;
   byId("departmentsPage").hidden = true;
@@ -1236,12 +1262,12 @@ async function start() {
       if (currentConfig.must_change_password) { renderPasswordChange(); return; }
       if (currentConfig.role === "super_admin") { renderPlatform(); return; }
       renderWelcome();
-      await loadChats();
+      if (currentConfig.legacy_workspace !== false) await loadChats();
       if (!currentConfig.authenticated) return;
-      startProcessPolling();
+      if (currentConfig.legacy_workspace !== false) startProcessPolling();
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
       else await testSavedModel();
-      showGmailOauthResult();
+      if (currentConfig.legacy_workspace !== false) showGmailOauthResult();
       if (currentConfig.role === "org_admin" && organizationRoute()) await showDepartments(false);
       else await showOnboardingOnFirstEntry();
     }
