@@ -650,6 +650,10 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             assert current_case.status_code == 200
             assert current_case.json()["state"] == "created"
             assert current_case.json()["next_actions"] == ["start_collecting"]
+            assert other_admin.get("/api/config").json()["legacy_workspace"] is False
+            assert client.get("/api/config").json()["legacy_workspace"] is True
+            assert other_admin.get("/organization/onboarding").status_code == 200
+            assert other_admin.get("/organization/capability").status_code == 200
             assert other_admin.get("/api/chats").status_code == 403
             assert client.post("/api/org/users", json={"username": "unsafe"}).status_code == 403
             new_employee = client.post(

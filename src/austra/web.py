@@ -1014,6 +1014,8 @@ def create_app(
     @app.get("/organization/departments")
     @app.get("/organization/departments/{department_id}")
     @app.get("/organization/people")
+    @app.get("/organization/onboarding")
+    @app.get("/organization/capability")
     @app.get("/organization/connections")
     @app.get("/organization/monitoring")
     def organization_page(request: Request, department_id: str | None = None) -> FileResponse:
@@ -1060,6 +1062,8 @@ def create_app(
             if saas
             else access.session_seconds_remaining(session),
             "saas_mode": bool(saas),
+            "legacy_workspace": not saas
+            or request.state.organization_slug == os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG"),
             "organization_slug": request.state.organization_slug if saas else None,
             "role": context.role if context else None,
             "must_change_password": context.must_change_password if context else False,
