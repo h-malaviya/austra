@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from austra.access import Access
 from austra.build_release.monitoring import record_metric
+from austra.integrations.model_credentials import ModelCredentials
 from austra.platform.auth import SaasIdentity
 from austra.retrieval.context import answer_packet
 from austra.retrieval.service import retrieve
@@ -55,7 +56,13 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
             answer = answer_packet(None, payload.question, evidence)
             _measure(request, task_id, answer, started)
             return {"evidence": evidence, "answer": answer}
-        key = Access(identity.legacy_root).get("ANTHROPIC_API_KEY")
+        actor, _remaining = identity.session(request.cookies.get("austra_session"))
+        context = TenantContext.from_auth(actor)
+        key = (
+            Access(identity.legacy_root).get("ANTHROPIC_API_KEY")
+            if request.state.organization_slug == os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG")
+            else ModelCredentials(identity.legacy_root).get(context.organization_id)
+        )
         if not key:
             raise HTTPException(status_code=503, detail="Anthropic connection is unavailable")
         try:
