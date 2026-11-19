@@ -287,7 +287,8 @@ def test_crawl_accepts_apex_to_www_redirect_but_stays_on_site():
     }
     with patch("austra.onboarding.website.fetch_page", side_effect=lambda url: pages[url]):
         assert [url for url, _ in crawl("https://example.com/")] == [
-            "https://www.example.com/", "https://www.example.com/about"
+            "https://www.example.com/",
+            "https://www.example.com/about",
         ]
 
 

@@ -83,12 +83,14 @@ def interview_turn(reply: str, *, confirmed: bool = False) -> InterviewTurn:
 @pytest.mark.parametrize("confirmation", ["no that's it", "everything is ok"])
 def test_natural_confirmation_finishes_onboarding(tour_client, monkeypatch, confirmation):
     monkeypatch.setattr(
-        routes, "generate_turn",
+        routes,
+        "generate_turn",
         lambda *args: interview_turn("I’m still checking the company details."),
     )
 
     response = tour_client.post(
-        "/api/org/tour/message", headers={"X-Austra-Request": "1"},
+        "/api/org/tour/message",
+        headers={"X-Austra-Request": "1"},
         json={"body": confirmation, "revision": 1},
     )
 
@@ -102,7 +104,8 @@ def test_natural_confirmation_finishes_onboarding(tour_client, monkeypatch, conf
 def test_escaped_link_is_checked_and_failed_read_is_explicit(tour_client, monkeypatch):
     called = []
     monkeypatch.setattr(
-        routes, "generate_turn",
+        routes,
+        "generate_turn",
         lambda *args: interview_turn(
             "Thanks for the LinkedIn link. It may be blocked. "
             "Ava is COO at Acme, which builds bikes. Does this look right?"
@@ -116,7 +119,8 @@ def test_escaped_link_is_checked_and_failed_read_is_explicit(tour_client, monkey
     monkeypatch.setattr(routes, "ingest_social_page", blocked_read)
 
     response = tour_client.post(
-        "/api/org/tour/message", headers={"X-Austra-Request": "1"},
+        "/api/org/tour/message",
+        headers={"X-Austra-Request": "1"},
         json={"body": r"www\.linkedin.com/company/acme", "revision": 1},
     )
 

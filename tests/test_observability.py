@@ -59,13 +59,16 @@ def test_message_trace_records_identity_and_provider_usage_without_content(monke
         message_id="message-1",
         source="ui",
     ):
-        assert observability.observed_message(
-            model_client,
-            "structured_reply",
-            model="claude-sonnet-5",
-            max_tokens=100,
-            messages=[{"role": "user", "content": "Private business data"}],
-        ) is response
+        assert (
+            observability.observed_message(
+                model_client,
+                "structured_reply",
+                model="claude-sonnet-5",
+                max_tokens=100,
+                messages=[{"role": "user", "content": "Private business data"}],
+            )
+            is response
+        )
 
     assert propagated[0]["user_id"] == "user-1"
     assert propagated[0]["session_id"] == "chat-1"
@@ -100,9 +103,12 @@ def test_unconfigured_observability_does_not_change_model_calls(monkeypatch):
 
     model_client = SimpleNamespace(messages=SimpleNamespace(create=create))
     with observability.trace_turn("chat_message", message_id="message-1"):
-        assert observability.observed_message(
-            model_client, "structured_reply", model="claude-sonnet-5"
-        ) == "reply"
+        assert (
+            observability.observed_message(
+                model_client, "structured_reply", model="claude-sonnet-5"
+            )
+            == "reply"
+        )
     assert calls == [{"model": "claude-sonnet-5"}]
 
 

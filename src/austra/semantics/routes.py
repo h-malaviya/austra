@@ -166,8 +166,14 @@ def install_semantic_routes(app: FastAPI, identity: SaasIdentity) -> None:
                 default=str,
             )
             save_memory_update(
-                db, actor, "onboarding", actor.organization_id, result["blueprint_id"],
-                "", MemoryUpdate(), confirmed_summary=summary,
+                db,
+                actor,
+                "onboarding",
+                actor.organization_id,
+                result["blueprint_id"],
+                "",
+                MemoryUpdate(),
+                confirmed_summary=summary,
             )
             return result
 

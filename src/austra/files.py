@@ -320,7 +320,12 @@ class Files:
             for note in notes:
                 quote = note["source_quote"].strip()
                 content = note["text"].strip()
-                if not quote or quote not in source_body or not content or SECRET_PATTERN.search(content):
+                if (
+                    not quote
+                    or quote not in source_body
+                    or not content
+                    or SECRET_PATTERN.search(content)
+                ):
                     continue
                 target = user_memory if note["scope"] == "user" else chat_memory["facts"]
                 match = next(

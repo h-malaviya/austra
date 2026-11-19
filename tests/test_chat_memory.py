@@ -79,8 +79,11 @@ def test_user_memory_survives_only_with_another_live_source(tmp_path):
     }
     for chat in (first, second):
         files.remember(
-            chat["id"], chat["messages"][0]["id"], "local_admin",
-            "I prefer concise reports", [note],
+            chat["id"],
+            chat["messages"][0]["id"],
+            "local_admin",
+            "I prefer concise reports",
+            [note],
         )
     assert len(files.user_long_term_memory("local_admin")) == 1
     files.delete_chat(first["id"])
@@ -93,7 +96,9 @@ def test_chat_memory_rejects_ungrounded_notes_and_erases_summary(tmp_path):
     files = Files(tmp_path)
     chat = files.create_chat("The order requires approval", "Admin")
     files.remember(
-        chat["id"], chat["messages"][0]["id"], "local_admin",
+        chat["id"],
+        chat["messages"][0]["id"],
+        "local_admin",
         "The order requires approval",
         [
             {"scope": "chat", "text": "Approval is required", "source_quote": "requires approval"},
@@ -113,10 +118,13 @@ def test_agent_updates_memory_only_on_conclusion(tmp_path):
     def planner(_files, _access, _chat):
         return AgentReply(
             reply="I noted your preference.",
-            memory_notes=[MemoryNote(
-                scope="user", text="Prefers concise reports",
-                source_quote="I prefer concise reports",
-            )],
+            memory_notes=[
+                MemoryNote(
+                    scope="user",
+                    text="Prefers concise reports",
+                    source_quote="I prefer concise reports",
+                )
+            ],
             requirements_complete=complete,
             final_summary="Confirmed concise reporting requirement." if complete else "",
         )

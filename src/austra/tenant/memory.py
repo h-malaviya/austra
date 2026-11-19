@@ -28,8 +28,11 @@ def memory_context(
             "AND scope = 'chat' AND (%s::timestamptz IS NULL OR created_at > %s) "
             "GROUP BY content ORDER BY max(created_at) DESC",
             (
-                context.organization_id, chat_kind, chat_id,
-                summary[2] if summary else None, summary[2] if summary else None,
+                context.organization_id,
+                chat_kind,
+                chat_id,
+                summary[2] if summary else None,
+                summary[2] if summary else None,
             ),
         ).fetchall()
         preferences = connection.execute(
@@ -46,8 +49,8 @@ def memory_context(
             ).fetchone()[0]
         else:
             pending_message_count = connection.execute(
-                "SELECT count(*) FROM onboarding_messages "
-                "WHERE organization_id = %s", (context.organization_id,),
+                "SELECT count(*) FROM onboarding_messages WHERE organization_id = %s",
+                (context.organization_id,),
             ).fetchone()[0]
     return {
         "facts": [row[0] for row in facts],
@@ -110,7 +113,12 @@ def save_memory_update(
         for note in update.notes:
             quote = note.source_quote.strip()
             content = note.text.strip()
-            if not quote or quote not in source_body or not content or SECRET_PATTERN.search(content):
+            if (
+                not quote
+                or quote not in source_body
+                or not content
+                or SECRET_PATTERN.search(content)
+            ):
                 continue
             connection.execute(
                 "INSERT INTO conversation_memory_notes "
@@ -118,8 +126,13 @@ def save_memory_update(
                 "source_message_id, scope, content) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                 (
-                    context.organization_id, context.actor.user_id, chat_kind,
-                    chat_id, message_id, note.scope, content,
+                    context.organization_id,
+                    context.actor.user_id,
+                    chat_kind,
+                    chat_id,
+                    message_id,
+                    note.scope,
+                    content,
                 ),
             )
         if summary or working_compaction:
@@ -142,9 +155,14 @@ def save_memory_update(
                 "ELSE conversation_memory_summaries.compacted_message_count END, "
                 "updated_at = now()",
                 (
-                    context.organization_id, context.actor.user_id, chat_kind,
-                    chat_id, message_id, summary or None,
-                    working_compaction, compacted_at,
+                    context.organization_id,
+                    context.actor.user_id,
+                    chat_kind,
+                    chat_id,
+                    message_id,
+                    summary or None,
+                    working_compaction,
+                    compacted_at,
                     compacted_message_count,
                 ),
             )
@@ -158,8 +176,10 @@ def list_chats(connection: psycopg.Connection, context: TenantContext) -> list[d
             "ORDER BY updated_at DESC",
             (context.organization_id, context.actor.user_id),
         ).fetchall()
-    return [{"id": str(chat_id), "title": title, "updated_at": updated_at.isoformat()}
-            for chat_id, title, updated_at in rows]
+    return [
+        {"id": str(chat_id), "title": title, "updated_at": updated_at.isoformat()}
+        for chat_id, title, updated_at in rows
+    ]
 
 
 def chat(connection: psycopg.Connection, context: TenantContext, chat_id: UUID) -> dict:
@@ -178,8 +198,11 @@ def chat(connection: psycopg.Connection, context: TenantContext, chat_id: UUID) 
             (context.organization_id, chat_id),
         ).fetchall()
     return {
-        "id": str(chat_id), "title": row[0], "source": "organization_ask",
-        "created_at": row[1].isoformat(), "updated_at": row[2].isoformat(),
+        "id": str(chat_id),
+        "title": row[0],
+        "source": "organization_ask",
+        "created_at": row[1].isoformat(),
+        "updated_at": row[2].isoformat(),
         "messages": [
             {"id": str(message_id), "role": role, "body": body, "at": at.isoformat()}
             for message_id, role, body, at in messages
