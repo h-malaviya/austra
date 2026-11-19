@@ -33,6 +33,13 @@ async def call_external_async(
     except Exception as error:
         raise ExternalToolError(f"External MCP tool {name} is unavailable") from error
     if result.isError:
+        if name in {"gmail_verify", "gmail_send_email"} and any(
+            "Gmail authorization expired or was revoked" in getattr(item, "text", "")
+            for item in result.content
+        ):
+            raise ExternalToolError(
+                "Gmail authorization expired or was revoked. Reconnect Gmail on Connections."
+            )
         raise ExternalToolError(f"External MCP tool {name} failed")
     if not isinstance(result.structuredContent, dict):
         raise ExternalToolError(f"External MCP tool {name} returned invalid data")
@@ -73,7 +80,6 @@ async def remote_tools(url: str, token: str = "") -> list[dict[str, Any]]:
             "name": tool.name,
             "description": (tool.description or "")[:300],
             "input_schema": tool.inputSchema,
-            "read_only": bool(tool.annotations and tool.annotations.readOnlyHint),
         }
         for tool in found
     ]

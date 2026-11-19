@@ -1,4 +1,15 @@
 .org-page { flex: 1; min-width: 0; min-height: 0; overflow: auto; background: #f6f8f6; color: #1d3026; }
+.org-onboarding-form { display: grid; gap: 12px; padding: 22px; margin-bottom: 20px; }
+.org-onboarding-form h3, .org-onboarding-form p { margin: 0; }
+.org-onboarding-textarea { width: 100%; min-height: 95px; padding: 12px; border: 1px solid #d8e4da; border-radius: 9px; font: inherit; }
+.org-capability-panel { padding: 22px; margin-bottom: 18px; }
+.org-capability-form, .org-capability-fields { display: grid; gap: 14px; }
+.org-capability-field { display: grid; gap: 5px; font-size: 13px; }
+.org-capability-field input, .org-capability-field select { padding: 10px; border: 1px solid #d8e4da; border-radius: 8px; font: inherit; }
+.org-capability-result { padding: 22px; }
+.org-source-row { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 14px 0; border-top: 1px solid #e1e9e2; }
+.org-source-row strong, .org-source-row span, .org-source-row small { width: 100%; overflow-wrap: anywhere; }
+.org-source-preview { width: 100%; max-height: 250px; overflow: auto; padding: 10px; background: #f6f8f6; white-space: pre-wrap; }
 #departmentsContent { min-height: 100%; }
 .org-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 31px clamp(22px, 4vw, 58px) 26px; border-bottom: 1px solid #e4eae5; background: #fff; }
 .org-eyebrow { color: #43815c; font-size: 10px; font-weight: 800; letter-spacing: .18em; }
@@ -85,4 +96,9 @@
   .org-stat small { display: none; }
   .org-table { min-width: 580px; }
   .org-form-grid, .org-permission-grid { grid-template-columns: 1fr; }
+}
+.org-chart-bar {
+  display: block;
+  min-height: 0.75rem;
+  background: var(--accent, #2d6cdf);
 }

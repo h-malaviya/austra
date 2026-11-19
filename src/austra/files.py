@@ -277,6 +277,73 @@ class Files:
             },
         )
 
+    def _user_memory_path(self, owner_id: str) -> Path:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", owner_id):
+            raise ValueError("Invalid memory owner")
+        return self.root / "memory" / "long_term" / "users" / f"{owner_id}.json"
+
+    def chat_long_term_memory(self, chat_id: str) -> dict[str, Any]:
+        self._read_chat(chat_id)
+        path = self.root / "memory" / "long_term" / "chats" / f"{chat_id}.json"
+        if not path.is_file():
+            return {"facts": [], "final_summary": ""}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def user_long_term_memory(self, owner_id: str) -> list[dict[str, Any]]:
+        path = self._user_memory_path(owner_id)
+        if not path.is_file():
+            return []
+        return json.loads(path.read_text(encoding="utf-8"))["facts"]
+
+    def remember(
+        self,
+        chat_id: str,
+        message_id: str,
+        owner_id: str,
+        source_body: str,
+        notes: list[dict[str, str]],
+        final_summary: str = "",
+        working_compaction: str = "",
+    ) -> None:
+        with self._lock:
+            chat = self._read_chat(chat_id)
+            if not any(message["id"] == message_id for message in chat["messages"]):
+                raise KeyError("Message not found")
+            chat_path = self.root / "memory" / "long_term" / "chats" / f"{chat_id}.json"
+            chat_memory = self.chat_long_term_memory(chat_id)
+            user_path = self._user_memory_path(owner_id)
+            user_memory = self.user_long_term_memory(owner_id)
+            if working_compaction.strip() and not SECRET_PATTERN.search(working_compaction):
+                chat_memory["working_compaction"] = working_compaction.strip()
+                chat_memory["compacted_fact_count"] = len(chat_memory["facts"])
+                chat_memory["compacted_message_count"] = len(chat["messages"])
+            for note in notes:
+                quote = note["source_quote"].strip()
+                content = note["text"].strip()
+                if not quote or quote not in source_body or not content or SECRET_PATTERN.search(content):
+                    continue
+                target = user_memory if note["scope"] == "user" else chat_memory["facts"]
+                match = next(
+                    (item for item in target if item["text"].casefold() == content.casefold()),
+                    None,
+                )
+                source = {"chat_id": chat_id, "message_id": message_id}
+                if match is None:
+                    target.append({"text": content, "sources": [source], "at": _now()})
+                elif source not in match["sources"]:
+                    match["sources"].append(source)
+                    match["at"] = _now()
+            if final_summary.strip() and not SECRET_PATTERN.search(final_summary):
+                chat_memory["final_summary"] = final_summary.strip()
+                chat_memory["summary_message_id"] = message_id
+            processed = chat_memory.setdefault("processed_message_ids", [])
+            if message_id not in processed:
+                processed.append(message_id)
+            chat_memory["updated_at"] = _now()
+            _save(chat_path, chat_memory)
+            if user_memory:
+                _save(user_path, {"facts": user_memory, "updated_at": _now()})
+
     def add_message(
         self,
         chat_id: str,
@@ -339,41 +406,24 @@ class Files:
             chat = self._read_chat(chat_id)
             chat["deleted_at"] = _now()
             _save(self._chat_path(chat_id), chat)
-            self._save_memory(chat)
-            self.record_event("chat.deleted", "Admin", "chat", chat_id, chat_id=chat_id)
-
-    def recent_memory(self, exclude_chat: str | None = None) -> list[dict[str, str]]:
-        entries = []
-        memory_paths = list((self.root / "memory" / "short_term").glob("*.json"))
-        legacy_paths = [
-            path
-            for path in (self.root / "chats").glob("*.json")
-            if not (self.root / "memory" / "short_term" / path.name).exists()
-        ]
-        for path in [*memory_paths, *legacy_paths]:
-            memory = json.loads(path.read_text(encoding="utf-8"))
-            source_chat = memory.get("source_chat", memory.get("id"))
-            if source_chat == exclude_chat:
-                continue
-            if (
-                memory.get("deleted_at")
-                or not isinstance(source_chat, str)
-                or not re.fullmatch(r"[0-9a-f]{32}", source_chat)
-                or not self._chat_path(source_chat).exists()
-            ):
-                continue
-            entries.extend(
-                {
-                    "role": item["role"],
-                    "body": item.get("display_body", item["body"]),
-                    "at": item["at"],
-                }
-                for item in memory["messages"]
-                if not item.get("deleted_at")
-                if item.get("display_body", item["body"])
-                and not item["body"].startswith("Attachment ")
+            (self.root / "memory" / "short_term" / f"{chat_id}.json").unlink(missing_ok=True)
+            (self.root / "memory" / "long_term" / "chats" / f"{chat_id}.json").unlink(
+                missing_ok=True
             )
-        return sorted(entries, key=lambda item: item["at"])[-12:]
+            for path in (self.root / "memory" / "long_term" / "users").glob("*.json"):
+                stored = json.loads(path.read_text(encoding="utf-8"))
+                remaining = []
+                for fact in stored["facts"]:
+                    fact["sources"] = [
+                        source for source in fact["sources"] if source["chat_id"] != chat_id
+                    ]
+                    if fact["sources"]:
+                        remaining.append(fact)
+                if remaining:
+                    _save(path, {"facts": remaining, "updated_at": _now()})
+                else:
+                    path.unlink(missing_ok=True)
+            self.record_event("chat.deleted", "Admin", "chat", chat_id, chat_id=chat_id)
 
     def record_recovery_failure(self, chat_id: str, tool: str, failure: str) -> str:
         """Keep operational failures separate from business facts and chat memory."""

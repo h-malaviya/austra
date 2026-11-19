@@ -136,6 +136,11 @@ def _available(record: dict[str, Any], status_field: str) -> Decimal:
     return reported
 
 
+def verified_available_kg(values: dict[str, Any]) -> Decimal:
+    """Use the report's quality, reservation, and mass-balance checks for a lot."""
+    return _available({"values": values}, "status")
+
+
 def _allowance(files: Files) -> tuple[Decimal, str]:
     policy = next(
         (

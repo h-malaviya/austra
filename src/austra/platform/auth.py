@@ -17,6 +17,7 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
 from austra.storage.identity import resolve_session
 from austra.storage.legacy_catalog import catalog_legacy_workspace, legacy_catalog_signature
+from austra.storage.legacy_inventory import record_legacy_inventory
 from austra.storage.migrate import apply_migrations
 from austra.tenant.permissions.evaluator import AuthContext
 
@@ -134,6 +135,7 @@ class SaasIdentity:
         ).fetchone()
         if existing:
             catalog_legacy_workspace(connection, organization[0], self.legacy_root)
+            record_legacy_inventory(connection, organization[0], self.legacy_root)
             return
         legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
         salt, digest = legacy["salt"], legacy["hash"]
@@ -146,6 +148,7 @@ class SaasIdentity:
             (organization[0], f"pbkdf2_sha256$600000${salt}${digest}"),
         )
         catalog_legacy_workspace(connection, organization[0], self.legacy_root)
+        record_legacy_inventory(connection, organization[0], self.legacy_root)
 
     def login(self, username: str, password: str, organization_slug: str) -> str:
         try:

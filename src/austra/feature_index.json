@@ -1,0 +1,82 @@
+[
+  {
+    "feature": "retrieval",
+    "owner": "retrieval",
+    "public_entrypoints": ["retrieval/service.py", "retrieval/context.py", "retrieval/routes.py"],
+    "tables": ["evidence_sources", "evidence_revisions", "evidence_chunks", "semantic_revision_embeddings", "blueprint_members", "business_objects"],
+    "events": [],
+    "skills": ["retrieving-evidence"],
+    "tests": ["tests/test_retrieval.py"],
+    "legacy_seams": ["agent.py", "tools.py", "files.py"]
+  },
+  {
+    "feature": "tenant_repository",
+    "owner": "tenant",
+    "public_entrypoints": ["tenant/context.py", "tenant/repository.py"],
+    "tables": ["business_objects"],
+    "events": [],
+    "skills": [],
+    "tests": ["tests/test_tenant_database.py", "tests/test_proactive_foundation.py"],
+    "legacy_seams": ["tenant/routes.py", "storage/legacy_catalog.py"]
+  },
+  {
+    "feature": "onboarding",
+    "owner": "onboarding",
+    "public_entrypoints": ["onboarding/service.py", "onboarding/routes.py"],
+    "tables": ["onboarding_cases", "blueprints", "lifecycle_events"],
+    "events": ["organization.created"],
+    "skills": [],
+    "tests": ["tests/test_proactive_foundation.py"],
+    "legacy_seams": ["platform/routes.py", "web.py"]
+  },
+  {
+    "feature": "build_release",
+    "owner": "build_release",
+    "public_entrypoints": ["build_release/service.py"],
+    "tables": ["builds", "defects", "releases"],
+    "events": [],
+    "skills": [],
+    "tests": ["tests/test_proactive_foundation.py"],
+    "legacy_seams": []
+  },
+  {
+    "feature": "event_outbox",
+    "owner": "capabilities",
+    "public_entrypoints": ["capabilities/events.py"],
+    "tables": ["runtime_events", "outbox_jobs"],
+    "events": [],
+    "skills": [],
+    "tests": ["tests/test_proactive_foundation.py"],
+    "legacy_seams": ["web.py"]
+  },
+  {
+    "feature": "legacy_inventory",
+    "owner": "storage",
+    "public_entrypoints": ["storage/legacy_inventory.py"],
+    "tables": ["legacy_inventory"],
+    "events": [],
+    "skills": [],
+    "tests": ["tests/test_proactive_foundation.py"],
+    "legacy_seams": ["platform/auth.py"]
+  },
+  {
+    "feature": "skill_catalog",
+    "owner": "skills",
+    "public_entrypoints": ["skills.py"],
+    "tables": [],
+    "events": [],
+    "skills": ["foundation", "skill_authoring", "structure_authoring", "credential_setup", "analysis_reporting"],
+    "tests": ["tests/test_proactive_foundation.py"],
+    "legacy_seams": ["agent.py"]
+  },
+  {
+    "feature": "semantic_blueprints",
+    "owner": "semantics",
+    "public_entrypoints": ["semantics/service.py", "semantics/routes.py"],
+    "tables": ["semantic_objects", "semantic_revisions", "semantic_edges", "source_claims", "blueprint_candidates", "blueprint_members", "blueprint_manifests"],
+    "events": ["blueprint.candidate_confirmed"],
+    "skills": ["eliciting-requirements", "modeling-organization"],
+    "tests": ["tests/test_semantic_blueprints.py"],
+    "legacy_seams": ["onboarding/service.py", "build_release/service.py", "files.py"]
+  }
+]

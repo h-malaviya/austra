@@ -1,9 +1,13 @@
 let currentChatId = null;
 let currentConfig = null;
+let tourState = null;
+let organizationChatMode = "discovery";
+let tourStarting = false;
 let pendingFiles = [];
 let fileSelectionBusy = false;
 let busy = false;
 let activeJobIds = new Set();
+let activeStreamJobs = new Map();
 let processPollTimer = null;
 let sessionExpiryTimer = null;
 let authGeneration = 0;
@@ -35,6 +39,48 @@ async function api(path, options = {}) {
   }
   if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Request failed");
   return data;
+}
+
+async function postStream(path, payload, onEvent) {
+  const requestGeneration = authGeneration;
+  const response = await fetch(path, {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-Austra-Request": "1" },
+    body: JSON.stringify(payload)
+  });
+  if (response.status === 401) {
+    showSignedOut();
+    throw new Error("Your session ended. Sign in again.");
+  }
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(typeof error.detail === "string" ? error.detail : "Request failed");
+  }
+  if (!response.body?.getReader) throw new Error("Streaming is unavailable in this browser.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (requestGeneration !== authGeneration) throw new Error("Your session ended. Sign in again.");
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const event = frame.match(/^event: (.+)$/m)?.[1];
+      const data = frame.match(/^data: (.+)$/m)?.[1];
+      if (!event || !data) continue;
+      const parsed = JSON.parse(data);
+      if (event === "error") throw new Error(parsed.detail);
+      if (event === "done") result = parsed;
+      onEvent(event, parsed);
+    }
+    if (done) break;
+  }
+  if (!result) throw new Error("The answer stream ended early. Please retry.");
+  return result;
 }
 
 function add(parent, tag, text = "", className = "") {
@@ -120,6 +166,8 @@ function status(text, error = false) {
 }
 
 function showSignedOut(broadcast = true) {
+  activeStreamJobs.forEach(stream => stream.close());
+  activeStreamJobs.clear();
   if (!currentConfig?.authenticated && byId("appShell").classList.contains("signed-out")) return;
   const wasAuthenticated = currentConfig?.authenticated;
   byId("platformRoot").hidden = true;
@@ -130,6 +178,8 @@ function showSignedOut(broadcast = true) {
   currentConfig = { ...currentConfig, authenticated: false };
   window.clearOrganizationManagementCache?.();
   currentChatId = null;
+  tourState = null;
+  tourStarting = false;
   activeJobIds.clear();
   busy = false;
   fileSelectionBusy = false;
@@ -141,6 +191,9 @@ function showSignedOut(broadcast = true) {
   byId("chatList").replaceChildren();
   byId("workspaceContent").replaceChildren();
   byId("connectionDetail").replaceChildren();
+  byId("accountContent").replaceChildren();
+  byId("accountPage").hidden = true;
+  byId("appShell").classList.remove("tour-mode");
   byId("activeProcesses").replaceChildren();
   byId("activeProcesses").hidden = true;
   byId("messageInput").value = "";
@@ -171,7 +224,8 @@ async function refreshProcesses() {
     add(panel, "div", `${job.chat_title}: ${job.stage} · ${job.elapsed_seconds}s elapsed`, "process-row");
   });
   panel.hidden = jobs.length === 0;
-  const finishedCurrent = [...activeJobIds].some(id => !jobs.some(job => job.id === id));
+  const finishedCurrent = [...activeJobIds].some(id =>
+    !jobs.some(job => job.id === id) && !activeStreamJobs.has(id));
   activeJobIds = new Set(jobs.map(job => job.id));
   if (finishedCurrent && currentChatId && !busy) await showChat(currentChatId);
 }
@@ -195,6 +249,56 @@ async function waitForJob(job) {
     }
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
+}
+
+function streamJob(job) {
+  if (typeof window.EventSource !== "function") return waitForJob(job);
+  const source = new window.EventSource(`/api/jobs/${job.id}/events`);
+  activeStreamJobs.set(job.id, source);
+  let pending = "";
+  let frame = null;
+  let item = null;
+  const flush = () => {
+    frame = null;
+    if (currentChatId !== job.chat_id || !pending) return;
+    if (!item || !item.isConnected) {
+      item = bubble("", "assistant");
+      item.parentElement.classList.add("streaming-row");
+      item.querySelector(".assistant-label").textContent = "Austra · drafting";
+      add(item, "p", "", "streaming-text");
+    }
+    item.querySelector(".streaming-text").textContent += pending;
+    pending = "";
+    scrollBottom();
+  };
+  source.addEventListener("stage", event => {
+    if (currentChatId === job.chat_id) status(JSON.parse(event.data).stage);
+  });
+  source.addEventListener("delta", event => {
+    pending += JSON.parse(event.data).text;
+    if (frame === null) frame = window.requestAnimationFrame(flush);
+  });
+  source.addEventListener("done", event => {
+    source.close();
+    activeStreamJobs.delete(job.id);
+    if (frame !== null) window.cancelAnimationFrame(frame);
+    const result = JSON.parse(event.data);
+    if (currentChatId === job.chat_id) {
+      showChat(job.chat_id).then(() => {
+        if (result.error) showError(result.error);
+        else status("");
+      });
+    }
+    refreshProcesses().catch(error => status(error.message, true));
+  });
+  source.onerror = () => {
+    source.close();
+    activeStreamJobs.delete(job.id);
+    if (frame !== null) window.cancelAnimationFrame(frame);
+    waitForJob(job).catch(error => {
+      if (currentConfig?.authenticated) showError(error.message);
+    });
+  };
 }
 
 function thread() {
@@ -239,13 +343,135 @@ function thinkingBubble() {
 function renderWelcome() {
   currentChatId = null;
   clearPendingFiles();
-  byId("chatTitle").textContent = "New chat";
+  const organizationWorkspace = currentConfig?.legacy_workspace === false;
+  byId("chatTitle").textContent = organizationWorkspace ? "Business conversation" : "New chat";
   byId("messages").replaceChildren();
+  if (organizationWorkspace && tourState?.completed) {
+    const modes = add(byId("messages"), "div", "", "organization-chat-modes");
+    modes.setAttribute("role", "group");
+    modes.setAttribute("aria-label", "Conversation type");
+    [["discovery", "Plan a process"], ["knowledge", "Ask saved knowledge"]]
+      .forEach(([mode, label]) => {
+        const button = add(modes, "button", label, "inline-button");
+        button.type = "button";
+        button.setAttribute("aria-pressed", String(organizationChatMode === mode));
+        button.onclick = () => { organizationChatMode = mode; renderWelcome(); };
+      });
+    byId("messageInput").placeholder = organizationChatMode === "discovery"
+      ? "Describe a process…" : "Ask about approved information…";
+    thread();
+    if (organizationChatMode === "discovery") {
+      tourState.messages.forEach(message => bubble(message.body, message.role));
+    } else bubble("Ask a question about approved business information.");
+    scrollBottom();
+    return;
+  }
   const welcome = add(byId("messages"), "div", "", "welcome");
   add(welcome, "div", "✦", "welcome-icon");
   add(welcome, "h1", "Work with your business");
-  add(welcome, "p", "Ask about saved records and workflows, or describe a change for Austra to draft and review.");
+  add(welcome, "p", organizationWorkspace
+    ? "Ask about your organization, explore its knowledge, or start a new question."
+    : "Ask about saved records and workflows, or describe a change for Austra to draft and review.");
   thread();
+}
+
+function tourBubble(message) {
+  const item = bubble(message);
+  item.parentElement.classList.add("tour-message");
+  return item;
+}
+
+function renderTour() {
+  if (!tourState || tourState.completed || !currentConfig?.authenticated) return;
+  showChatView();
+  byId("appShell").classList.add("tour-mode");
+  byId("chatTitle").textContent = "Welcome to Austra";
+  byId("messages").replaceChildren();
+  byId("messageInput").placeholder = "Reply to Austra…";
+  byId("messageInput").disabled = !currentConfig.connectors.anthropic || tourStarting;
+  byId("sendButton").disabled = byId("messageInput").disabled;
+  thread();
+  if (!currentConfig.connectors.anthropic) {
+    const card = tourBubble("👋 Add your Anthropic API key to begin. I’ll verify it securely, then we can talk about your organization.");
+    const input = add(card, "input", "", "secure-input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.placeholder = "Anthropic API key";
+    input.setAttribute("aria-label", "Anthropic API key");
+    const button = add(card, "button", "Check key & continue →", "inline-button");
+    button.type = "button";
+    const feedback = add(card, "p", "", "auth-feedback");
+    feedback.setAttribute("role", "alert");
+    button.onclick = async () => {
+      button.disabled = true;
+      feedback.textContent = "Checking your key…";
+      try {
+        await api("/api/credentials/anthropic", { method: "POST", body: JSON.stringify({ values: { ANTHROPIC_API_KEY: input.value.trim() } }) });
+        input.value = "";
+        await refreshConfig();
+        connectionStatus(true);
+        renderTour();
+      } catch (error) {
+        feedback.textContent = error.message;
+        button.disabled = false;
+      }
+    };
+    input.onkeydown = event => { if (event.key === "Enter") button.click(); };
+    input.focus();
+    return;
+  }
+  if (!tourState.messages?.length) {
+    thinkingBubble();
+    if (!tourStarting) startTour();
+    return;
+  }
+  tourState.messages.forEach(message => {
+    if (message.role === "assistant") tourBubble(message.body);
+    else bubble(message.body, "user");
+  });
+  scrollBottom();
+  byId("messageInput").focus();
+}
+
+async function startTour() {
+  tourStarting = true;
+  byId("messageInput").disabled = true;
+  byId("sendButton").disabled = true;
+  const requestGeneration = authGeneration;
+  try {
+    const result = await api("/api/org/tour/start", { method: "POST" });
+    if (requestGeneration !== authGeneration) return;
+    if (!Array.isArray(result.messages) || !result.messages.length) {
+      throw new Error("Austra did not return a welcome message.");
+    }
+    tourState = result;
+    tourStarting = false;
+    byId("messageInput").disabled = false;
+    byId("sendButton").disabled = false;
+    renderTour();
+  } catch (error) {
+    if (requestGeneration !== authGeneration) return;
+    tourStarting = false;
+    byId("messages").replaceChildren();
+    const card = tourBubble("I couldn’t start our conversation yet. Please try again.");
+    const retry = add(card, "button", "Try again", "inline-button");
+    retry.type = "button";
+    retry.onclick = () => { retry.disabled = true; startTour(); };
+    status(error.message, true);
+  }
+}
+
+async function finishTour() {
+  byId("appShell").classList.remove("tour-mode");
+  byId("messageInput").disabled = false;
+  byId("sendButton").disabled = false;
+  byId("messageInput").placeholder = "Ask Austra a question…";
+  try { await refreshConfig(); }
+  catch (error) { status(error.message, true); return; }
+  byId("chatTitle").textContent = "Welcome to Austra";
+  status("You can update these details in Settings → Org info.");
+  renderWelcome();
+  await loadChats();
 }
 
 function renderPendingFiles() {
@@ -342,8 +568,23 @@ async function refreshConfig() {
     return;
   }
   currentConfig = config;
+  if (config.authenticated && config.role === "org_admin" && config.legacy_workspace === false && !config.must_change_password) {
+    const state = await api("/api/org/tour");
+    tourState = typeof state.completed === "boolean" ? state : null;
+  } else tourState = null;
+  const touring = Boolean(tourState && !tourState.completed);
+  byId("appShell").classList.toggle("tour-mode", touring);
   byId("organizationLabel").textContent = config.organization_name || "Business workspace";
-  byId("departmentsButton").hidden = !(config.saas_mode && config.role === "org_admin");
+  byId("departmentsButton").hidden = touring || !(config.saas_mode && config.role === "org_admin");
+  byId("profileButton").hidden = !tourState;
+  byId("orgInfoButton").hidden = !tourState || touring;
+  const legacyWorkspace = config.legacy_workspace !== false;
+  byId("workspaceButton").hidden = !legacyWorkspace;
+  byId("infrastructureButton").hidden = !legacyWorkspace;
+  byId("attachButton").hidden = !legacyWorkspace;
+  byId("chatList").hidden = !legacyWorkspace && !tourState?.completed;
+  byId("chatListLabel").hidden = !legacyWorkspace && !tourState?.completed;
+  byId("newChat").textContent = legacyWorkspace ? "＋ New chat" : "Business conversation";
   byId("appShell").classList.toggle(
     "signed-out", !config.authenticated || config.must_change_password || config.role === "super_admin"
   );
@@ -428,12 +669,13 @@ function accessPrompt(setup) {
       if (currentConfig.must_change_password) { renderPasswordChange(); return; }
       if (currentConfig.role === "super_admin") { renderPlatform(); return; }
       renderWelcome();
-      await loadChats();
+      if (!tourState || tourState.completed) await loadChats();
       if (!currentConfig.authenticated) return;
-      startProcessPolling();
+      if (currentConfig.legacy_workspace !== false) startProcessPolling();
+      if (tourState && !tourState.completed) { renderTour(); return; }
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
       else await testSavedModel();
-      showGmailOauthResult();
+      if (currentConfig.legacy_workspace !== false) showGmailOauthResult();
       if (currentConfig.role === "org_admin" && organizationRoute()) await showDepartments(false);
     } catch (error) {
       feedback.textContent = error.message;
@@ -448,7 +690,8 @@ async function loadChats() {
   const list = byId("chatList");
   if (!list.childElementCount) showLoadingState(list, "Loading chats", "list");
   let chats;
-  try { chats = await api("/api/chats"); }
+  const chatsPath = currentConfig?.legacy_workspace === false ? "/api/org/chats" : "/api/chats";
+  try { chats = await api(chatsPath); }
   catch (error) { list.replaceChildren(); throw error; }
   list.replaceChildren();
   if (!chats.length) add(list, "p", "No chats yet.", "connection");
@@ -491,7 +734,7 @@ async function loadChats() {
         destructive: true
       })) return;
       try {
-        await api(`/api/chats/${chat.id}`, { method: "DELETE" });
+        await api(`${chatsPath}/${chat.id}`, { method: "DELETE" });
         if (currentChatId === chat.id) renderWelcome();
         await loadChats();
         status("Chat removed from the list. Its audit copy remains.");
@@ -533,10 +776,22 @@ function renderDraft(item) {
 
 function renderChat(result) {
   const chat = result.chat;
+  const previousThread = byId("thread");
+  const existing = previousThread
+    ? [...previousThread.querySelectorAll(".message-row > .bubble[data-message-id]")]
+    : [];
+  const canAppend = currentChatId === chat.id && Boolean(previousThread)
+    && existing.length <= chat.messages.length
+    && existing.every((item, index) => item.dataset.messageId === chat.messages[index].id);
   currentChatId = chat.id;
   byId("chatTitle").textContent = chat.title;
-  byId("messages").replaceChildren();
-  chat.messages.forEach(message => {
+  if (canAppend) {
+    previousThread.querySelectorAll(".message-row").forEach(row => {
+      if (!row.querySelector(".bubble[data-message-id]")) row.remove();
+    });
+    previousThread.querySelectorAll(".a2ui-item, .a2ui-panel").forEach(item => item.remove());
+  } else byId("messages").replaceChildren();
+  chat.messages.slice(canAppend ? existing.length : 0).forEach(message => {
     const visual = message.role === "assistant" && (message.report || message.visualize);
     const showVisual = visual && Boolean(window.AustraA2UI);
     const item = bubble(
@@ -544,6 +799,7 @@ function renderChat(result) {
       message.role
     );
     item.dataset.messageId = message.id;
+    if (canAppend && message.role === "assistant") item.parentElement.classList.add("arriving");
     if (visual) {
       item._austraFallback = message.body;
       if (showVisual) {
@@ -559,9 +815,11 @@ function renderChat(result) {
     });
   });
   const surfaceRequest = ++chatSurfaceRequest;
-  const reviewPanel = add(thread(), "div", "", "a2ui-panel");
-  loadChatSurfaces(chat.id, reviewPanel, surfaceRequest, result.drafts || [])
-    .catch(error => status(error.message, true));
+  if (currentConfig?.legacy_workspace !== false) {
+    const reviewPanel = add(thread(), "div", "", "a2ui-panel");
+    loadChatSurfaces(chat.id, reviewPanel, surfaceRequest, result.drafts || [])
+      .catch(error => status(error.message, true));
+  }
   (result.credential_requests || []).forEach(name => {
     if (!currentConfig.connectors[name]) securePrompt(name);
   });
@@ -634,8 +892,10 @@ async function loadChatSurfaces(chatId, panel, requestId, fallbackDrafts) {
 async function showChat(chatId) {
   try {
     if (chatId !== currentChatId) clearPendingFiles();
+    if (currentConfig?.legacy_workspace === false) organizationChatMode = "knowledge";
     showChatView();
-    renderChat(await api(`/api/chats/${chatId}`));
+    const chatsPath = currentConfig?.legacy_workspace === false ? "/api/org/chats" : "/api/chats";
+    renderChat(await api(`${chatsPath}/${chatId}`));
     byId("sidebar").classList.remove("open");
   } catch (error) { status(error.message, true); }
 }
@@ -644,8 +904,53 @@ async function sendMessage() {
   if (busy || fileSelectionBusy || !currentConfig?.authenticated) return;
   const input = byId("messageInput");
   const text = input.value.trim();
+  if (tourState && !tourState.completed) {
+    if (!currentConfig.connectors.anthropic || tourStarting || !text) return;
+    busy = true;
+    byId("sendButton").disabled = true;
+    input.value = "";
+    const optimistic = bubble(text, "user");
+    const thinking = thinkingBubble();
+    let preview = null;
+    try {
+      tourState = await postStream("/api/org/tour/message/stream", {
+        body: text, revision: tourState.revision
+      }, (event, data) => {
+        if (event !== "delta") return;
+        thinking.remove();
+        if (!preview) {
+          preview = bubble("", "assistant");
+          preview.parentElement.classList.add("streaming-row");
+          preview.querySelector(".assistant-label").textContent = "Austra · drafting";
+          add(preview, "p", "", "streaming-text");
+        }
+        preview.querySelector(".streaming-text").textContent += data.text;
+        scrollBottom();
+      });
+      preview?.parentElement.remove();
+      if (tourState.completed) {
+        thinking.remove();
+        tourBubble(tourState.messages.at(-1).body);
+        await finishTour();
+      } else renderTour();
+    } catch (error) {
+      thinking.remove();
+      preview?.parentElement.remove();
+      optimistic.parentElement.remove();
+      input.value = text;
+      status(error.message, true);
+    } finally {
+      busy = false;
+      if (currentConfig?.authenticated) byId("sendButton").disabled = false;
+    }
+    return;
+  }
   const selectedFiles = [...pendingFiles];
   if (!text && !selectedFiles.length) return;
+  if (currentConfig.legacy_workspace === false && selectedFiles.length) {
+    status("Add business files through Onboarding.", true);
+    return;
+  }
   if (/sk-ant-|xox[baprs]-|-----BEGIN .*PRIVATE KEY-----/i.test(text)) {
     status("Use Connections to enter credentials privately.", true);
     return;
@@ -662,8 +967,82 @@ async function sendMessage() {
   const optimistic = bubble(text, "user");
   selectedFiles.forEach(({ file }) => add(optimistic, "div", `📎 ${file.name}`, "sent-attachment"));
   const thinking = thinkingBubble();
+  let streamedAnswer = null;
+  let acceptedChatId = null;
   scrollBottom();
   try {
+    if (currentConfig.legacy_workspace === false && tourState?.completed
+      && currentConfig.role === "org_admin" && organizationChatMode === "discovery"
+      && !text.startsWith("/capability ")) {
+      tourState = await postStream("/api/org/discovery/message/stream", {
+        body: text, revision: tourState.revision
+      }, (event, data) => {
+        if (event !== "delta") return;
+        thinking.remove();
+        if (!streamedAnswer) {
+          streamedAnswer = bubble("", "assistant");
+          streamedAnswer.parentElement.classList.add("streaming-row");
+          streamedAnswer.querySelector(".assistant-label").textContent = "Austra · drafting";
+          add(streamedAnswer, "p", "", "streaming-text");
+        }
+        streamedAnswer.querySelector(".streaming-text").textContent += data.text;
+        scrollBottom();
+      });
+      if (requestGeneration !== authGeneration) return;
+      thinking.remove();
+      if (streamedAnswer) {
+        streamedAnswer.replaceChildren();
+        add(streamedAnswer, "div", "Austra", "assistant-label");
+        renderMarkdown(streamedAnswer, tourState.messages.at(-1).body);
+        streamedAnswer.parentElement.classList.remove("streaming-row");
+      } else bubble(tourState.messages.at(-1).body, "assistant");
+      status("");
+      return;
+    }
+    if (currentConfig.legacy_workspace === false && !text.startsWith("/capability ")) {
+      let pending = "";
+      let frame = null;
+      const result = await postStream("/api/org/ask/stream", {
+        question: text, chat_id: currentChatId
+      }, (event, data) => {
+        if (event === "accepted") acceptedChatId = data.chat_id;
+        if (event === "stage") status(data.stage);
+        if (event !== "delta") return;
+        thinking.remove();
+        if (!streamedAnswer) {
+          streamedAnswer = bubble("", "assistant");
+          streamedAnswer.parentElement.classList.add("streaming-row");
+          streamedAnswer.querySelector(".assistant-label").textContent = "Austra · drafting";
+          add(streamedAnswer, "p", "", "streaming-text");
+        }
+        pending += data.text;
+        if (frame === null) frame = window.requestAnimationFrame(() => {
+          streamedAnswer.querySelector(".streaming-text").textContent += pending;
+          pending = "";
+          frame = null;
+          scrollBottom();
+        });
+      });
+      if (requestGeneration !== authGeneration) return;
+      thinking.remove();
+      renderChat({ chat: result.chat, drafts: [] });
+      status("");
+      return;
+    }
+    if (currentConfig?.saas_mode && text.startsWith("/capability ")) {
+      if (selectedFiles.length) throw new Error("Capability commands cannot include attachments.");
+      const command = JSON.parse(text.slice("/capability ".length));
+      const decision = await api("/api/org/capability-chat/commands", {
+        method: "POST", body: JSON.stringify(command)
+      });
+      if (requestGeneration !== authGeneration) return;
+      thinking.remove();
+      const records = [decision.record, decision.order, decision.lot].filter(Boolean);
+      const outcome = records.map(record => `${record.external_id}: ${record.state}`).join("; ");
+      bubble(`${outcome || decision.effect || "Decision recorded"}. Event ${decision.event_id}.`, "assistant");
+      status("");
+      return;
+    }
     const form = new FormData();
     form.append("body", text);
     if (currentChatId) form.append("chat_id", currentChatId);
@@ -682,9 +1061,7 @@ async function sendMessage() {
     if (result.job) {
       activeJobIds.add(result.job.id);
       await refreshProcesses();
-      waitForJob(result.job).catch(error => {
-        if (currentConfig?.authenticated) showError(error.message);
-      });
+      streamJob(result.job);
     }
     if (result.duplicate_files?.length) {
       status(`${result.duplicate_files.length} duplicate file${result.duplicate_files.length === 1 ? "" : "s"} skipped.`);
@@ -692,6 +1069,12 @@ async function sendMessage() {
   } catch (error) {
     if (requestGeneration !== authGeneration) return;
     thinking.remove();
+    streamedAnswer?.parentElement.remove();
+    if (acceptedChatId) {
+      await showChat(acceptedChatId);
+      showError(error.message);
+      return;
+    }
     optimistic.parentElement.remove();
     input.value = text;
     resizeMessageInput();
@@ -722,6 +1105,7 @@ function showChatView(syncRoute = true) {
   byId("connectionsPage").hidden = true;
   byId("workspacePage").hidden = true;
   byId("departmentsPage").hidden = true;
+  byId("accountPage").hidden = true;
   byId("chatArea").hidden = false;
   byId("sidebar").classList.remove("open");
   scrollBottom();
@@ -737,12 +1121,14 @@ function renderConnectionList() {
   const list = byId("connectionList");
   list.replaceChildren();
   Object.entries(currentConfig.guides).forEach(([name, guide]) => {
+    if (currentConfig.legacy_workspace === false && name !== "anthropic") return;
     const button = add(list, "button", "", `connection-option${name === selectedConnector ? " active" : ""}`);
     button.type = "button";
     add(button, "strong", guide.title);
     add(button, "small", currentConfig.connectors[name] ? "Saved" : "Setup needed");
     button.onclick = () => { selectedConnector = name; renderConnectionList(); renderConnectionDetail(); };
   });
+  if (currentConfig.legacy_workspace === false) return;
   const mcpButton = add(list, "button", "", `connection-option${selectedConnector === "mcp" ? " active" : ""}`);
   mcpButton.type = "button";
   add(mcpButton, "strong", "Other apps via MCP");
@@ -988,8 +1374,10 @@ function showGmailOauthResult() {
 
 function showConnections(connector = "anthropic") {
   if (!currentConfig?.authenticated) return;
+  if (tourState && !tourState.completed) { renderTour(); return; }
   leaveOrganizationRoute();
-  selectedConnector = connector === "mcp" || currentConfig.guides[connector] ? connector : "anthropic";
+  selectedConnector = currentConfig.legacy_workspace === false ? "anthropic"
+    : connector === "mcp" || currentConfig.guides[connector] ? connector : "anthropic";
   byId("chatArea").hidden = true;
   byId("workspacePage").hidden = true;
   byId("departmentsPage").hidden = true;
@@ -1067,6 +1455,7 @@ async function loadWorkspace() {
 
 function showWorkspace() {
   if (!currentConfig?.authenticated) return;
+  if (tourState && !tourState.completed) { renderTour(); return; }
   leaveOrganizationRoute();
   byId("chatArea").hidden = true;
   byId("connectionsPage").hidden = true;
@@ -1095,6 +1484,7 @@ async function loadWorkspaceDepartments() {
 
 async function showDepartments(pushRoute = true) {
   if (currentConfig?.role !== "org_admin") return;
+  if (tourState && !tourState.completed) { renderTour(); return; }
   if (pushRoute && window.location.pathname !== "/organization/departments") {
     window.history.pushState({}, "", "/organization/departments");
   }
@@ -1106,7 +1496,71 @@ async function showDepartments(pushRoute = true) {
   await window.renderOrganizationManagement();
 }
 
+function showAccount(view) {
+  if (!currentConfig?.authenticated || !tourState || (view === "organization" && !tourState.completed)) return;
+  leaveOrganizationRoute();
+  ["chatArea", "connectionsPage", "workspacePage", "departmentsPage"].forEach(id => { byId(id).hidden = true; });
+  byId("accountPage").hidden = false;
+  byId("sidebar").classList.remove("open");
+  const root = byId("accountContent");
+  root.replaceChildren();
+  add(root, "div", view === "profile" ? "YOUR ACCOUNT" : "SETTINGS", "eyebrow");
+  add(root, "h1", view === "profile" ? "My profile" : "Organization info");
+  const back = add(root, "button", "← Back to chat", "top-action");
+  back.type = "button";
+  back.onclick = () => { if (tourState && !tourState.completed) renderTour(); else showChatView(); };
+  if (view === "profile") {
+    [
+      ["Name", tourState.full_name || "Not added yet"],
+      ["Username", tourState.username],
+      ["Email", tourState.email || "Not added yet"],
+      ["Phone", tourState.contact_number || "Not added yet"],
+      ["About me", tourState.about_admin || "Not added yet"],
+      ["Organization", tourState.organization_name]
+    ].forEach(([label, value]) => {
+      const row = add(root, "div", "", "account-detail");
+      add(row, "span", label);
+      add(row, "strong", value);
+    });
+    return;
+  }
+  add(root, "p", "Update the details you shared during your welcome tour.", "account-description");
+  const form = add(root, "form", "", "account-form");
+  const inputs = {};
+  [
+    ["name", "Organization name", tourState.organization_name, "text"],
+    ["about_organization", "About your organization", tourState.about_organization, "textarea"],
+    ["desired_outcome", "What Austra should help with", tourState.desired_outcome, "textarea"],
+    ["website_url", "Website URL", tourState.website_url, "url"],
+    ["social_url", "Social media page URL", tourState.social_url, "url"]
+  ].forEach(([key, labelText, value, type]) => {
+    const label = add(form, "label", labelText);
+    const input = add(label, type === "textarea" ? "textarea" : "input", "", "secure-input");
+    if (type !== "textarea") input.type = type;
+    input.value = value || "";
+    inputs[key] = input;
+  });
+  const save = add(form, "button", "Save changes", "inline-button");
+  save.type = "submit";
+  const feedback = add(form, "p", "", "account-feedback");
+  feedback.setAttribute("role", "status");
+  form.onsubmit = async event => {
+    event.preventDefault();
+    save.disabled = true;
+    try {
+      tourState = await api("/api/org/info", { method: "PUT", body: JSON.stringify(
+        Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value.trim()]))
+      ) });
+      byId("organizationLabel").textContent = tourState.organization_name;
+      feedback.textContent = "Saved. Your organization info is up to date.";
+    } catch (error) {
+      feedback.textContent = error.message;
+    } finally { save.disabled = false; }
+  };
+}
+
 async function showInfrastructure() {
+  if (tourState && !tourState.completed) return;
   try {
     const result = await api("/api/infrastructure");
     const lines = Object.entries(result.services).map(([name, state]) => `${name}: ${state}`);
@@ -1114,7 +1568,7 @@ async function showInfrastructure() {
   } catch (error) { status(error.message, true); }
 }
 
-byId("newChat").onclick = () => { if (currentConfig?.authenticated) { showChatView(); renderWelcome(); } };
+byId("newChat").onclick = () => { if (currentConfig?.authenticated && (!tourState || tourState.completed)) { showChatView(); renderWelcome(); } };
 byId("sendButton").onclick = sendMessage;
 byId("messageInput").onkeydown = event => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -1137,6 +1591,8 @@ byId("workspaceBack").onclick = showChatView;
 byId("topConnections").onclick = () => showConnections();
 byId("backToChat").onclick = showChatView;
 byId("infrastructureButton").onclick = showInfrastructure;
+byId("profileButton").onclick = () => showAccount("profile");
+byId("orgInfoButton").onclick = () => showAccount("organization");
 byId("menuButton").onclick = () => byId("sidebar").classList.toggle("open");
 byId("logoutButton").onclick = async () => {
   try {
@@ -1147,6 +1603,7 @@ byId("logoutButton").onclick = async () => {
 
 window.addEventListener("popstate", () => {
   if (currentConfig?.authenticated && currentConfig.role === "org_admin") {
+    if (tourState && !tourState.completed) { renderTour(); return; }
     if (organizationRoute()) showDepartments(false).catch(error => status(error.message, true));
     else if (!byId("departmentsPage").hidden) showChatView(false);
   }
@@ -1208,12 +1665,13 @@ async function start() {
       if (currentConfig.must_change_password) { renderPasswordChange(); return; }
       if (currentConfig.role === "super_admin") { renderPlatform(); return; }
       renderWelcome();
-      await loadChats();
+      if (!tourState || tourState.completed) await loadChats();
       if (!currentConfig.authenticated) return;
-      startProcessPolling();
+      if (currentConfig.legacy_workspace !== false) startProcessPolling();
+      if (tourState && !tourState.completed) { renderTour(); return; }
       if (!currentConfig.connectors.anthropic) securePrompt("anthropic");
       else await testSavedModel();
-      showGmailOauthResult();
+      if (currentConfig.legacy_workspace !== false) showGmailOauthResult();
       if (currentConfig.role === "org_admin" && organizationRoute()) await showDepartments(false);
     }
   } catch (error) { status(error.message, true); }

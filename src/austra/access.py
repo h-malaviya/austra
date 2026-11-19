@@ -43,7 +43,8 @@ GUIDES = {
             "Testing, add your Google account under Google Auth Platform > Audience > "
             "Test users. "
             "Save the client ID and secret, then choose Connect with Google. "
-            "Austra verifies the mailbox without sending email."
+            "Austra verifies the mailbox without sending email. Reconnect an existing "
+            "Gmail account to grant send permission."
         ),
     },
     "slack": {

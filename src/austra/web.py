@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -15,6 +16,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from uuid import UUID, uuid4
 
 from docx import Document
 from docx.table import Table
@@ -29,7 +31,7 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
@@ -52,10 +54,14 @@ from austra.agent import (
     analyze,
     verify_anthropic_key,
 )
+from austra.build_release.routes import install_monitoring_routes
+from austra.capabilities.routes import install_capability_routes
 from austra.connectors import VERIFIERS, Verifier, exchange_gmail_code, gmail_authorization_url
 from austra.files import SECRET_PATTERN, Files
 from austra.imports import import_chat_tables, inspect_chat_table
 from austra.infrastructure import Infrastructure, InfrastructureError
+from austra.integrations.model_credentials import ModelCredentials
+from austra.integrations.routes import install_integration_routes
 from austra.mail_draft import is_requirement_mail_request, requirement_email, requirement_pdf
 from austra.material_plan import (
     build_material_plan,
@@ -66,6 +72,15 @@ from austra.material_plan import (
 )
 from austra.mcp_connections import McpConnections
 from austra.mcp_gateway import ExternalToolError, call_external
+from austra.memory import (
+    MEMORY_COMPACTION_CHARS,
+    MEMORY_COMPACTION_MESSAGES,
+    current_memory_owner,
+    extract_memory_update,
+    memory_scope,
+)
+from austra.observability import trace_turn
+from austra.onboarding.routes import install_onboarding_routes
 from austra.pdf_text import PDFExtractionError, extract_pdf_text
 from austra.platform.auth import SaasIdentity
 from austra.platform.routes import install_platform_routes
@@ -75,6 +90,8 @@ from austra.reports import (
     stock_display_unit,
     stock_report,
 )
+from austra.retrieval.routes import install_retrieval_routes
+from austra.semantics.routes import install_semantic_routes
 from austra.skills import PLATFORM_SKILLS
 from austra.slack import event_message, verify_signature
 from austra.slack_socket import run_socket_mode
@@ -221,6 +238,7 @@ def create_app(
     workspace = Path(root or os.getenv("AUSTRA_WORKSPACE", "data/blank"))
     files = Files(workspace)
     access = Access(workspace)
+    model_credentials = ModelCredentials(workspace)
     database_url = os.getenv("AUSTRA_DATABASE_URL")
     saas = SaasIdentity(database_url, workspace) if database_url else None
     if saas:
@@ -231,6 +249,7 @@ def create_app(
     oauth_states: dict[str, tuple[float, str, str | None]] = {}
     jobs: dict[str, dict[str, Any]] = {}
     jobs_lock = threading.RLock()
+    jobs_condition = threading.Condition(jobs_lock)
     slack_socket_status = {"connected": False}
     public_url = os.getenv("AUSTRA_PUBLIC_URL", "http://127.0.0.1:8000").rstrip("/")
     gmail_redirect_uri = f"{public_url}/api/connections/gmail/callback"
@@ -260,6 +279,12 @@ def create_app(
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     if saas:
         install_platform_routes(app, saas)
+        install_onboarding_routes(app, saas, model_credentials.get)
+        install_semantic_routes(app, saas)
+        install_retrieval_routes(app, saas)
+        install_capability_routes(app, saas)
+        install_monitoring_routes(app, saas)
+        install_integration_routes(app, saas, workspace)
         install_tenant_routes(app, saas)
         install_manager_routes(app, saas)
 
@@ -355,8 +380,46 @@ def create_app(
         if not access.authenticated(request.cookies.get(SESSION_COOKIE)):
             raise HTTPException(status_code=401, detail="Administrator sign in required")
 
-    def analyzed_chat(
-        chat_id: str, progress: Callable[[str], None] | None = None
+    def require_model_admin(request: Request) -> UUID | None:
+        if not saas:
+            require_admin(request)
+            return None
+        context, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+        if context is None:
+            raise HTTPException(status_code=401, detail="Sign in required")
+        if (
+            context.role != "org_admin"
+            or not context.user_active
+            or not context.organization_active
+            or context.must_change_password
+            or context.organization_id is None
+            or request.state.organization_slug in {None, "platform"}
+        ):
+            raise HTTPException(status_code=403, detail="Organization admin access required")
+        if request.state.organization_slug == os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG"):
+            require_admin(request)
+            return None
+        return context.organization_id
+
+    def require_connector_admin(connector: str, request: Request) -> UUID | None:
+        if connector == "anthropic":
+            return require_model_admin(request)
+        require_admin(request)
+        return None
+
+    def audit_model_connection(request: Request, action: str, outcome: str) -> None:
+        context, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+        with saas.connect() as connection:
+            connection.execute(
+                "INSERT INTO audit_events (organization_id, actor_user_id, channel, "
+                "action, outcome, correlation_id) VALUES (%s, %s, 'web', %s, %s, %s)",
+                (context.organization_id, context.user_id, action, outcome, uuid4()),
+            )
+
+    def _analyzed_chat(
+        chat_id: str,
+        progress: Callable[[str], None] | None = None,
+        on_text: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         latest = files.chat(chat_id)["messages"][-1]
         latest_text = latest.get("display_body", latest["body"])
@@ -571,11 +634,17 @@ def create_app(
         try:
             if progress:
                 progress("Analyzing request")
-            result = verification_update(files, chat_id) or (
-                analyze(files, access, chat_id, verified_material_plan=verified_material_plan)
-                if verified_material_plan is not None
-                else planner(files, access, chat_id)
-            )
+            result = verification_update(files, chat_id)
+            if result is None:
+                if verified_material_plan is not None or planner is analyze:
+                    options: dict[str, Any] = {}
+                    if verified_material_plan is not None:
+                        options["verified_material_plan"] = verified_material_plan
+                    if on_text and "on_text" in inspect.signature(analyze).parameters:
+                        options["on_text"] = on_text
+                    result = analyze(files, access, chat_id, **options)
+                else:
+                    result = planner(files, access, chat_id)
         except AnalysisUnavailable as error:
             logger.warning("Chat analysis unavailable: %s", error)
             files.record_event(
@@ -589,6 +658,18 @@ def create_app(
             )
             analysis_error = str(error)
             result = AgentReply(reply=str(error))
+        if latest["role"] == "user" and analysis_error is None:
+            files.remember(
+                chat_id,
+                latest["id"],
+                current_memory_owner(),
+                latest_text,
+                [note.model_dump() for note in result.memory_notes],
+                result.final_summary
+                if result.requirements_complete and not result.needs_input
+                else "",
+                result.working_compaction,
+            )
         if result.title.strip() and not files.chat(chat_id).get("title_generated"):
             files.set_chat_title(chat_id, result.title)
         if result.needs_input:
@@ -758,17 +839,44 @@ def create_app(
                 )
                 analysis_error = result.reply
         if result.external_calls:
-            if files.chat(chat_id)["source"] != "ui" or latest.get("sender") != "Admin":
+            if saas:
+                result.reply += "\n\nUse an approved organization connection and action preview."
+            elif files.chat(chat_id)["source"] != "ui" or latest.get("sender") != "Admin":
                 result.reply += "\n\nExternal actions require an administrator chat in the app."
             else:
                 outcomes = []
                 call_dir = files.root / "external_calls"
                 call_dir.mkdir(exist_ok=True)
                 for call in result.external_calls:
+                    marker = None
                     try:
                         arguments = json.loads(call.arguments_json)
                         if not isinstance(arguments, dict):
                             raise TypeError("Tool arguments must be a JSON object")
+                        if (
+                            call.connection == "gmail"
+                            and call.tool == "send_email"
+                            and re.search(r"\b(?:pdf|attachment)\b", latest_text, re.IGNORECASE)
+                            and not arguments.get("attachment_id")
+                        ):
+                            raise ValueError(
+                                "The requested PDF attachment was not selected; no email was sent"
+                            )
+                        if (
+                            call.connection == "gmail"
+                            and call.tool == "send_email"
+                            and arguments.get("attachment_id") == "material_requirements_pdf"
+                        ):
+                            plan = build_material_plan(files)
+                            prepared = files.add_generated_attachment_message(
+                                chat_id,
+                                "Prepared the current material requirements PDF for email.",
+                                "material-requirements.pdf",
+                                requirement_pdf(plan),
+                            )
+                            arguments["attachment_id"] = prepared["messages"][-1]["attachments"][0][
+                                "id"
+                            ]
                         identity = (
                             f"{latest['id']}:{call.connection}:{call.tool}:{call.arguments_json}"
                         )
@@ -778,7 +886,9 @@ def create_app(
                         except FileExistsError:
                             outcomes.append(f"{call.connection}.{call.tool}: already requested")
                             continue
-                        response = mcp_connections.call(call.connection, call.tool, arguments)
+                        response = mcp_connections.call(
+                            call.connection, call.tool, arguments, chat_id=chat_id
+                        )
                         details = json.dumps(response, ensure_ascii=False, default=str)[:2000]
                         if SECRET_PATTERN.search(details):
                             details = "Completed; sensitive output omitted"
@@ -792,6 +902,12 @@ def create_app(
                             details={"tool": call.tool},
                         )
                     except (ExternalToolError, KeyError, TypeError, ValueError) as error:
+                        if marker is not None and (
+                            isinstance(error, (KeyError, TypeError, ValueError))
+                            or "Gmail authorization expired or was revoked" in str(error)
+                            or "Reconnect Gmail" in str(error)
+                        ):
+                            marker.unlink(missing_ok=True)
                         outcomes.append(f"{call.connection}.{call.tool}: failed ({error})")
                         files.record_event(
                             "mcp.tool_failed",
@@ -833,12 +949,92 @@ def create_app(
             "analysis_error": analysis_error,
         }
 
+    def chat_trace_identity(request: Request | None) -> dict[str, str]:
+        if not saas or request is None:
+            return {}
+        actor, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+        if actor is None or actor.organization_id is None:
+            return {}
+        with saas.connect() as connection:
+            row = connection.execute(
+                "SELECT name FROM organizations WHERE id = %s", (actor.organization_id,)
+            ).fetchone()
+        return {
+            "organization_id": str(actor.organization_id),
+            "organization_name": row[0] if row else "",
+            "user_id": str(actor.user_id),
+        }
+
+    def analyzed_chat(
+        chat_id: str,
+        progress: Callable[[str], None] | None = None,
+        trace_identity: dict[str, str] | None = None,
+        on_text: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        chat = files.chat(chat_id)
+        latest = chat["messages"][-1]
+        owner_id = (trace_identity or {}).get("user_id")
+        if owner_id is None:
+            sender = latest.get("sender", "")
+            owner_id = (
+                "local_admin"
+                if chat["source"] == "ui"
+                else f"{chat['source']}_{hashlib.sha256(sender.encode()).hexdigest()[:24]}"
+            )
+        with (
+            memory_scope(owner_id),
+            trace_turn(
+                "chat_message",
+                chat_id=chat_id,
+                message_id=latest["id"],
+                source=chat["source"],
+                **(trace_identity or {}),
+            ),
+        ):
+            result = _analyzed_chat(chat_id, progress, on_text)
+            if latest["role"] == "user" and not result.get("analysis_error"):
+                chat_memory = files.chat_long_term_memory(chat_id)
+                if latest["id"] not in chat_memory.get("processed_message_ids", []):
+                    key = access.get("ANTHROPIC_API_KEY")
+                    if key:
+                        pending_facts = chat_memory["facts"][
+                            chat_memory.get("compacted_fact_count", 0) :
+                        ]
+                        update = extract_memory_update(
+                            key,
+                            latest.get("display_body", latest["body"]),
+                            files.chat(chat_id)["messages"],
+                            [item["text"] for item in pending_facts],
+                            [],
+                            prior_compaction=chat_memory.get("working_compaction", ""),
+                            compaction_needed=(
+                                sum(len(item["text"]) for item in pending_facts)
+                                >= MEMORY_COMPACTION_CHARS
+                                or len(chat["messages"])
+                                - chat_memory.get("compacted_message_count", 0)
+                                >= MEMORY_COMPACTION_MESSAGES
+                            ),
+                        )
+                        files.remember(
+                            chat_id,
+                            latest["id"],
+                            owner_id,
+                            latest.get("display_body", latest["body"]),
+                            [note.model_dump() for note in update.notes],
+                            update.final_summary if update.requirements_complete else "",
+                            update.working_compaction,
+                        )
+            return result
+
     def submitted_chat(
-        chat_id: str | None, body: str, uploads: list[dict[str, Any]]
+        chat_id: str | None,
+        body: str,
+        uploads: list[dict[str, Any]],
+        trace_identity: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         chat, duplicates, changed = submit_only(chat_id, body, uploads)
         result = (
-            analyzed_chat(chat["id"])
+            analyzed_chat(chat["id"], trace_identity=trace_identity)
             if changed
             else {
                 "chat": chat,
@@ -862,7 +1058,7 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
-    def start_job(chat_id: str) -> dict[str, Any]:
+    def start_job(chat_id: str, trace_identity: dict[str, str] | None = None) -> dict[str, Any]:
         with jobs_lock:
             if any(
                 job["chat_id"] == chat_id and job["status"] == "running" for job in jobs.values()
@@ -880,16 +1076,34 @@ def create_app(
                 "started_at": datetime.now(UTC).isoformat(),
                 "finished_at": None,
                 "error": None,
+                "events": [],
             }
             jobs[job_id] = job
+
+        def publish(event: str, data: dict[str, Any]) -> None:
+            with jobs_condition:
+                job["events"].append(
+                    {
+                        "id": len(job["events"]) + 1,
+                        "event": event,
+                        "data": data,
+                    }
+                )
+                jobs_condition.notify_all()
 
         def progress(stage: str) -> None:
             with jobs_lock:
                 job["stage"] = stage
+            publish("stage", {"stage": stage})
 
         def run() -> None:
             try:
-                result = analyzed_chat(chat_id, progress)
+                result = analyzed_chat(
+                    chat_id,
+                    progress,
+                    trace_identity,
+                    on_text=lambda chunk: publish("delta", {"text": chunk}),
+                )
                 with jobs_lock:
                     job["status"] = "failed" if result["analysis_error"] else "completed"
                     job["error"] = result["analysis_error"]
@@ -903,6 +1117,7 @@ def create_app(
             finally:
                 with jobs_lock:
                     job["finished_at"] = datetime.now(UTC).isoformat()
+                publish("done", {"status": job["status"], "error": job["error"]})
 
         threading.Thread(target=run, daemon=True, name=f"austra-job-{job_id}").start()
         return job_snapshot(job)
@@ -912,7 +1127,10 @@ def create_app(
         finished = (
             datetime.fromisoformat(job["finished_at"]) if job["finished_at"] else datetime.now(UTC)
         )
-        return {**job, "elapsed_seconds": max(0, int((finished - started).total_seconds()))}
+        return {
+            **{key: value for key, value in job.items() if key != "events"},
+            "elapsed_seconds": max(0, int((finished - started).total_seconds())),
+        }
 
     @app.get("/")
     def home() -> FileResponse:
@@ -928,6 +1146,10 @@ def create_app(
     @app.get("/organization/departments")
     @app.get("/organization/departments/{department_id}")
     @app.get("/organization/people")
+    @app.get("/organization/onboarding")
+    @app.get("/organization/capability")
+    @app.get("/organization/connections")
+    @app.get("/organization/monitoring")
     def organization_page(request: Request, department_id: str | None = None) -> FileResponse:
         if not saas or request.state.organization_slug in {None, "platform"}:
             raise HTTPException(status_code=404, detail="Page not found")
@@ -947,6 +1169,16 @@ def create_app(
                     (context.organization_id,),
                 ).fetchone()
                 organization_name = row[0] if row else None
+        connectors = access.configured()
+        missing = {name: access.missing(name) for name in CONNECTORS}
+        if saas and request.state.organization_slug != os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG"):
+            model_ready = bool(
+                context
+                and context.organization_id
+                and model_credentials.get(context.organization_id)
+            )
+            connectors["anthropic"] = model_ready
+            missing["anthropic"] = [] if model_ready else ["ANTHROPIC_API_KEY"]
         return {
             "admin_ready": True if saas else access.ready,
             "authenticated": (
@@ -962,6 +1194,8 @@ def create_app(
             if saas
             else access.session_seconds_remaining(session),
             "saas_mode": bool(saas),
+            "legacy_workspace": not saas
+            or request.state.organization_slug == os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG"),
             "organization_slug": request.state.organization_slug if saas else None,
             "role": context.role if context else None,
             "must_change_password": context.must_change_password if context else False,
@@ -969,9 +1203,9 @@ def create_app(
             if context and context.organization_id
             else None,
             "organization_name": organization_name,
-            "connectors": access.configured(),
+            "connectors": connectors,
             "guides": GUIDES,
-            "missing": {name: access.missing(name) for name in CONNECTORS},
+            "missing": missing,
             "fields": {
                 name: list(VISIBLE_FIELDS.get(name, fields)) for name, fields in CONNECTORS.items()
             },
@@ -1037,46 +1271,81 @@ def create_app(
         files.record_event("admin.logout", "Admin", "access", "administrator")
         return {"authenticated": False}
 
-    @app.post("/api/credentials/{connector}", dependencies=[Depends(require_admin)])
-    def save_credentials(connector: str, payload: Credentials) -> dict[str, Any]:
+    @app.post("/api/credentials/{connector}")
+    def save_credentials(
+        connector: str,
+        payload: Credentials,
+        request: Request,
+        model_organization_id: Annotated[UUID | None, Depends(require_connector_admin)],
+    ) -> dict[str, Any]:
         try:
             if connector == "anthropic":
                 key = payload.values.get("ANTHROPIC_API_KEY", "")
-                if not key:
+                if not key or (
+                    model_organization_id and set(payload.values) != {"ANTHROPIC_API_KEY"}
+                ):
                     raise ValueError("Enter an Anthropic API key")
                 if len(key) > 8000 or "\n" in key or "\r" in key:
                     raise ValueError("Credential values must be nonempty single lines")
                 anthro_verifier(key)
-            missing = access.save(connector, payload.values)
-            files.record_event("credential.updated", "Admin", "connector", connector)
+            if model_organization_id:
+                model_credentials.save(model_organization_id, key)
+                missing = []
+                audit_model_connection(request, "credential.updated", "success")
+            else:
+                missing = access.save(connector, payload.values)
+                files.record_event("credential.updated", "Admin", "connector", connector)
         except ConnectionCheckError as error:
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         return {"connector": connector, "configured": not missing, "missing": missing}
 
-    @app.post("/api/credentials/anthropic/test", dependencies=[Depends(require_admin)])
-    def test_anthropic_connection() -> dict[str, bool]:
-        return test_connection("anthropic")
+    @app.post("/api/credentials/anthropic/test")
+    def test_anthropic_connection(
+        request: Request,
+        model_organization_id: Annotated[UUID | None, Depends(require_model_admin)],
+    ) -> dict[str, bool]:
+        return test_connection("anthropic", request, model_organization_id)
 
-    @app.post("/api/connections/{connector}/test", dependencies=[Depends(require_admin)])
-    def test_connection(connector: str) -> dict[str, bool]:
+    @app.post("/api/connections/{connector}/test")
+    def test_connection(
+        connector: str,
+        request: Request,
+        model_organization_id: Annotated[UUID | None, Depends(require_connector_admin)],
+    ) -> dict[str, bool]:
         if connector not in CONNECTORS:
             raise HTTPException(status_code=404, detail="Unknown connection")
-        missing = access.missing(connector)
+        if model_organization_id:
+            missing = [] if model_credentials.get(model_organization_id) else ["ANTHROPIC_API_KEY"]
+        else:
+            missing = access.missing(connector)
         if missing:
             raise HTTPException(status_code=400, detail="Complete all connection fields first")
         try:
             if connector == "anthropic":
-                anthro_verifier(access.get("ANTHROPIC_API_KEY"))
+                key = (
+                    model_credentials.get(model_organization_id)
+                    if model_organization_id
+                    else access.get("ANTHROPIC_API_KEY")
+                )
+                anthro_verifier(key)
             else:
                 verifiers[connector]({name: access.get(name) for name in CONNECTORS[connector]})
         except ConnectionCheckError as error:
-            files.record_event(
-                "connection.tested", "Admin", "connector", connector, outcome="failed"
-            )
+            if model_organization_id:
+                audit_model_connection(request, "connection.tested", "failed")
+            else:
+                files.record_event(
+                    "connection.tested", "Admin", "connector", connector, outcome="failed"
+                )
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
-        files.record_event("connection.tested", "Admin", "connector", connector)
+        if model_organization_id:
+            audit_model_connection(request, "connection.tested", "success")
+        else:
+            files.record_event("connection.tested", "Admin", "connector", connector)
         return {"connected": True}
 
     @app.get("/api/mcp/connections", dependencies=[Depends(require_admin)])
@@ -1110,6 +1379,10 @@ def create_app(
         dependencies=[Depends(require_admin)],
     )
     def call_mcp_tool(name: str, tool_name: str, payload: McpToolInput) -> dict[str, Any]:
+        if saas:
+            raise HTTPException(
+                status_code=409, detail="Use the approved organization action gateway"
+            )
         try:
             result = mcp_connections.call(name, tool_name, payload.arguments)
         except KeyError as error:
@@ -1216,13 +1489,13 @@ def create_app(
         return files.chats()
 
     @app.post("/api/chats", dependencies=[Depends(require_admin)], status_code=201)
-    def create_chat(payload: Message) -> dict[str, Any]:
+    def create_chat(payload: Message, request: Request) -> dict[str, Any]:
         try:
             body = payload.safe_body
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         chat = files.create_chat(body, "Admin")
-        return analyzed_chat(chat["id"])
+        return analyzed_chat(chat["id"], trace_identity=chat_trace_identity(request))
 
     @app.get("/api/chats/{chat_id}", dependencies=[Depends(require_admin)])
     def get_chat(chat_id: str) -> dict[str, Any]:
@@ -1291,34 +1564,36 @@ def create_app(
         return {"deleted": True, "audit_preserved": True}
 
     @app.post("/api/chats/{chat_id}/messages", dependencies=[Depends(require_admin)])
-    def add_message(chat_id: str, payload: Message) -> dict[str, Any]:
+    def add_message(chat_id: str, payload: Message, request: Request) -> dict[str, Any]:
         try:
             files.add_message(chat_id, "user", payload.safe_body, "Admin")
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Chat not found") from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        return analyzed_chat(chat_id)
+        return analyzed_chat(chat_id, trace_identity=chat_trace_identity(request))
 
     @app.post("/api/chats/{chat_id}/retry", dependencies=[Depends(require_admin)])
-    def retry_chat(chat_id: str) -> dict[str, Any]:
+    def retry_chat(chat_id: str, request: Request) -> dict[str, Any]:
         try:
             files.chat(chat_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Chat not found") from error
-        return analyzed_chat(chat_id)
+        return analyzed_chat(chat_id, trace_identity=chat_trace_identity(request))
 
     @app.post("/api/messages", dependencies=[Depends(require_admin)])
     async def submit_message(
+        request: Request,
         body: str = Form(default=""),
         chat_id: str = Form(default=""),
         uploads: Annotated[list[UploadFile] | None, File()] = None,
     ) -> dict[str, Any]:
         prepared = await _prepare_uploads(uploads or [])
-        return submitted_chat(chat_id or None, body, prepared)
+        return submitted_chat(chat_id or None, body, prepared, chat_trace_identity(request))
 
     @app.post("/api/messages/background", dependencies=[Depends(require_admin)], status_code=202)
     async def submit_background_message(
+        request: Request,
         body: str = Form(default=""),
         chat_id: str = Form(default=""),
         uploads: Annotated[list[UploadFile] | None, File()] = None,
@@ -1338,7 +1613,7 @@ def create_app(
             "chat": chat,
             "duplicate_files": duplicates,
             "unchanged": not changed,
-            "job": start_job(chat["id"]) if changed else None,
+            "job": start_job(chat["id"], chat_trace_identity(request)) if changed else None,
         }
 
     @app.get("/api/jobs", dependencies=[Depends(require_admin)])
@@ -1353,10 +1628,59 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Process not found")
             return job_snapshot(jobs[job_id])
 
+    @app.get("/api/jobs/{job_id}/events", dependencies=[Depends(require_admin)])
+    def stream_job_events(job_id: str, request: Request) -> StreamingResponse:
+        with jobs_lock:
+            if job_id not in jobs:
+                raise HTTPException(status_code=404, detail="Process not found")
+        try:
+            cursor = max(0, int(request.headers.get("last-event-id", "0")))
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="Invalid event cursor") from error
+
+        def events():
+            nonlocal cursor
+            while True:
+                with jobs_condition:
+                    jobs_condition.wait_for(
+                        lambda cursor=cursor: (
+                            len(jobs[job_id]["events"]) > cursor
+                            or jobs[job_id]["status"] != "running"
+                        ),
+                        timeout=15,
+                    )
+                    available = jobs[job_id]["events"][cursor:]
+                    finished = jobs[job_id]["status"] != "running"
+                if not available:
+                    if finished:
+                        return
+                    yield ": keep-alive\n\n"
+                    continue
+                for item in available:
+                    cursor = item["id"]
+                    yield (
+                        f"id: {item['id']}\n"
+                        f"event: {item['event']}\n"
+                        f"data: {json.dumps(item['data'], ensure_ascii=True)}\n\n"
+                    )
+                if finished:
+                    return
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.post("/api/chats/{chat_id}/attachments", dependencies=[Depends(require_admin)])
-    async def add_attachment(chat_id: str, upload: Annotated[UploadFile, File()]) -> dict[str, Any]:
+    async def add_attachment(
+        chat_id: str, upload: Annotated[UploadFile, File()], request: Request
+    ) -> dict[str, Any]:
         prepared = await _prepare_uploads([upload])
-        return submitted_chat(chat_id, "", prepared)
+        return submitted_chat(chat_id, "", prepared, chat_trace_identity(request))
 
     @app.get("/api/artifacts", dependencies=[Depends(require_admin)])
     def list_artifacts() -> list[dict[str, Any]]:

@@ -175,7 +175,12 @@ def test_gmail_oauth_flow_hides_refresh_token_and_rejects_replayed_state(tmp_pat
     assert query["client_id"] == ["client-id"]
     assert query["access_type"] == ["offline"]
     assert query["redirect_uri"] == [config["gmail_redirect_uri"]]
-    assert query["scope"] == ["https://www.googleapis.com/auth/gmail.metadata"]
+    assert query["scope"] == [
+        (
+            "https://www.googleapis.com/auth/gmail.metadata "
+            "https://www.googleapis.com/auth/gmail.send"
+        )
+    ]
 
     def exchange(code, client_id, client_secret, redirect_uri):
         assert (code, client_id, client_secret, redirect_uri) == (

@@ -6,9 +6,11 @@ requires-python = ">=3.13"
 dependencies = [
     "anthropic>=1.0",
     "argon2-cffi>=23,<26",
+    "cryptography>=45,<47",
     "fastapi>=0.118",
     "httpx>=0.28",
     "jsonschema>=4.25",
+    "langfuse>=4,<5",
     "mcp>=1.0,<2",
     "openpyxl>=3.1",
     "psycopg[binary]>=3.2,<4",

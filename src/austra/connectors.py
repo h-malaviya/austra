@@ -7,7 +7,9 @@ from austra.agent import ConnectionCheckError
 from austra.mcp_gateway import ExternalToolError, call_external
 
 Verifier = Callable[[dict[str, str]], None]
-GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.metadata"
+GMAIL_SCOPE = (
+    "https://www.googleapis.com/auth/gmail.metadata https://www.googleapis.com/auth/gmail.send"
+)
 
 
 def gmail_authorization_url(client_id: str, redirect_uri: str, state: str) -> str:
@@ -65,7 +67,12 @@ def verify_gmail(values: dict[str, str]) -> None:
     try:
         result = call_external("gmail_verify", {}, values)
     except ExternalToolError as error:
-        raise ConnectionCheckError("Could not verify Gmail through MCP. Try again.", 503) from error
+        message = (
+            str(error)
+            if "Gmail authorization expired or was revoked" in str(error)
+            else "Could not verify Gmail through MCP. Try again."
+        )
+        raise ConnectionCheckError(message, 503) from error
     email = result.get("email")
     if not isinstance(email, str) or email.casefold() != values["GMAIL_SENDER_EMAIL"].casefold():
         raise ConnectionCheckError("Gmail account does not match the sender address.", 400)
