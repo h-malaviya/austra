@@ -1,11 +1,13 @@
 """Organization administrator semantic review endpoints."""
 
+import json
 from datetime import datetime
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from austra.memory import MemoryUpdate
 from austra.platform.auth import SaasIdentity
 from austra.semantics.service import (
     add_edge,
@@ -19,6 +21,7 @@ from austra.semantics.service import (
     review_candidate,
 )
 from austra.tenant.context import TenantContext
+from austra.tenant.memory import save_memory_update
 
 
 class ClaimDecisionInput(BaseModel):
@@ -146,6 +149,32 @@ def install_semantic_routes(app: FastAPI, identity: SaasIdentity) -> None:
 
     @app.post("/api/org/onboarding-cases/{case_id}/candidate/confirm")
     def confirm(case_id: UUID, payload: ConfirmInput, request: Request):
-        return run(
-            request, lambda db, actor: confirm_candidate(db, actor, case_id, payload.content_hash)
-        )
+        def confirm_and_remember(db, actor):
+            result = confirm_candidate(db, actor, case_id, payload.content_hash)
+            candidate = review_candidate(db, actor, case_id)
+            summary = json.dumps(
+                {
+                    "confirmed_blueprint_version": result["version"],
+                    "behavior": candidate["behavior"],
+                    "revisions": [
+                        {"kind": item["kind"], "key": item["key"]}
+                        for item in candidate["revisions"]
+                    ],
+                    "acceptance_examples": candidate["acceptance_examples"],
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+            save_memory_update(
+                db,
+                actor,
+                "onboarding",
+                actor.organization_id,
+                result["blueprint_id"],
+                "",
+                MemoryUpdate(),
+                confirmed_summary=summary,
+            )
+            return result
+
+        return run(request, confirm_and_remember)

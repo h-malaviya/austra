@@ -49,7 +49,7 @@ def database():
         admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
         try:
             with psycopg.connect(url, options=f"-c search_path={schema}") as connection:
-                assert apply_migrations(connection)[-1] == "013_proactive_monitoring.sql"
+                assert "016_discovery_state.sql" in apply_migrations(connection)
                 yield connection
         finally:
             admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))

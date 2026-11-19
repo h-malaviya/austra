@@ -4,11 +4,15 @@ import http.client
 import ipaddress
 import socket
 import ssl
+from collections import deque
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 MAX_PAGE_BYTES = 2 * 1024 * 1024
-MAX_PAGES = 5
+MAX_PAGES = 12
+MAX_FULL_PAGES = 300
+MAX_DISCOVERED_URLS = 1000
 MAX_REDIRECTS = 3
 FETCH_TIMEOUT_SECONDS = 8
 
@@ -141,34 +145,69 @@ def parse_page(content: bytes) -> PageParser:
     return parser
 
 
-def crawl(root: str):
+def same_site_host(first: str | None, second: str | None) -> bool:
+    return bool(first and second and first.removeprefix("www.") == second.removeprefix("www."))
+
+
+@dataclass(frozen=True)
+class CrawlReport:
+    pages: list[tuple[str, bytes]]
+    failed_urls: list[str]
+    truncated: bool
+    page_limit: int
+
+
+def crawl_report(root: str, page_limit: int = MAX_PAGES) -> CrawlReport:
+    """Follow discoverable public HTML links across the supplied site."""
     root_host = urlsplit(root).hostname
-    queue = [(root, 0)]
-    seen = set()
-    while queue and len(seen) < MAX_PAGES:
-        url, depth = queue.pop(0)
+    queue = deque([root])
+    queued = {root}
+    seen: set[str] = set()
+    pages: list[tuple[str, bytes]] = []
+    failed_urls: list[str] = []
+    discovery_limited = False
+    while queue and len(pages) < page_limit:
+        url = queue.popleft()
         if url in seen:
             continue
-        final_url, data = fetch_page(url)
-        if urlsplit(final_url).hostname != root_host:
-            raise ValueError("Website redirected outside the supplied host")
+        seen.add(url)
+        try:
+            final_url, data = fetch_page(url)
+        except (ValueError, OSError):
+            if url == root:
+                raise
+            failed_urls.append(url)
+            continue
+        if not same_site_host(urlsplit(final_url).hostname, root_host):
+            if url == root:
+                raise ValueError("Website redirected outside the supplied host")
+            failed_urls.append(url)
+            continue
+        if final_url in seen and final_url != url and any(page[0] == final_url for page in pages):
+            continue
         seen.add(final_url)
-        yield final_url, data
-        if depth == 0:
-            parser = parse_page(data)
-            for href in parser.links:
-                candidate = urljoin(final_url, href)
-                parsed = urlsplit(candidate)
-                if (
-                    parsed.hostname == root_host
-                    and parsed.scheme in {"http", "https"}
-                    and len(queue) < MAX_PAGES
-                ):
-                    queue.append(
-                        (
-                            urlunsplit(
-                                (parsed.scheme, parsed.netloc, parsed.path, parsed.query, "")
-                            ),
-                            1,
-                        )
-                    )
+        pages.append((final_url, data))
+        for href in parse_page(data).links:
+            candidate = urljoin(final_url, href)
+            parsed = urlsplit(candidate)
+            if not (
+                same_site_host(parsed.hostname, root_host)
+                and parsed.scheme in {"http", "https"}
+                and not parsed.query
+                and not parsed.path.lower().endswith(
+                    (".pdf", ".jpg", ".jpeg", ".png", ".svg", ".webp", ".zip")
+                )
+            ):
+                continue
+            normalized = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+            if normalized not in queued:
+                if len(queued) >= MAX_DISCOVERED_URLS:
+                    discovery_limited = True
+                    continue
+                queue.append(normalized)
+                queued.add(normalized)
+    return CrawlReport(pages, failed_urls, bool(queue) or discovery_limited, page_limit)
+
+
+def crawl(root: str):
+    yield from crawl_report(root).pages

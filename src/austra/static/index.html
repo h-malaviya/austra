@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Austra · Business workspace</title>
-  <link rel="stylesheet" href="/static/app.css?v=21">
+  <link rel="stylesheet" href="/static/app.css?v=24">
   <link rel="stylesheet" href="/static/organization-admin.css?v=2">
 </head>
 <body>
@@ -12,13 +12,15 @@
     <aside class="sidebar" id="sidebar" aria-label="Conversations">
       <div class="brand"><span class="brand-mark">A</span><span>Austra<small>Business workspace</small></span></div>
       <button class="new-chat" id="newChat" type="button">＋ New chat</button>
-      <div class="sidebar-label">YOUR CHATS</div>
+      <div class="sidebar-label" id="chatListLabel">YOUR CHATS</div>
       <nav class="chat-list" id="chatList" aria-label="Previous chats"></nav>
       <div class="sidebar-bottom">
         <button class="side-action" id="workspaceButton" type="button">Workspace <span>↗</span></button>
         <button class="side-action" id="departmentsButton" type="button" hidden>Departments & People <span>↗</span></button>
         <button class="side-action" id="infrastructureButton" type="button">Infrastructure <span>↗</span></button>
         <button class="side-action" id="connectionsButton" type="button">Connections <span>↗</span></button>
+        <button class="side-action" id="orgInfoButton" type="button" hidden>Settings · Org info <span>↗</span></button>
+        <button class="side-action" id="profileButton" type="button" hidden>My profile <span>↗</span></button>
         <button class="side-action" id="logoutButton" type="button">Sign out <span>↗</span></button>
         <div class="connection" id="connection">Checking setup…</div>
       </div>
@@ -66,6 +68,9 @@
     <main class="org-page" id="departmentsPage" hidden>
       <div id="departmentsContent" aria-live="polite"></div>
     </main>
+    <main class="account-page" id="accountPage" hidden>
+      <div class="account-card" id="accountContent"></div>
+    </main>
   </div>
   <div id="platformRoot" class="platform-root" hidden></div>
   <script src="/static/markdown.js?v=8" defer></script>
@@ -78,6 +83,6 @@
   <script src="/static/organization-monitoring.js?v=1" defer></script>
   <script src="/static/organization-admin-detail.js?v=2" defer></script>
   <script src="/static/organization-admin-actions.js?v=2" defer></script>
-  <script src="/static/app.js?v=19" defer></script>
+  <script src="/static/app.js?v=21" defer></script>
 </body>
 </html>

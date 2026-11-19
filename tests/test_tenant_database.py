@@ -43,6 +43,11 @@ def test_migration_session_scope_and_revocation(database):
         "011_connections.sql",
         "012_capability_descriptors.sql",
         "013_proactive_monitoring.sql",
+        "014_guided_tour.sql",
+        "015_model_led_onboarding.sql",
+        "016_discovery_state.sql",
+        "017_social_page_status.sql",
+        "018_conversation_memory.sql",
     ]
     assert apply_migrations(database) == []
     organization_id = database.execute(

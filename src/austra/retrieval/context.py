@@ -2,8 +2,10 @@
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
+from austra.observability import observed_message
 from austra.skills import load_skill
 
 MODEL = "claude-sonnet-5"
@@ -20,6 +22,8 @@ def answer_packet(
     *,
     input_usd_per_million: float | None = None,
     output_usd_per_million: float | None = None,
+    conversation_context: dict | None = None,
+    on_text: Callable[[str], None] | None = None,
 ) -> dict:
     if packet.get("aggregate", {}).get("measure") == "active_record_count":
         value = packet["aggregate"]["value"]
@@ -43,6 +47,8 @@ def answer_packet(
         load_skill("retrieving-evidence")
         + "\nAnswer only from the packet. Cite each factual statement with [chunk UUID]. "
         "For semantic facts cite their revision UUID. Say unknown for unsupported parts. "
+        "Conversation context can clarify the user's wording and style, but it is not "
+        "evidence for a factual answer. "
         "Do not compute totals; only quote SQL aggregates supplied in the packet."
     )
     passages = list(packet["passages"])
@@ -55,6 +61,7 @@ def answer_packet(
                 "semantic": packet["semantic"],
                 "exact_records": packet.get("exact_records", []),
                 "passages": passages,
+                "conversation_context": conversation_context or {},
             },
             default=str,
             ensure_ascii=False,
@@ -85,8 +92,14 @@ def answer_packet(
         }
     if counted > INPUT_HARD_CAP:
         raise ValueError("Input token hard cap exceeded")
-    response = client.messages.create(
-        model=MODEL, max_tokens=OUTPUT_RESERVE, system=system, messages=messages
+    response = observed_message(
+        client,
+        "retrieval_answer",
+        on_text=on_text,
+        model=MODEL,
+        max_tokens=OUTPUT_RESERVE,
+        system=system,
+        messages=messages,
     )
     if response.stop_reason != "end_turn":
         raise ValueError("Answer did not finish")

@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from collections.abc import Callable
 from typing import Any, Literal
 
 from anthropic import Anthropic, APIConnectionError, APIStatusError, APITimeoutError
@@ -12,6 +13,14 @@ from austra.access import Access
 from austra.files import Files
 from austra.mcp_connections import McpConnections
 from austra.mcp_gateway import ExternalToolError
+from austra.memory import (
+    MEMORY_COMPACTION_CHARS,
+    MEMORY_COMPACTION_MESSAGES,
+    MemoryNote,
+    current_memory_owner,
+)
+from austra.observability import observed_message
+from austra.reply_stream import ReplyStream
 from austra.reports import has_stock_order_table, is_stock_order_report_request
 from austra.skills import load_skills
 from austra.tools import ReadTools
@@ -87,6 +96,10 @@ class AgentReply(BaseModel):
     record_changes: list[RecordChange] = Field(default_factory=list, max_length=50)
     rule_changes: list[RuleChange] = Field(default_factory=list, max_length=20)
     external_calls: list[ExternalCall] = Field(default_factory=list, max_length=3)
+    memory_notes: list[MemoryNote] = Field(default_factory=list, max_length=20)
+    requirements_complete: bool = False
+    final_summary: str = Field(default="", max_length=3000)
+    working_compaction: str = Field(default="", max_length=5000)
 
 
 OUTPUT_SCHEMA = {
@@ -103,6 +116,10 @@ OUTPUT_SCHEMA = {
         "record_changes",
         "rule_changes",
         "external_calls",
+        "memory_notes",
+        "requirements_complete",
+        "final_summary",
+        "working_compaction",
     ],
     "properties": {
         "reply": {"type": "string"},
@@ -193,6 +210,22 @@ OUTPUT_SCHEMA = {
                 },
             },
         },
+        "memory_notes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["scope", "text", "source_quote"],
+                "properties": {
+                    "scope": {"type": "string", "enum": ["chat", "user"]},
+                    "text": {"type": "string"},
+                    "source_quote": {"type": "string"},
+                },
+            },
+        },
+        "requirements_complete": {"type": "boolean"},
+        "final_summary": {"type": "string"},
+        "working_compaction": {"type": "string"},
     },
 }
 
@@ -250,7 +283,9 @@ def _delegate_research(client: Any, files: Files, chat_id: str, task: str) -> st
     worker_tools = ReadTools(files, chat_id)
     messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
     for _ in range(MAX_RESEARCH_TURNS):
-        response = client.messages.create(
+        response = observed_message(
+            client,
+            "delegated_research",
             model="claude-sonnet-5",
             max_tokens=RESEARCH_RESPONSE_TOKENS,
             system=(
@@ -298,6 +333,7 @@ def analyze(
     access: Access,
     chat_id: str,
     verified_material_plan: dict[str, Any] | None = None,
+    on_text: Callable[[str], None] | None = None,
 ) -> AgentReply:
     key = access.get("ANTHROPIC_API_KEY")
     if not key:
@@ -331,7 +367,27 @@ def analyze(
     )
     records = files.records()
     mcp_catalog = McpConnections(files.root, access).list()
+    chat_memory = files.chat_long_term_memory(chat_id)
+    pending_facts = chat_memory["facts"][chat_memory.get("compacted_fact_count", 0) :]
     context = {
+        "chat_memory": {
+            "facts": [item["text"] for item in pending_facts],
+            "working_compaction": chat_memory.get("working_compaction", ""),
+            "final_summary": chat_memory.get("final_summary", ""),
+            "compaction_needed": (
+                sum(len(item["text"]) for item in pending_facts) >= MEMORY_COMPACTION_CHARS
+                or len(chat["messages"]) - chat_memory.get("compacted_message_count", 0)
+                >= MEMORY_COMPACTION_MESSAGES
+            ),
+        },
+        "user_memory": [
+            item["text"]
+            for item in sorted(
+                files.user_long_term_memory(current_memory_owner()),
+                key=lambda item: item.get("at", ""),
+                reverse=True,
+            )
+        ],
         "conversation": [
             {
                 "role": item["role"],
@@ -346,10 +402,6 @@ def analyze(
                 ],
             }
             for index, item in enumerate(chat["messages"][-16:])
-        ],
-        "short_term_memory": [
-            {"role": item["role"], "body": item["body"][:400]}
-            for item in files.recent_memory(exclude_chat=chat_id)
         ],
         "approved_workspace_index": [
             {"kind": item["kind"], "name": item["name"], "version": item["version"]}
@@ -404,9 +456,7 @@ def analyze(
                     ).input_tokens
                     if count <= token_budget:
                         break
-                    if context["short_term_memory"]:
-                        context["short_term_memory"].pop(0)
-                    elif len(context["conversation"]) > 1:
+                    if len(context["conversation"]) > 1:
                         context["conversation"].pop(0)
                     elif context["saved_record_summary"]:
                         context["saved_record_summary"] = {}
@@ -443,7 +493,9 @@ def analyze(
             completed_calls: set[str] = set()
             pending_recoveries: list[str] = []
             for turn in range(MAX_RESEARCH_TURNS):
-                research = client.messages.create(
+                research = observed_message(
+                    client,
+                    "research",
                     model="claude-sonnet-5",
                     max_tokens=RESEARCH_RESPONSE_TOKENS,
                     system=(
@@ -595,7 +647,11 @@ def analyze(
         completion_retry = False
         report_recovery_id: str | None = None
         for attempt in range(3):
-            response = client.messages.create(
+            streamed_reply = ReplyStream(on_text) if on_text and attempt == 0 else None
+            response = observed_message(
+                client,
+                "structured_reply",
+                on_text=streamed_reply.feed if streamed_reply else None,
                 model="claude-sonnet-5",
                 max_tokens=FINAL_RESPONSE_TOKENS,
                 system=(
@@ -611,6 +667,22 @@ def analyze(
                     "ask one direct question naming the exact choice or missing detail. "
                     "If the user can change a business requirement, say that in plain words. "
                     "Do not treat an internal data format mismatch as a reason to ask the user."
+                    "\nMemory: add a memory_note only for a durable fact stated by the latest "
+                    "user message. source_quote must copy exact words from that message. "
+                    "Use scope=user only for the person's stable preferences or important "
+                    "personal information; use scope=chat for requirements and business facts "
+                    "specific to this conversation. Do not save secrets, credentials, guesses, "
+                    "or an assistant's own statements. An empty list is normal. "
+                    "Treat later explicit corrections as superseding older conflicting memory. "
+                    "Set requirements_complete and final_summary only when requirement "
+                    "gathering has reached a clear conclusion: the user confirmed the final "
+                    "requirements, or all material requirements are resolved and your reply "
+                    "presents the completed result. Do not mark completion when needs_input is true "
+                    "or a material choice remains open. Otherwise final_summary must be empty. "
+                    "Do not rewrite the final summary on routine messages."
+                    " If chat_memory.compaction_needed is true, combine its working_compaction "
+                    "and all chat_memory.facts into a concise working_compaction, retaining "
+                    "uncertainties and corrections. Otherwise return working_compaction empty. "
                     "\nFor data-bearing answers, include complete Markdown tables with "
                     "headers, units, and every requested breakdown in this one reply. "
                     "The app renders these tables as interactive A2UI views. Use "
@@ -660,6 +732,10 @@ def analyze(
                 raise AnalysisUnavailable("Austra returned an unexpected response")
             try:
                 answer = AgentReply.model_validate_json(blocks[0])
+                if streamed_reply and answer.reply.startswith(streamed_reply.sent):
+                    remainder = answer.reply[len(streamed_reply.sent) :]
+                    if remainder:
+                        on_text(remainder)
                 if answer.reply.strip().casefold() == "placeholder" or (
                     stock_order_report_requested
                     and not answer.needs_input

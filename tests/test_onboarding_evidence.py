@@ -25,7 +25,7 @@ from austra.onboarding.evidence import (
 )
 from austra.onboarding.extract import MAX_CHARS_PER_CHUNK, chunks
 from austra.onboarding.service import open_case
-from austra.onboarding.website import MAX_PAGE_BYTES, fetch_page, public_target
+from austra.onboarding.website import MAX_PAGE_BYTES, crawl, crawl_report, fetch_page, public_target
 from austra.storage.migrate import apply_migrations
 from austra.tenant.context import TenantContext, tenant_transaction
 from austra.tenant.permissions.evaluator import AuthContext
@@ -275,6 +275,52 @@ def test_dns_private_answer_and_redirect_rejected():
         pytest.raises(ValueError),
     ):
         fetch_page("http://example.com/")
+
+
+def test_crawl_accepts_apex_to_www_redirect_but_stays_on_site():
+    pages = {
+        "https://example.com/": (
+            "https://www.example.com/",
+            b'<h1>Home</h1><a href="/about">About</a><a href="https://other.example/about">Other</a>',
+        ),
+        "https://www.example.com/about": ("https://www.example.com/about", b"<p>About us</p>"),
+    }
+    with patch("austra.onboarding.website.fetch_page", side_effect=lambda url: pages[url]):
+        assert [url for url, _ in crawl("https://example.com/")] == [
+            "https://www.example.com/",
+            "https://www.example.com/about",
+        ]
+
+
+def test_crawl_follows_deeper_links_and_reports_unreadable_pages():
+    pages = {
+        "https://example.com/": b'<a href="/services">Services</a>',
+        "https://example.com/services": b'<a href="/services/ai">AI</a>',
+        "https://example.com/services/ai": b'<h1>AI</h1><a href="/missing">More</a>',
+    }
+
+    def fetch(url):
+        if url not in pages:
+            raise ValueError("HTTP 404")
+        return url, pages[url]
+
+    with patch("austra.onboarding.website.fetch_page", side_effect=fetch):
+        report = crawl_report("https://example.com/")
+
+    assert [url for url, _ in report.pages] == list(pages)
+    assert report.failed_urls == ["https://example.com/missing"]
+    assert not report.truncated
+
+
+def test_crawl_rejects_root_redirect_to_another_host():
+    with (
+        patch(
+            "austra.onboarding.website.fetch_page",
+            return_value=("https://other.example/", b"<h1>Wrong site</h1>"),
+        ),
+        pytest.raises(ValueError, match="redirected outside"),
+    ):
+        crawl_report("https://example.com/")
 
 
 def test_oversized_website_response_rejected():
