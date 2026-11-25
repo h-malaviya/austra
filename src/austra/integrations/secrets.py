@@ -53,3 +53,18 @@ class ConnectionSecrets:
 
     def revoke(self, organization_id: UUID, connection_id: UUID) -> None:
         self._path(organization_id, connection_id).unlink(missing_ok=True)
+
+    def take(self, organization_id: UUID, connection_id: UUID) -> dict[str, str]:
+        """Consume a one-time secret across requests and app processes."""
+        path = self._path(organization_id, connection_id)
+        claimed = path.with_name(f".{uuid4().hex}.claimed")
+        try:
+            path.rename(claimed)
+        except FileNotFoundError as error:
+            raise ValueError("Google consent expired or already completed") from error
+        try:
+            return json.loads(self._cipher().decrypt(claimed.read_bytes()))
+        except (InvalidToken, ValueError) as error:
+            raise ValueError("Google consent could not be verified") from error
+        finally:
+            claimed.unlink(missing_ok=True)

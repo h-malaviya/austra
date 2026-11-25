@@ -98,9 +98,10 @@ def finish_job(
             raise ValueError("Job is not leased in this organization")
         if not success:
             release = connection.execute(
-                "SELECT blueprint_id, approved_by FROM releases WHERE organization_id = %s "
-                "AND state = 'active'",
-                (context.organization_id,),
+                "SELECT r.blueprint_id, r.approved_by FROM releases r JOIN runtime_events e "
+                "ON e.organization_id = r.organization_id AND e.payload->>'build_id' = r.build_id::text "
+                "WHERE r.organization_id = %s AND e.id = %s",
+                (context.organization_id, row[1]),
             ).fetchone()
             open_review(
                 connection,

@@ -1,7 +1,9 @@
 """Phase 5 gates against disposable tenant schemas and fake providers."""
 
+import json
 import os
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import psycopg
@@ -11,7 +13,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from austra.build_release.monitoring import list_reviews
-from austra.connectors import GMAIL_SCOPE
+from austra.connectors import GMAIL_CONTENT_SCOPE, GMAIL_SCOPE
 from austra.integrations.catalog import TEMPLATES
 from austra.integrations.connections import (
     _remote_catalog,
@@ -22,12 +24,21 @@ from austra.integrations.connections import (
     review_remote,
     revoke,
 )
+from austra.integrations.email_delivery_recovery import reconcile_email_delivery
 from austra.integrations.email_jobs import deliver_email_job, preview_email_job
 from austra.integrations.execution import execute_proposal
 from austra.integrations.gateway import approve_workflow, preview_action, receive_webhook
+from austra.integrations.gmail_replies import capture_email_reply, reply_status
+from austra.integrations.gmail_reply_worker import check_due_gmail_reply
 from austra.integrations.providers import safe_mcp_url
+from austra.integrations.reply_recovery import MAX_ATTEMPTS, read_pending_replies
 from austra.integrations.secrets import ConnectionSecrets
-from austra.mcp_gateway import ExternalToolError
+from austra.integrations.workflow_notifications import (
+    dispatch_owner_notification,
+    enqueue_due_follow_up,
+    list_notifications,
+)
+from austra.mcp_gateway import ExternalContractError, ExternalToolError
 from austra.storage.migrate import apply_migrations
 from austra.tenant.context import TenantContext, tenant_transaction
 from austra.tenant.permissions.evaluator import AuthContext
@@ -407,17 +418,22 @@ def test_gmail_job_reconnect_preview_and_idempotent_delivery(database, tmp_path,
     )
     assert approved_result["preview"]["arguments"] == fixture
     with tenant_transaction(database, context):
+        po_id = database.execute(
+            "INSERT INTO capability_records (organization_id, department_id, kind, external_id, state, data) "
+            "VALUES (%s,%s,'purchase_order','PO-1','approved',%s) RETURNING id",
+            (context.organization_id, department, Jsonb({"total": "0"})),
+        ).fetchone()[0]
         email_id = database.execute(
             "INSERT INTO capability_records (organization_id, department_id, kind, "
             "external_id, state, data) VALUES (%s, %s, 'email_proposal', 'MAIL-1', "
-            "'queued', '{}'::jsonb) RETURNING id",
-            (context.organization_id, department),
+            "'queued', %s) RETURNING id",
+            (context.organization_id, department, Jsonb({"po_id": str(po_id)})),
         ).fetchone()[0]
         event_id = database.execute(
             "INSERT INTO runtime_events (organization_id, department_id, event_type, "
-            "idempotency_key, correlation_id) VALUES (%s, %s, 'capability.command', %s, %s) "
+            "idempotency_key, correlation_id, payload) VALUES (%s, %s, 'capability.command', %s, %s, %s) "
             "RETURNING id",
-            (context.organization_id, department, "mail-fixture", uuid4()),
+            (context.organization_id, department, "mail-fixture", uuid4(), Jsonb({"build_id": str(build)})),
         ).fetchone()[0]
         job_id = database.execute(
             "INSERT INTO outbox_jobs (organization_id, department_id, event_id, topic, "
@@ -466,7 +482,181 @@ def test_gmail_job_reconnect_preview_and_idempotent_delivery(database, tmp_path,
 
     monkeypatch.setattr("austra.integrations.execution.perform", send)
     proposal_id = UUID(preview["proposal_id"])
-    first = deliver_email_job(database, context, tmp_path, department, job_id, proposal_id)
+    database.commit()
+    database.autocommit = True
+    with pytest.raises(PermissionError, match="reviewed workflow email"):
+        execute_proposal(database, context, tmp_path, department, proposal_id, f"email-job:{job_id}")
+    assert not reconcile_email_delivery(database)
+
+    def interrupted(*_args):
+        raise RuntimeError("Interruption after the receipt was saved")
+
+    with monkeypatch.context() as patches:
+        patches.setattr("austra.integrations.email_jobs.finish_email_delivery", interrupted)
+        with pytest.raises(RuntimeError, match="after the receipt"):
+            deliver_email_job(database, context, tmp_path, department, job_id, proposal_id,
+                              follow_up_days=2, owner_email_alerts=True)
+    assert database.execute("SELECT state FROM outbox_jobs WHERE id=%s", (job_id,)).fetchone() == ("repair",)
+    assert reconcile_email_delivery(database)
+    assert not reconcile_email_delivery(database)
+    first = deliver_email_job(database, context, tmp_path, department, job_id, proposal_id,
+                              follow_up_days=2, owner_email_alerts=True)
     assert first == {"state": "delivered", "receipt": "provider-message-1"}
     assert deliver_email_job(database, context, tmp_path, department, job_id, proposal_id) == first
     assert len(sent) == 1
+    reply = {"message_id": "reply-message-1", "thread_id": "thread-1",
+             "from": fixture["to"], "subject": "Re: Purchase order", "received_ms": 1730000000000}
+    follow_up = {**reply, "message_id": "reply-message-2", "received_ms": 1730000010000}
+    replies = []
+
+    def list_replies(tool, arguments, _credentials):
+        assert tool == "gmail_list_replies"
+        assert arguments == {"message_id": "provider-message-1", "recipient": fixture["to"]}
+        return {"replies": list(replies)}
+
+    monkeypatch.setattr("austra.integrations.gmail_replies.call_external", list_replies)
+    assert capture_email_reply(database, context, tmp_path, department, job_id)["reply"] is None
+
+    def force_due():
+        database.execute("UPDATE outbox_jobs SET reply_check_at = now() WHERE id = %s", (job_id,))
+        database.commit()
+
+    replies.append(reply)
+    force_due()
+    assert check_due_gmail_reply(database, tmp_path)
+    assert not check_due_gmail_reply(database, tmp_path)
+    first = reply_status(database, context, department, job_id)
+    assert (first["state"], first["tracking"], first["replies"]) == (
+        "reply_received", "tracking", [reply],
+    )
+    other, other_department = tenant(database, "unrelated-tenant")
+    with pytest.raises(LookupError):
+        reply_status(database, other, other_department, job_id)
+    assert not check_due_gmail_reply(database, tmp_path)
+
+    def unavailable(*_arguments):
+        raise ExternalToolError("Fixture Gmail outage")
+
+    monkeypatch.setattr("austra.integrations.gmail_replies.call_external", unavailable)
+    force_due()
+    assert check_due_gmail_reply(database, tmp_path)
+    paused = reply_status(database, context, department, job_id)
+    assert (paused["tracking"], paused["replies"]) == ("retrying", [reply])
+
+    monkeypatch.setattr("austra.integrations.gmail_replies.call_external", list_replies)
+    replies.append(follow_up)
+    force_due()
+    assert check_due_gmail_reply(database, tmp_path)
+    latest = capture_email_reply(database, context, tmp_path, department, job_id)
+    assert latest["reply"] == reply
+    assert latest["replies"] == [reply, follow_up]
+    assert database.execute(
+        "SELECT state, data->'gmail_replies' FROM capability_records WHERE id = %s", (email_id,)
+    ).fetchone() == ("reply_received", [reply, follow_up])
+    assert database.execute(
+        "SELECT payload->>'trigger' FROM runtime_events WHERE event_type = 'capability.email_reply_captured' "
+        "AND payload->>'job_id' = %s ORDER BY occurred_at", (str(job_id),)
+    ).fetchall() == [("scheduled",), ("scheduled",)]
+    assert list_notifications(database, other) == []
+    assert len(list_notifications(database, context)) == 2
+    assert latest.get("evidence") is None
+
+    database.execute(
+        "UPDATE integration_connections SET granted_scopes=array_append(granted_scopes,%s) WHERE id=%s",
+        (GMAIL_CONTENT_SCOPE, UUID(connected["id"])),
+    )
+
+    reads = []
+    gmail_listing_unavailable = False
+
+    def include_documents(tool, arguments, credentials):
+        if tool == "gmail_read_reply_content":
+            assert arguments["thread_id"] == "thread-1"
+            message = arguments["message_id"]
+            content = {
+                "body": "Quote reference: Q-100",
+                "attachments": [{"name": "offer.docx" if message == reply["message_id"] else "quote.xlsx",
+                                 "status": "extracted"}],
+                "quoted_terms": {"quote_reference": "Q-100"},
+            }
+            first_read = message not in reads
+            reads.append(message)
+            if message == reply["message_id"] and first_read:
+                raise ExternalContractError(tool, json.dumps(content))
+            if first_read:
+                raise ExternalToolError("Temporary read failure")
+            return content
+        if gmail_listing_unavailable:
+            raise ExternalToolError("Temporary listing failure")
+        return list_replies(tool, arguments, credentials)
+
+    monkeypatch.setattr("austra.integrations.gmail_replies.call_external", include_documents)
+    force_due()
+    assert check_due_gmail_reply(database, tmp_path)
+    snapshot = reply_status(database, context, department, job_id)
+    assert snapshot["recovery"][reply["message_id"]]["reason"] == "legacy_mcp_envelope"
+    assert snapshot["recovery"][follow_up["message_id"]]["state"] == "retrying"
+    assert snapshot["replies"] == [reply, follow_up]
+    assert follow_up["message_id"] not in snapshot["evidence"]
+    assert snapshot["evidence"][reply["message_id"]]["attachments"][0]["name"] == "offer.docx"
+    assert len(list_notifications(database, context)) == 2
+    gmail_listing_unavailable = True
+    database.execute(
+        "UPDATE outbox_jobs SET reply_recovery=jsonb_set(reply_recovery, %s, to_jsonb(%s::text)) WHERE id=%s",
+        ([follow_up["message_id"], "retry_at"], (datetime.now(UTC) - timedelta(minutes=1)).isoformat(), job_id),
+    )
+    force_due()
+    assert check_due_gmail_reply(database, tmp_path)
+    snapshot = reply_status(database, context, department, job_id)
+    assert snapshot["recovery"][follow_up["message_id"]] == {
+        "state": "recovered", "attempts": 2, "reason": "provider_unavailable",
+    }
+    assert snapshot["evidence"][follow_up["message_id"]]["attachments"][0]["name"] == "quote.xlsx"
+    assert reads == [reply["message_id"], follow_up["message_id"], follow_up["message_id"]]
+    assert len(sent) == 1
+    state, data = database.execute(
+        "SELECT state,data FROM capability_records WHERE id=%s", (po_id,),
+    ).fetchone()
+    assert state == "approved" and data["total"] == "0"
+    assert data["supplier_response"]["supplier_quote"]["status"] == "needs_review"
+    assert data["supplier_response"]["count"] == 2
+    assert len(list_notifications(database, context)) == 2
+
+    database.execute("UPDATE outbox_jobs SET follow_up_due_at=now() WHERE id=%s", (job_id,))
+    database.commit()
+    assert enqueue_due_follow_up(database)
+    assert not enqueue_due_follow_up(database)
+    messages = []
+
+    def notify(template, action, arguments, credentials):
+        assert template == "gmail" and action == "gmail.send_email"
+        assert arguments["to"] == "mailbox@example.com"
+        messages.append(arguments)
+        return {"message_id": f"notification-{len(messages)}"}
+
+    monkeypatch.setattr("austra.integrations.workflow_notifications.perform", notify)
+    for _ in range(3):
+        assert dispatch_owner_notification(database, tmp_path)
+    assert not dispatch_owner_notification(database, tmp_path)
+    assert {item[5] for item in list_notifications(database, context)} == {"sent"}
+
+
+def test_reply_repair_stops_after_bounded_attempts():
+    reply = {"message_id": "reply-1", "thread_id": "thread-1"}
+    now = datetime.now(UTC)
+    calls = []
+
+    def invalid_response(tool, arguments, _credentials):
+        calls.append(arguments)
+        raise ExternalContractError(tool, '{"body": 123}')
+
+    recoveries = {}
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        evidence, recoveries = read_pending_replies([reply], set(), recoveries, {}, invalid_response,
+                                                   now, manual=False)
+        assert evidence == {}
+        assert recoveries["reply-1"]["attempts"] == attempt
+        now += timedelta(days=1)
+    assert recoveries["reply-1"]["state"] == "needs_review"
+    assert read_pending_replies([reply], set(), recoveries, {}, invalid_response, now, manual=False) == ({}, {})
+    assert calls == [reply] * MAX_ATTEMPTS

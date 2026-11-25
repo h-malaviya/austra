@@ -20,6 +20,7 @@ from austra.semantics.service import (
     record_conflict,
     review_candidate,
 )
+from austra.semantics.workflow_definition import Definition, define_workflow
 from austra.tenant.context import TenantContext
 from austra.tenant.memory import save_memory_update
 
@@ -58,6 +59,7 @@ class CandidateInput(BaseModel):
     edge_ids: list[UUID]
     behavior: dict
     acceptance_examples: list[dict]
+    open_decisions: list[str] = Field(default_factory=list, max_length=30)
 
 
 class ConfirmInput(BaseModel):
@@ -65,6 +67,7 @@ class ConfirmInput(BaseModel):
 
 
 class AnswerInput(BaseModel):
+    content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     question_index: int = Field(ge=0)
     answer: str = Field(min_length=1, max_length=5000)
 
@@ -143,9 +146,13 @@ def install_semantic_routes(app: FastAPI, identity: SaasIdentity) -> None:
         return run(
             request,
             lambda db, actor: answer_question(
-                db, actor, case_id, payload.question_index, payload.answer
+                db, actor, case_id, payload.question_index, payload.answer, payload.content_hash
             ),
         )
+
+    @app.post("/api/org/onboarding-cases/{case_id}/candidate/definition")
+    def define(case_id: UUID, payload: Definition, request: Request):
+        return run(request, lambda db, actor: define_workflow(db, actor, case_id, payload))
 
     @app.post("/api/org/onboarding-cases/{case_id}/candidate/confirm")
     def confirm(case_id: UUID, payload: ConfirmInput, request: Request):

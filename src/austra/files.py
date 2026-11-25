@@ -14,6 +14,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 
 from austra.formulas import parse_formula, validate_formula_mapping
 from austra.infrastructure import SERVICES, InfrastructureError
+from austra.integrations.google_workspace import GoogleWorkspaceApp
 
 ArtifactKind = Literal[
     "policy",
@@ -247,6 +248,7 @@ class Files:
         needs_input: bool = False,
         report: dict[str, Any] | None = None,
         visualize: bool = False,
+        google_workspace_required: GoogleWorkspaceApp | None = None,
     ) -> dict[str, Any]:
         message = {"id": uuid4().hex, "role": role, "body": body, "sender": sender, "at": _now()}
         if display_body is not None:
@@ -259,6 +261,8 @@ class Files:
             message["report"] = report
         if visualize and role == "assistant":
             message["visualize"] = True
+        if google_workspace_required and role == "assistant":
+            message["google_workspace_required"] = google_workspace_required
         chat["messages"].append(message)
         chat["updated_at"] = _now()
         _save(self._chat_path(chat["id"]), chat)
@@ -360,6 +364,7 @@ class Files:
         display_body: str | None = None,
         report: dict[str, Any] | None = None,
         visualize: bool = False,
+        google_workspace_required: GoogleWorkspaceApp | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             chat = self._add_message(
@@ -371,6 +376,7 @@ class Files:
                 display_body=display_body,
                 report=report,
                 visualize=visualize,
+                google_workspace_required=google_workspace_required,
             )
             self.record_event("chat.message_added", sender, "chat", chat_id, chat_id=chat_id)
             return chat

@@ -10,7 +10,9 @@ from psycopg.types.json import Jsonb
 from austra.a2ui import capability_decision_surface
 from austra.arithmetic import calculate_expression
 from austra.capabilities.contracts import CapabilityCommand
+from austra.capabilities.projections import visible_projection
 from austra.capabilities.state_machine import execute_transition
+from austra.integrations.gmail_replies import reply_snapshot
 from austra.material_plan import verified_available_kg
 from austra.tenant.context import TenantContext, tenant_transaction
 
@@ -22,22 +24,35 @@ def _text(value: Decimal) -> str:
     return format(value.normalize(), "f") if value else "0"
 
 
-def _active_build(connection: psycopg.Connection, context: TenantContext) -> dict:
-    row = connection.execute(
-        "SELECT r.blueprint_id, r.build_id, b.content_hash, a.blueprint_hash, a.manifest "
-        "FROM releases r JOIN blueprints b ON b.id = r.blueprint_id "
-        "JOIN capability_build_artifacts a ON a.build_id = r.build_id "
-        "WHERE r.organization_id = %s AND r.state = 'active'",
+def active_builds(connection: psycopg.Connection, context: TenantContext) -> list[dict]:
+    rows = connection.execute(
+        "SELECT r.blueprint_id, r.build_id, b.content_hash, a.blueprint_hash, a.manifest, c.workflow_name "
+        "FROM releases r JOIN blueprints b ON (b.organization_id, b.id) = (r.organization_id, r.blueprint_id) "
+        "JOIN capability_build_artifacts a ON (a.organization_id, a.build_id) = (r.organization_id, r.build_id) "
+        "LEFT JOIN onboarding_cases c ON (c.organization_id, c.id) = (r.organization_id, r.workflow_case_id) "
+        "WHERE r.organization_id = %s AND r.state = 'active' ORDER BY r.released_at, r.id",
         (context.organization_id,),
-    ).fetchone()
-    if row is None or row[2] != row[3]:
+    ).fetchall()
+    return [
+        {"blueprint_id": row[0], "build_id": row[1], "blueprint_hash": row[2],
+         "manifest": row[4], "name": row[5]} for row in rows if row[2] == row[3]
+    ]
+
+
+def department_capabilities(manifest: dict, department_id: UUID) -> list[dict]:
+    return [item for item in manifest.get("capabilities", []) if not item.get("department_ids")
+            or str(department_id) in item["department_ids"]]
+
+
+def select_build(builds: list[dict], predicate) -> dict:
+    matches = [build for build in builds if predicate(build)]
+    if len(matches) > 1:
+        raise ValueError("Multiple released workflows match this request")
+    if not matches:
+        if builds:
+            raise ValueError("The requested capability is not in the released build")
         raise ValueError("No released capability pinned to its confirmed blueprint")
-    return {
-        "blueprint_id": row[0],
-        "build_id": row[1],
-        "blueprint_hash": row[2],
-        "manifest": row[4],
-    }
+    return matches[0]
 
 
 def _authority(
@@ -62,6 +77,9 @@ def _authority(
     permission = matches[0]["content"].get("required_permission")
     if permission not in {"workflows.run", "workflows.approve"}:
         raise ValueError("Unsupported capability authority")
+    allowed_users = matches[0]["content"].get("allowed_user_ids", [])
+    if allowed_users and str(context.actor.user_id) not in allowed_users:
+        raise PermissionError("This transition requires a designated workflow reviewer")
     context.require(permission, command.department_id)
     return matches[0]
 
@@ -103,11 +121,15 @@ def _save(
     current: dict | None = None,
 ) -> dict:
     if current is None:
-        record_id, revision = connection.execute(
+        inserted = connection.execute(
             "INSERT INTO capability_records (organization_id, department_id, kind, external_id, "
-            "state, data) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, revision",
+            "state, data) VALUES (%s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (organization_id, department_id, kind, external_id) DO NOTHING RETURNING id, revision",
             (context.organization_id, command.department_id, kind, external_id, state, Jsonb(data)),
         ).fetchone()
+        if inserted is None:
+            raise ValueError("This workflow already has a record with that external ID in this department")
+        record_id, revision = inserted
     else:
         record_id = current["id"]
         revision = connection.execute(
@@ -363,11 +385,13 @@ def execute_command(
 ) -> dict:
     """All transports call this service; the model never supplies executable code."""
     context.require("workflows.run", command.department_id)
+    context.require_active_department(connection, command.department_id)
     at = datetime.now(UTC)
     from austra.build_release.monitoring import scan_command_expiry
 
     scan_command_expiry(
-        connection, context, command.action, at, getattr(command.payload, "transition_key", None)
+        connection, context, command.action, at, getattr(command.payload, "transition_key", None),
+        getattr(command.payload, "capability_key", None),
     )
     if command.occurred_at is not None and abs((at - command.occurred_at).total_seconds()) > 300:
         raise ValueError("Command time must be current; history uses pinned events")
@@ -383,7 +407,17 @@ def execute_command(
             if prior[0] != digest or prior[2]["actor_id"] != str(context.actor.user_id):
                 raise ValueError("Idempotency key reused for a different command or actor")
             return prior[1]
-        build = _active_build(connection, context)
+        builds = [build for build in active_builds(connection, context)
+                  if command.build_id is None or build["build_id"] == command.build_id]
+        if command.action == "transition_record":
+            build = select_build(builds, lambda b: any(
+                item["key"] == command.payload.capability_key for item in department_capabilities(b["manifest"], command.department_id)
+            ))
+        else:
+            build = select_build(builds, lambda b: (
+                command.action in b["manifest"]["commands"]
+                and allows_department(b["manifest"], command.department_id)
+            ))
         if command.action not in build["manifest"]["commands"]:
             raise ValueError("Command is not in the released build")
         rule = _authority(build["manifest"], command, context, at)
@@ -432,7 +466,9 @@ def execute_command(
             "build_id": str(build["build_id"]),
             "authority_revision_id": rule["id"],
             "occurred_at": at.isoformat(),
-            "projection": build["manifest"].get("projections", []),
+            "projection": [p for p in build["manifest"].get("projections", [])
+                           if build["manifest"].get("engine") != "state_machine"
+                           or visible_projection(context, command.department_id, p, build["manifest"])],
         }
         decision["a2ui"] = capability_decision_surface(decision)
         connection.execute(
@@ -491,19 +527,85 @@ def explain_event(
         }
 
 
+def allows_department(manifest: dict, department_id: UUID) -> bool:
+    departments = manifest.get("department_ids", [])
+    return not departments or str(department_id) in departments
+
+
+def _email_jobs(connection, context, department, build):
+    if context.actor.role != "org_admin":
+        return []
+    rows = connection.execute(
+        "SELECT j.id,j.state,j.payload->>'recipient',j.payload->>'subject',"
+        "e.external_id,e.data,j.reply_tracking_until,j.reply_check_failed,e.id,j.reply_recovery FROM outbox_jobs j "
+        "JOIN runtime_events event ON (event.organization_id,event.id)=(j.organization_id,j.event_id) "
+        "JOIN capability_records e ON (e.organization_id,e.department_id,e.id)="
+        "(j.organization_id,j.department_id,(j.payload->>'email_id')::uuid) "
+        "WHERE j.organization_id=%s AND j.department_id=%s AND j.topic='capability.email' "
+        "AND event.payload->>'build_id'=%s ORDER BY j.created_at DESC LIMIT 20",
+        (context.organization_id, department, str(build)),
+    ).fetchall()
+    return [{**reply_snapshot(row[5], row[6], row[7]), "id": row[0], "state": row[1],
+             "recipient": row[2], "subject": row[3], "reference": row[4], "email_id": row[8],
+             "recovery": row[9]}
+            for row in rows]
+
+
+def _record_email_view(connection, context, department, build, capabilities):
+    definitions = [item for item in capabilities if item.get("reply_mapping") or item.get("email_document")
+                   or item.get("automatic_email")]
+    if context.actor.role != "org_admin" or not definitions:
+        return {}
+    records = []
+    for item in definitions:
+        automation = item.get("automatic_email")
+        states = ([rule["state"] for rule in automation["rules"]] if automation else
+                  (item.get("reply_mapping") or {}).get("states", item["states"]))
+        rows = connection.execute(
+            "SELECT id,external_id,revision,state FROM capability_records WHERE organization_id=%s "
+            "AND department_id=%s AND kind=%s AND data->>'capability_key'=%s AND state=ANY(%s) "
+            "ORDER BY updated_at DESC,id LIMIT 200",
+            (context.organization_id, department, item["record_kind"], item["key"], states),
+        ).fetchall()
+        records.extend({"id": str(identifier), "external_id": reference, "revision": revision,
+                        "state": state} for identifier, reference, revision, state in rows)
+    return {"email_records": records, "email_jobs": _email_jobs(connection, context, department, build)}
+
+
 def capability_view(
-    connection: psycopg.Connection, context: TenantContext, department_id: UUID
+    connection: psycopg.Connection, context: TenantContext, department_id: UUID, build_id: UUID | None = None
 ) -> dict:
     context.require("workflows.read", department_id)
+    context.require_active_department(connection, department_id)
     with tenant_transaction(connection, context):
-        build = _active_build(connection, context)
+        builds = [b for b in active_builds(connection, context)
+                  if allows_department(b["manifest"], department_id)
+                  and (b["manifest"].get("engine") != "state_machine"
+                       or department_capabilities(b["manifest"], department_id))]
+        if len(builds) > 1 and build_id is None:
+            return {"workflows": [{"build_id": b["build_id"], "name": b["name"] or "Business workflow"}
+                                  for b in builds]}
+        build = select_build(builds, lambda b: build_id is None or b["build_id"] == build_id)
+        manifest = build["manifest"]
+        details = {
+            "name": build["name"] or "Business workflow",
+            "rules": [
+                {key: value for key, value in rule["content"].items()
+                 if key in {"decision_key", "required_permission", "limit", "unit"}}
+                for rule in manifest["decision_tables"]
+                if rule["content"].get("decision_key", "").startswith("command.")
+            ],
+        }
         if build["manifest"].get("engine") == "state_machine":
+            capabilities = department_capabilities(manifest, department_id)
             return {
+                **details,
+                **_record_email_view(connection, context, department_id, build["build_id"], capabilities),
                 "blueprint_id": str(build["blueprint_id"]),
                 "build_id": str(build["build_id"]),
                 "blueprint_hash": build["blueprint_hash"],
                 "commands": build["manifest"]["commands"],
-                "capabilities": build["manifest"]["capabilities"],
+                "capabilities": capabilities,
                 "custom_module_drafts": (
                     build["manifest"].get("custom_module_drafts", [])
                     if context.actor.role == "org_admin"
@@ -512,7 +614,7 @@ def capability_view(
                 "projections": [
                     item
                     for item in build["manifest"]["projections"]
-                    if context.actor.role in item["roles"]
+                    if visible_projection(context, department_id, item, build["manifest"])
                 ],
                 "records": [],
                 "record_count": 0,
@@ -521,19 +623,22 @@ def capability_view(
         rows = connection.execute(
             "SELECT id, kind, external_id, revision, state, data FROM capability_records "
             "WHERE organization_id = %s AND department_id = %s "
+            "AND kind IN ('sales_order', 'stock_lot', 'purchase_order', 'email_proposal') "
             "ORDER BY created_at, id LIMIT 200",
             (context.organization_id, department_id),
         ).fetchall()
         total = connection.execute(
             "SELECT count(*) FROM capability_records WHERE organization_id = %s "
-            "AND department_id = %s",
+            "AND department_id = %s AND kind IN ('sales_order', 'stock_lot', 'purchase_order', 'email_proposal')",
             (context.organization_id, department_id),
         ).fetchone()[0]
         return {
+            **details,
             "blueprint_id": str(build["blueprint_id"]),
             "build_id": str(build["build_id"]),
             "blueprint_hash": build["blueprint_hash"],
             "commands": build["manifest"]["commands"],
+            "email_jobs": _email_jobs(connection, context, department_id, build["build_id"]),
             "projections": build["manifest"].get("projections", []),
             "record_count": total,
             "complete": len(rows) == total,

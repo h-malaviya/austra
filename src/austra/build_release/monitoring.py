@@ -131,43 +131,43 @@ def scan_command_expiry(
     action: str,
     at: datetime,
     transition_key: str | None = None,
+    capability_key: str | None = None,
 ) -> None:
     """Open an owner's review before an action reaches the edge of its dated rule."""
     with tenant_transaction(connection, context):
-        release = connection.execute(
+        releases = connection.execute(
             "SELECT r.blueprint_id, r.approved_by, a.manifest FROM releases r "
             "JOIN capability_build_artifacts a ON a.build_id = r.build_id "
             "AND a.organization_id = r.organization_id "
             "WHERE r.organization_id = %s AND r.state = 'active'",
             (context.organization_id,),
-        ).fetchone()
-        if release is None:
-            return
+        ).fetchall()
         key = (
-            f"command.{action}.{transition_key}"
+            f"command.{capability_key}.{transition_key}"
             if action == "transition_record"
             else f"command.{action}"
         )
-        for rule in release[2].get("decision_tables", []):
-            if rule.get("content", {}).get("decision_key") != key or not rule.get("valid_to"):
-                continue
-            expires = datetime.fromisoformat(rule["valid_to"])
-            if expires > at + EXPIRY_NOTICE:
-                continue
-            revision_id = UUID(str(rule["id"]))
-            open_review(
-                connection,
-                context,
-                trigger="policy_expiry",
-                subject_id=revision_id,
-                owner_user_id=release[1],
-                blueprint_id=release[0],
-                citations=[
-                    {"semantic_revision_id": str(revision_id), "blueprint_id": str(release[0])}
-                ],
-                impact=f"The rule for {key} expires at {expires.isoformat()}.",
-                next_step="Confirm a successor rule and release a new blueprint before expiry.",
-            )
+        for release in releases:
+            for rule in release[2].get("decision_tables", []):
+                if rule.get("content", {}).get("decision_key") != key or not rule.get("valid_to"):
+                    continue
+                expires = datetime.fromisoformat(rule["valid_to"])
+                if expires > at + EXPIRY_NOTICE:
+                    continue
+                revision_id = UUID(str(rule["id"]))
+                open_review(
+                    connection,
+                    context,
+                    trigger="policy_expiry",
+                    subject_id=revision_id,
+                    owner_user_id=release[1],
+                    blueprint_id=release[0],
+                    citations=[
+                        {"semantic_revision_id": str(revision_id), "blueprint_id": str(release[0])}
+                    ],
+                    impact=f"The rule for {key} expires at {expires.isoformat()}.",
+                    next_step="Confirm a successor rule and release a new blueprint before expiry.",
+                )
 
 
 def report_outcome_conflict(
@@ -225,13 +225,13 @@ def triage_feedback(
         raise ValueError("Feedback requires expected, observed, and source citations")
     with tenant_transaction(connection, context):
         release = connection.execute(
-            "SELECT blueprint_id, build_id, approved_by FROM releases "
+            "SELECT blueprint_id, build_id, approved_by, workflow_case_id FROM releases "
             "WHERE organization_id = %s AND id = %s AND state = 'active' FOR UPDATE",
             (context.organization_id, release_id),
         ).fetchone()
         if release is None:
             raise LookupError("Active release not found")
-        blueprint_id, build_id, owner = release
+        blueprint_id, build_id, owner, lineage = release
         for citation in citations:
             if not isinstance(citation, dict) or not set(citation) & CITATION_TABLES.keys():
                 raise ValueError("Feedback citation must name a stored source or revision")
@@ -326,9 +326,18 @@ def triage_feedback(
         )
         case = connection.execute(
             "SELECT id FROM onboarding_cases WHERE organization_id = %s "
-            "AND state <> 'locked_candidate'",
-            (context.organization_id,),
+            "AND state <> 'locked_candidate' AND workflow_root_id IS NOT DISTINCT FROM %s "
+            "AND (%s::uuid IS NOT NULL OR (parent_case_id IS NULL AND workflow_name IS NULL))",
+            (context.organization_id, lineage, lineage),
         ).fetchone()
+        if case is None and lineage:
+            case = connection.execute(
+                "INSERT INTO onboarding_cases (organization_id, created_event_id, state, parent_case_id, "
+                "workflow_root_id, workflow_name) SELECT organization_id, %s, 'clarifying', "
+                "coalesce(parent_case_id, id), id, workflow_name FROM onboarding_cases "
+                "WHERE organization_id = %s AND id = %s RETURNING id",
+                (review_id, context.organization_id, lineage),
+            ).fetchone()
         if case is None:
             case = connection.execute(
                 "INSERT INTO onboarding_cases (organization_id, created_event_id, state) "
@@ -405,12 +414,17 @@ def review_dashboard(connection: psycopg.Connection, context: TenantContext) -> 
             "AND metric = 'repair_time_ms'",
             (context.organization_id,),
         ).fetchone()[0]
+        automatic_email = dict(connection.execute(
+            "SELECT state,count(*) FROM workflow_automatic_replies WHERE organization_id=%s GROUP BY state",
+            (context.organization_id,),
+        ).fetchall())
     return {
         "metrics": metrics,
         "cost_per_resolved_task_usd": metrics["task_cost_usd"] / resolved
         if resolved and "task_cost_usd" in metrics
         else None,
         "connection_health": connections,
+        "automatic_email": automatic_email,
         "embedding_freshness": {
             "current_chunks": freshness[0],
             "current_model_chunks": freshness[1],

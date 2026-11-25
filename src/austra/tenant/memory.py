@@ -49,8 +49,9 @@ def memory_context(
             ).fetchone()[0]
         else:
             pending_message_count = connection.execute(
-                "SELECT count(*) FROM onboarding_messages WHERE organization_id = %s",
-                (context.organization_id,),
+                "SELECT count(*) FROM onboarding_messages WHERE organization_id = %s "
+                "AND (workflow_scope = %s OR (workflow_scope IS NULL AND organization_id = %s))",
+                (context.organization_id, chat_id, chat_id),
             ).fetchone()[0]
     return {
         "facts": [row[0] for row in facts],
@@ -107,8 +108,9 @@ def save_memory_update(
                 ).fetchone()[0]
             else:
                 compacted_message_count = connection.execute(
-                    "SELECT count(*) FROM onboarding_messages WHERE organization_id = %s",
-                    (context.organization_id,),
+                    "SELECT count(*) FROM onboarding_messages WHERE organization_id = %s "
+                    "AND (workflow_scope = %s OR (workflow_scope IS NULL AND organization_id = %s))",
+                    (context.organization_id, chat_id, chat_id),
                 ).fetchone()[0]
         for note in update.notes:
             quote = note.source_quote.strip()
@@ -171,21 +173,22 @@ def save_memory_update(
 def list_chats(connection: psycopg.Connection, context: TenantContext) -> list[dict]:
     with tenant_transaction(connection, context):
         rows = connection.execute(
-            "SELECT id, title, updated_at FROM organization_chats "
+            "SELECT id, title, updated_at, workflow_context FROM organization_chats "
             "WHERE organization_id = %s AND owner_user_id = %s AND deleted_at IS NULL "
             "ORDER BY updated_at DESC",
             (context.organization_id, context.actor.user_id),
         ).fetchall()
     return [
-        {"id": str(chat_id), "title": title, "updated_at": updated_at.isoformat()}
-        for chat_id, title, updated_at in rows
+        {"id": str(chat_id), "title": title, "updated_at": updated_at.isoformat(),
+         **({"workflow": workflow} if workflow is not None else {})}
+        for chat_id, title, updated_at, workflow in rows
     ]
 
 
 def chat(connection: psycopg.Connection, context: TenantContext, chat_id: UUID) -> dict:
     with tenant_transaction(connection, context):
         row = connection.execute(
-            "SELECT title, created_at, updated_at FROM organization_chats "
+            "SELECT title, created_at, updated_at, workflow_context FROM organization_chats "
             "WHERE id = %s AND organization_id = %s AND owner_user_id = %s "
             "AND deleted_at IS NULL",
             (chat_id, context.organization_id, context.actor.user_id),
@@ -201,6 +204,7 @@ def chat(connection: psycopg.Connection, context: TenantContext, chat_id: UUID) 
         "id": str(chat_id),
         "title": row[0],
         "source": "organization_ask",
+        **({"workflow": row[3]} if row[3] is not None else {}),
         "created_at": row[1].isoformat(),
         "updated_at": row[2].isoformat(),
         "messages": [

@@ -10,15 +10,18 @@ Verifier = Callable[[dict[str, str]], None]
 GMAIL_SCOPE = (
     "https://www.googleapis.com/auth/gmail.metadata https://www.googleapis.com/auth/gmail.send"
 )
+GMAIL_CONTENT_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 
-def gmail_authorization_url(client_id: str, redirect_uri: str, state: str) -> str:
+def gmail_authorization_url(
+    client_id: str, redirect_uri: str, state: str, *, read_content: bool = False
+) -> str:
     query = urlencode(
         {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": GMAIL_SCOPE,
+            "scope": f"{GMAIL_SCOPE} {GMAIL_CONTENT_SCOPE}" if read_content else GMAIL_SCOPE,
             "access_type": "offline",
             "prompt": "consent",
             "state": state,

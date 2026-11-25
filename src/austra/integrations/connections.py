@@ -11,7 +11,13 @@ from jsonschema import Draft202012Validator, SchemaError
 from psycopg.types.json import Jsonb
 
 from austra.build_release.monitoring import open_review
+from austra.connectors import GMAIL_CONTENT_SCOPE, GMAIL_SCOPE
 from austra.integrations.catalog import TEMPLATES
+from austra.integrations.google_workspace import (
+    GOOGLE_WORKSPACE_ENDPOINTS,
+    GOOGLE_WORKSPACE_SCOPE,
+    remote_access_token,
+)
 from austra.integrations.providers import discover, github_identity, gmail_identity, slack_identity
 from austra.integrations.secrets import ConnectionSecrets
 from austra.mcp_gateway import ExternalToolError
@@ -64,6 +70,16 @@ def _public(row: tuple) -> dict:
     }
 
 
+def _affected_blueprints(db, context, connection_id):
+    rows = db.execute(
+        "SELECT DISTINCT r.blueprint_id FROM releases r JOIN integration_approvals a "
+        "ON (a.organization_id, a.build_id) = (r.organization_id, r.build_id) "
+        "WHERE r.organization_id = %s AND r.state = 'active' AND a.connection_id = %s",
+        (context.organization_id, connection_id),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 def list_connections(db: psycopg.Connection, context: TenantContext) -> list[dict]:
     context.require("integrations.use")
     with tenant_transaction(db, context):
@@ -74,6 +90,26 @@ def list_connections(db: psycopg.Connection, context: TenantContext) -> list[dic
             (context.organization_id,),
         ).fetchall()
     return [_public(row) for row in rows]
+
+
+def workspace_apps(db: psycopg.Connection, context: TenantContext) -> list[dict]:
+    names = {endpoint: name for name, endpoint in GOOGLE_WORKSPACE_ENDPOINTS.items()}
+    return [
+        {
+            "name": names[item["endpoint_url"]],
+            "account": item["account"],
+            "health": item["health"],
+        }
+        for item in list_connections(db, context)
+        if GOOGLE_WORKSPACE_SCOPE in item["scopes"] and item["endpoint_url"] in names
+    ]
+
+
+def workspace_access_missing(db: psycopg.Connection, context: TenantContext, app: str) -> bool:
+    return app in GOOGLE_WORKSPACE_ENDPOINTS and not any(
+        item["name"] == app and item["health"] in {"healthy", "schema_review"}
+        for item in workspace_apps(db, context)
+    )
 
 
 def _credentials(template: str, values: dict[str, str]) -> dict[str, str]:
@@ -94,11 +130,23 @@ def connect_key(
     endpoint_url: str | None = None,
     account_label: str | None = None,
     connection_id: UUID | None = None,
+    *,
+    google_workspace: tuple[dict[str, str], list[dict]] | None = None,
 ) -> dict:
     context.require("integrations.use")
     if context.actor.role != "org_admin" or template not in {"github", "slack", "remote_mcp"}:
         raise PermissionError("Organization admin and a private key template required")
-    credentials = _credentials(template, values)
+    if google_workspace is not None and (
+        template != "remote_mcp" or endpoint_url not in GOOGLE_WORKSPACE_ENDPOINTS.values()
+    ):
+        raise ValueError("Google OAuth credentials require an official Workspace endpoint")
+    credentials = _credentials(template, values) if google_workspace is None else google_workspace[0]
+    workspace_unavailable = google_workspace is not None and not google_workspace[1]
+    health = "repair" if workspace_unavailable else "healthy"
+    reason = (
+        "Google Workspace refused authenticated discovery; check the MCP API setup"
+        if workspace_unavailable else None
+    )
     if template in {"github", "slack"}:
         if endpoint_url:
             raise ValueError("Curated app endpoint is fixed by its reviewed template")
@@ -117,15 +165,17 @@ def connect_key(
     else:
         if not endpoint_url or not account_label or not account_label.strip():
             raise ValueError("Remote MCP needs its HTTPS URL and an account label")
-        actions = _remote_catalog(discover(endpoint_url, credentials["token"]))
-        account, scopes = account_label.strip(), ()
+        tools = discover(endpoint_url, credentials["token"]) if google_workspace is None else google_workspace[1]
+        actions = [] if workspace_unavailable else _remote_catalog(tools)
+        account = account_label.strip()
+        scopes = (GOOGLE_WORKSPACE_SCOPE,) if google_workspace is not None else ()
     vault = ConnectionSecrets(root)
     with tenant_transaction(db, context):
         if connection_id is None:
             row = db.execute(
                 "INSERT INTO integration_connections (organization_id, owner_user_id, template_key, "
                 "endpoint_url, account_label, granted_scopes, action_catalog, catalog_hash, "
-                "health, checked_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'healthy', now()) "
+                "health, repair_reason, checked_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
                 "RETURNING id",
                 (
                     context.organization_id,
@@ -136,18 +186,24 @@ def connect_key(
                     list(scopes),
                     Jsonb(actions),
                     _digest(actions),
+                    health,
+                    reason,
                 ),
             ).fetchone()
         else:
             existing = db.execute(
                 "SELECT template_key, account_label, endpoint_url, "
-                "action_catalog FROM integration_connections WHERE "
+                "action_catalog, granted_scopes FROM integration_connections WHERE "
                 "organization_id = %s AND id = %s AND revoked_at IS NULL "
                 "FOR UPDATE",
                 (context.organization_id, connection_id),
             ).fetchone()
             if existing is None or existing[:3] != (template, account, endpoint_url):
                 raise ValueError("Reconnect must use the same app, account, and endpoint")
+            if GOOGLE_WORKSPACE_SCOPE in existing[4] and google_workspace is None:
+                raise ValueError("Reconnect Google Workspace from the workflow chat")
+            if workspace_unavailable:
+                actions = existing[3]
             old_schemas = {item["name"]: item["schema_hash"] for item in existing[3]}
             new_schemas = {item["name"]: item["schema_hash"] for item in actions}
             changed = old_schemas != new_schemas
@@ -157,21 +213,18 @@ def connect_key(
                     "organization_id = %s AND connection_id = %s AND revoked_at IS NULL",
                     (context.organization_id, connection_id),
                 )
-                active = db.execute(
-                    "SELECT blueprint_id FROM releases WHERE organization_id = %s "
-                    "AND state = 'active'",
-                    (context.organization_id,),
-                ).fetchone()
+                affected = _affected_blueprints(db, context, connection_id)
                 open_review(
                     db,
                     context,
                     trigger="schema_drift",
                     subject_id=connection_id,
                     owner_user_id=context.actor.user_id,
-                    blueprint_id=active[0] if active else None,
+                    blueprint_id=UUID(affected[0]) if len(affected) == 1 else None,
                     citations=[
                         {
                             "connection_id": str(connection_id),
+                            "affected_blueprints": affected,
                             "old_schema_hashes": old_schemas,
                             "new_schema_hashes": new_schemas,
                         }
@@ -182,6 +235,8 @@ def connect_key(
             else:
                 actions = existing[3]
             review_required = changed and template == "remote_mcp"
+            if review_required:
+                health, reason = "schema_review", "Tool schema changed; review actions and tests"
             db.execute(
                 "UPDATE integration_connections SET granted_scopes = %s, "
                 "action_catalog = %s, catalog_hash = %s, health = %s, "
@@ -191,8 +246,8 @@ def connect_key(
                     list(scopes),
                     Jsonb(actions),
                     _digest(actions),
-                    "schema_review" if review_required else "healthy",
-                    "Tool schema changed; review actions and tests" if review_required else None,
+                    health,
+                    reason,
                     context.organization_id,
                     connection_id,
                 ),
@@ -205,9 +260,7 @@ def connect_key(
             "account": account,
             "scopes": scopes,
             "actions": actions,
-            "health": "schema_review"
-            if connection_id is not None and review_required
-            else "healthy",
+            "health": health,
         }
 
 
@@ -225,8 +278,8 @@ def connect_gmail(
     context.require("integrations.use")
     if context.actor.role != "org_admin":
         raise PermissionError("Organization admin required")
-    required = set(TEMPLATES["gmail"].scopes)
-    if not required <= set(scopes):
+    metadata_scope, send_scope = GMAIL_SCOPE.split()
+    if send_scope not in scopes or not {metadata_scope, GMAIL_CONTENT_SCOPE}.intersection(scopes):
         raise ValueError("Gmail consent is missing metadata or send permission; reconnect")
     credentials = {
         "GMAIL_CLIENT_ID": client_id,
@@ -272,21 +325,18 @@ def connect_gmail(
                     "organization_id = %s AND connection_id = %s AND revoked_at IS NULL",
                     (context.organization_id, connection_id),
                 )
-                active = db.execute(
-                    "SELECT blueprint_id FROM releases WHERE organization_id = %s "
-                    "AND state = 'active'",
-                    (context.organization_id,),
-                ).fetchone()
+                affected = _affected_blueprints(db, context, connection_id)
                 open_review(
                     db,
                     context,
                     trigger="schema_drift",
                     subject_id=connection_id,
                     owner_user_id=context.actor.user_id,
-                    blueprint_id=active[0] if active else None,
+                    blueprint_id=UUID(affected[0]) if len(affected) == 1 else None,
                     citations=[
                         {
                             "connection_id": str(connection_id),
+                            "affected_blueprints": affected,
                             "old_catalog_hash": _digest(existing[0]),
                             "new_catalog_hash": _digest(actions),
                         }
@@ -411,7 +461,7 @@ def check_health(
             if account != row[2] or "chat:write" not in scopes:
                 raise ValueError("Slack account or scope changed; reconnect")
         else:
-            discovered = _remote_catalog(discover(row[1], secrets["token"]))
+            discovered = _remote_catalog(discover(row[1], remote_access_token(row[1], secrets)))
             old = {item["name"]: item["schema_hash"] for item in row[3]}
             new = {item["name"]: item["schema_hash"] for item in discovered}
             if old != new:
@@ -431,20 +481,18 @@ def check_health(
             state, reason = "schema_review", "App action template changed; reconnect and retest"
     with tenant_transaction(db, context):
         if state == "schema_review" and (schema_changed or row[4] != "schema_review"):
-            active = db.execute(
-                "SELECT blueprint_id FROM releases WHERE organization_id = %s AND state = 'active'",
-                (context.organization_id,),
-            ).fetchone()
+            affected = _affected_blueprints(db, context, connection_id)
             open_review(
                 db,
                 context,
                 trigger="schema_drift",
                 subject_id=connection_id,
                 owner_user_id=row[5],
-                blueprint_id=active[0] if active else None,
+                blueprint_id=UUID(affected[0]) if len(affected) == 1 else None,
                 citations=[
                     {
                         "connection_id": str(connection_id),
+                        "affected_blueprints": affected,
                         "catalog_hash": _digest(row[3]),
                         "observed_catalog_hash": _digest(discovered) if discovered else None,
                     }

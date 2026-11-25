@@ -4,6 +4,7 @@ import os
 import secrets
 import time
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -21,13 +22,21 @@ from austra.integrations.connections import (
     review_remote,
     revoke,
 )
-from austra.integrations.email_jobs import deliver_email_job, preview_email_job
+from austra.integrations.email_jobs import (
+    approve_email_connection,
+    deliver_email_job,
+    preview_email_job,
+)
 from austra.integrations.execution import execute_proposal
 from austra.integrations.gateway import approve_workflow, preview_action
+from austra.integrations.gmail_replies import capture_email_reply, reply_status
+from austra.integrations.tracked_email import RecordEmail, prepare_record_email
+from austra.integrations.workflow_notifications import list_notifications, mark_notification_read
 from austra.mcp_gateway import ExternalToolError, call_external
 from austra.platform.auth import SaasIdentity
 from austra.tenant.context import TenantContext
 
+GMAIL_OAUTH_CALLBACK_PATH = "/api/org/connections/gmail/callback"
 OAUTH_SECONDS = 600
 
 
@@ -71,11 +80,19 @@ class ExecuteInput(BaseModel):
 
 class ReconnectInput(BaseModel):
     connection_id: UUID | None = None
+    read_content: bool = False
 
 
 class EmailJobInput(BaseModel):
     department_id: UUID
     proposal_id: UUID
+    follow_up_days: Literal[1, 2, 7] | None = None
+    owner_email_alerts: bool = False
+    automatic_replies: bool = False
+
+
+class EmailConnectionInput(BaseModel):
+    connection_id: UUID
 
 
 def install_integration_routes(app: FastAPI, identity: SaasIdentity, root: Path) -> None:
@@ -89,24 +106,26 @@ def install_integration_routes(app: FastAPI, identity: SaasIdentity, root: Path)
         if public.hostname not in {"127.0.0.1", "localhost"}:
             raise ValueError("Platform Gmail redirect URI must be configured")
         port = f":{public.port}" if public.port else ""
-        return f"{public.scheme}://admin.localhost{port}/api/org/connections/gmail/callback"
+        return f"{public.scheme}://localhost{port}{GMAIL_OAUTH_CALLBACK_PATH}"
 
-    def run(request: Request, operation):
+    def run(request: Request, operation, *, commit_stages=False):
         actor, _ = identity.session(request.cookies.get("austra_session"))
         if actor is None or request.state.organization_slug in {None, "platform"}:
             raise HTTPException(status_code=403, detail="Organization session required")
         try:
             context = TenantContext.from_auth(actor)
             with identity.connect() as db:
+                if commit_stages:
+                    db.autocommit = True
                 return operation(db, context)
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
         except LookupError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
-        except (ValueError, RuntimeError, TypeError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
         except ExternalToolError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
+        except (ValueError, RuntimeError, TypeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/api/org/connection-catalog")
     def connection_catalog(request: Request):
@@ -220,6 +239,21 @@ def install_integration_routes(app: FastAPI, identity: SaasIdentity, root: Path)
                 payload.proposal_id,
                 payload.idempotency_key,
             ),
+            commit_stages=True,
+        )
+
+    @app.post("/api/org/email-jobs/{department_id}/{job_id}/approve-connection")
+    def approve_delivery_connection(department_id: UUID, job_id: UUID, payload: EmailConnectionInput, request: Request):
+        return run(
+            request, lambda db, context: approve_email_connection(
+                db, context, root, department_id, job_id, payload.connection_id
+            ),
+        )
+
+    @app.post("/api/org/workflow-email/{department_id}/{build_id}")
+    def prepare_email(department_id: UUID, build_id: UUID, payload: RecordEmail, request: Request):
+        return run(
+            request, lambda db, context: prepare_record_email(db, context, department_id, build_id, payload)
         )
 
     @app.post("/api/org/email-jobs/{department_id}/{job_id}/preview")
@@ -233,9 +267,36 @@ def install_integration_routes(app: FastAPI, identity: SaasIdentity, root: Path)
         return run(
             request,
             lambda db, context: deliver_email_job(
-                db, context, root, payload.department_id, job_id, payload.proposal_id
+                db, context, root, payload.department_id, job_id, payload.proposal_id,
+                follow_up_days=payload.follow_up_days, owner_email_alerts=payload.owner_email_alerts,
+                automatic_replies=payload.automatic_replies,
             ),
+            commit_stages=True,
         )
+
+    @app.post("/api/org/email-jobs/{department_id}/{job_id}/check-reply")
+    def check_reply(department_id: UUID, job_id: UUID, request: Request):
+        return run(
+            request, lambda db, context: capture_email_reply(db, context, root, department_id, job_id),
+            commit_stages=True,
+        )
+
+    @app.get("/api/org/email-jobs/{department_id}/{job_id}/replies")
+    def email_replies(department_id: UUID, job_id: UUID, request: Request):
+        return run(request, lambda db, context: reply_status(db, context, department_id, job_id))
+
+    @app.get("/api/org/workflow-notifications")
+    def workflow_notifications(request: Request):
+        rows = run(request, list_notifications)
+        return [
+            {"id": str(identifier), "title": title, "message": message, "created_at": created,
+             "read": read is not None, "email": email}
+            for identifier, title, message, created, read, email in rows
+        ]
+
+    @app.post("/api/org/workflow-notifications/{identifier}/read")
+    def read_workflow_notification(identifier: UUID, request: Request):
+        return run(request, lambda db, context: mark_notification_read(db, context, identifier))
 
     @app.post("/api/org/connections/gmail/start")
     def start_gmail(request: Request, payload: ReconnectInput | None = None):
@@ -259,12 +320,14 @@ def install_integration_routes(app: FastAPI, identity: SaasIdentity, root: Path)
                 request.state.organization_slug,
             )
             return {
-                "authorization_url": gmail_authorization_url(client_id, gmail_redirect(), state)
+                "authorization_url": gmail_authorization_url(
+                    client_id, gmail_redirect(), state, read_content=bool(payload and payload.read_content),
+                )
             }
 
         return run(request, start)
 
-    @app.get("/api/org/connections/gmail/callback")
+    @app.get(GMAIL_OAUTH_CALLBACK_PATH)
     def finish_gmail(request: Request):
         state = request.query_params.get("state", "")
         pending = oauth_states.pop(state, None)

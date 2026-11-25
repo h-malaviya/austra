@@ -19,6 +19,7 @@ PLATFORM_SKILLS = (
 REVIEWED_SEMANTIC_SKILLS = ("eliciting-requirements", "modeling-organization")
 RETRIEVAL_SKILLS = ("retrieving-evidence",)
 SUPERVISOR_SKILLS = ("triaging-feedback",)
+PLANNER_SKILLS = ("planning-workflow-solutions",)
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,8 @@ def skill_cards() -> tuple[SkillCard, ...]:
 def load_skill(skill_id: str) -> str:
     if (
         skill_id
-        not in PLATFORM_SKILLS + REVIEWED_SEMANTIC_SKILLS + RETRIEVAL_SKILLS + SUPERVISOR_SKILLS
+        not in PLATFORM_SKILLS + REVIEWED_SEMANTIC_SKILLS + RETRIEVAL_SKILLS
+        + SUPERVISOR_SKILLS + PLANNER_SKILLS
     ):
         raise KeyError(skill_id)
     return (SKILL_ROOT / skill_id / "SKILL.md").read_text(encoding="utf-8")

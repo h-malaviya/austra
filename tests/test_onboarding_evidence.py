@@ -15,6 +15,7 @@ from reportlab.pdfgen import canvas
 
 from austra.onboarding.evidence import (
     _embedding,
+    exclude_source,
     list_sources,
     preview_source,
     process_job,
@@ -76,6 +77,41 @@ def complete(connection, context, root, revision_id):
             return result
 
 
+def test_legacy_organization_can_save_website_evidence(database, tmp_path):
+    organization_id = database.execute(
+        "INSERT INTO organizations (slug, name) VALUES ('legacy', 'Legacy') RETURNING id"
+    ).fetchone()[0]
+    user_id = database.execute(
+        "INSERT INTO users (organization_id, username_normalized, role, password_hash, "
+        "must_change_password) VALUES (%s, 'admin', 'org_admin', 'test', false) RETURNING id",
+        (organization_id,),
+    ).fetchone()[0]
+    context = TenantContext.from_auth(
+        AuthContext(user_id, organization_id, "org_admin", True, True)
+    )
+    page = b"<h1>Legacy company</h1>"
+
+    saved = save_website_page(database, context, tmp_path, "https://example.com/", page)
+    repeated = save_website_page(database, context, tmp_path, "https://example.com/", page)
+
+    assert saved["revision_id"] == repeated["revision_id"]
+    assert complete(database, context, tmp_path, saved["revision_id"])["state"] == "complete"
+    assert database.execute(
+        "SELECT count(*) FROM onboarding_cases WHERE organization_id = %s", (organization_id,)
+    ).fetchone() == (1,)
+    assert database.execute(
+        "SELECT action, actor_user_id FROM audit_events WHERE organization_id = %s",
+        (organization_id,),
+    ).fetchall() == [("onboarding.case_initialized", user_id)]
+    assert database.execute(
+        "SELECT event_type FROM runtime_events WHERE organization_id = %s",
+        (organization_id,),
+    ).fetchall() == [("onboarding.case_initialized",)]
+    assert database.execute(
+        "SELECT count(*) FROM outbox_jobs WHERE organization_id = %s", (organization_id,)
+    ).fetchone() == (1,)
+
+
 def test_interview_revision_provenance_and_tenant_isolation(database, tmp_path):
     first = organization(database, "first")
     second = organization(database, "second")
@@ -88,12 +124,16 @@ def test_interview_revision_provenance_and_tenant_isolation(database, tmp_path):
     ]
     assert complete(database, first, tmp_path, original["revision_id"])["total_units"] == 1
     source = list_sources(database, first)[0]
+    assert source["review_state"] == "pending"
+    exclude_source(database, first, source["id"], False)
+    assert list_sources(database, first)[0]["review_state"] == "included"
     preview = preview_source(database, first, source["id"])
     assert preview[0]["locator"].startswith("text")
     assert "Approval requires" in preview[0]["text"]
     assert preview[0]["captured_at"] == source["captured_at"]
     changed = save_file(database, first, tmp_path, "policy.txt", b"Approval requires two managers.")
     assert changed["revision"] == 2 and changed["revision_id"] != original["revision_id"]
+    assert list_sources(database, first)[0]["review_state"] == "pending"
     assert complete(database, first, tmp_path, changed["revision_id"])["state"] == "complete"
     assert "two managers" in preview_source(database, first, source["id"])[0]["text"]
     assert list_sources(database, second) == []
@@ -108,6 +148,28 @@ def test_interview_revision_provenance_and_tenant_isolation(database, tmp_path):
             "VALUES (%s, %s, 'file', 'wrong', 'Wrong')",
             (first.organization_id, case["id"]),
         )
+
+
+def test_pending_source_rejection_requires_reason_and_records_audit(database, tmp_path):
+    context = organization(database, "review")
+    saved = save_file(database, context, tmp_path, "inventory.txt", b"Garden supplies")
+    complete(database, context, tmp_path, saved["revision_id"])
+    source_id = saved["source_id"]
+    with pytest.raises(ValueError, match="reason"):
+        exclude_source(database, context, source_id, True)
+    assert list_sources(database, context)[0]["review_state"] == "pending"
+
+    assert exclude_source(database, context, source_id, True, "Unrelated garden inventory") == (
+        "excluded"
+    )
+    reviewed = list_sources(database, context)[0]
+    assert reviewed["review_state"] == "excluded"
+    assert reviewed["excluded"] is True
+    assert database.execute(
+        "SELECT action, reason FROM audit_events WHERE organization_id = %s "
+        "AND resource_id = %s ORDER BY occurred_at DESC LIMIT 1",
+        (context.organization_id, source_id),
+    ).fetchone() == ("onboarding.source_rejected", "Unrelated garden inventory")
 
 
 def test_pdf_docx_csv_xlsx_and_untrusted_instructions(database, tmp_path):

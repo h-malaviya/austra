@@ -31,6 +31,7 @@ class LangfuseStub:
 def test_message_trace_records_identity_and_provider_usage_without_content(monkeypatch):
     langfuse = LangfuseStub()
     propagated = []
+    requests = []
 
     @contextmanager
     def capture_attributes(**attributes):
@@ -48,7 +49,11 @@ def test_message_trace_records_identity_and_provider_usage_without_content(monke
         ),
         stop_reason="end_turn",
     )
-    model_client = SimpleNamespace(messages=SimpleNamespace(create=lambda **_kwargs: response))
+    def create(**kwargs):
+        requests.append(kwargs)
+        return response
+
+    model_client = SimpleNamespace(messages=SimpleNamespace(create=create))
 
     with observability.trace_turn(
         "chat_message",
@@ -86,6 +91,7 @@ def test_message_trace_records_identity_and_provider_usage_without_content(monke
         "cache_creation_input_tokens": 3,
         "cache_read_input_tokens": 2,
     }
+    assert requests[0]["cache_control"] == {"type": "ephemeral"}
     exported = [
         {"attributes": observation.attributes, "updates": observation.updates}
         for observation in langfuse.observations
@@ -93,7 +99,7 @@ def test_message_trace_records_identity_and_provider_usage_without_content(monke
     assert "Private business data" not in repr(exported)
 
 
-def test_unconfigured_observability_does_not_change_model_calls(monkeypatch):
+def test_unconfigured_observability_still_enables_prompt_cache(monkeypatch):
     monkeypatch.setattr(observability, "_client", lambda: None)
     calls = []
 
@@ -109,7 +115,45 @@ def test_unconfigured_observability_does_not_change_model_calls(monkeypatch):
             )
             == "reply"
         )
-    assert calls == [{"model": "claude-sonnet-5"}]
+    assert calls == [{"model": "claude-sonnet-5", "cache_control": {"type": "ephemeral"}}]
+
+
+def test_cache_control_applies_to_streamed_calls_and_prompt_changes(monkeypatch):
+    monkeypatch.setattr(observability, "_client", lambda: None)
+    requests = []
+    chunks = []
+
+    class Stream:
+        def __init__(self):
+            self.text_stream = iter(["Hello", " there"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_final_message(self):
+            return "complete"
+
+    def stream(**kwargs):
+        requests.append(kwargs)
+        return Stream()
+
+    model_client = SimpleNamespace(messages=SimpleNamespace(stream=stream))
+    first = observability.observed_message(
+        model_client, "discovery_reply", on_text=chunks.append,
+        model="claude-sonnet-5", max_tokens=100, system="Prompt version 1",
+    )
+    second = observability.observed_message(
+        model_client, "discovery_reply", on_text=chunks.append,
+        model="claude-sonnet-5", max_tokens=100, system="Prompt version 2",
+    )
+
+    assert first == second == "complete"
+    assert chunks == ["Hello", " there", "Hello", " there"]
+    assert [request["system"] for request in requests] == ["Prompt version 1", "Prompt version 2"]
+    assert all(request["cache_control"] == {"type": "ephemeral"} for request in requests)
 
 
 def test_model_error_is_not_swallowed(monkeypatch):

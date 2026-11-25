@@ -10,6 +10,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from austra.connectors import GMAIL_SCOPE
+from austra.onboarding.decisions import unique_decisions
 from austra.onboarding.evidence import EMBEDDING_MODEL, _embedding
 from austra.tenant.context import TenantContext, tenant_transaction
 from austra.tenant.permissions.keys import ADMIN_ONLY_PERMISSIONS, DEPARTMENT_PERMISSIONS
@@ -71,7 +72,8 @@ def extract_claims(
         row = connection.execute(
             "SELECT c.text FROM evidence_chunks c JOIN evidence_revisions r ON r.id = c.revision_id "
             "JOIN evidence_sources s ON s.id = r.source_id WHERE c.organization_id = %s "
-            "AND c.id = %s AND r.status = 'complete' AND NOT s.excluded",
+            "AND c.id = %s AND r.status = 'complete' AND NOT s.excluded "
+            "AND s.review_state = 'included'",
             (context.organization_id, chunk_id),
         ).fetchone()
         if row is None:
@@ -178,7 +180,8 @@ def add_revision(
             "FROM source_claims c JOIN evidence_chunks e ON e.id = c.chunk_id "
             "JOIN evidence_revisions r ON r.id = e.revision_id "
             "JOIN evidence_sources s ON s.id = r.source_id "
-            "WHERE c.organization_id = %s AND c.id = ANY(%s) AND NOT s.excluded",
+            "WHERE c.organization_id = %s AND c.id = ANY(%s) AND NOT s.excluded "
+            "AND s.review_state = 'included'",
             (context.organization_id, claim_ids),
         ).fetchall()
         if len(set(claim_ids)) != len(claims):
@@ -334,7 +337,8 @@ def _checks(
             issues.append({"type": "broken_link", "detail": str(edge["id"])})
     claim_rows = connection.execute(
         "SELECT rc.revision_id, c.id, s.kind, s.display_name, e.locator, r.captured_at, "
-        "s.excluded, coalesce((SELECT d.decision FROM claim_decisions d WHERE "
+        "(s.excluded OR s.review_state <> 'included'), "
+        "coalesce((SELECT d.decision FROM claim_decisions d WHERE "
         "d.organization_id = c.organization_id AND d.claim_id = c.id "
         "ORDER BY d.decision_order DESC LIMIT 1), 'unconfirmed') "
         "FROM semantic_revision_claims rc JOIN source_claims c ON c.id = rc.claim_id "
@@ -519,6 +523,12 @@ def _checks(
         if behavior.get("actions") and not any(item["kind"] == "authority" for item in revisions):
             issues.append({"type": "side_effect", "detail": "External action has no authority"})
     examples = proposal.get("acceptance_examples", [])
+    for decision in proposal.get("open_decisions", []):
+        if isinstance(decision, str) and decision.strip():
+            issues.append({"type": "open_decision", "detail": decision.strip()})
+    for setting in proposal.get("email_requirements", []):
+        if not any(item["kind"] == "capability" and item["content"].get(setting) for item in revisions):
+            issues.append({"type": "open_decision", "detail": f"Define the {setting.replace('_', ' ')} for review."})
     for category in ("normal", "boundary", "adverse"):
         if not any(
             example.get("category") == category and example.get("input") and example.get("expected")
@@ -592,14 +602,22 @@ def propose_candidate(
             raise ValueError("An unlocked onboarding case is required")
         issues, manifest = _checks(connection, context.organization_id, proposal)
         canonical = {
+            "name": str(proposal.get("name") or "Workflow draft").strip()[:80],
             "revision_ids": sorted(
                 str(UUID(str(value))) for value in proposal.get("revision_ids", [])
             ),
             "edge_ids": sorted(str(UUID(str(value))) for value in proposal.get("edge_ids", [])),
             "behavior": proposal.get("behavior", {}),
             "acceptance_examples": proposal.get("acceptance_examples", []),
+            "open_decisions": unique_decisions(proposal.get("open_decisions", [])),
             "clarifications": proposal.get("clarifications", []),
         }
+        if proposal.get("suggested_definition"):
+            canonical["suggested_definition"] = proposal["suggested_definition"]
+        if requirements := proposal.get("email_requirements"):
+            if set(requirements) - {"reply_mapping", "email_document", "automatic_email"}:
+                raise ValueError("Unknown workflow email configuration")
+            canonical["email_requirements"] = sorted(set(requirements))
         digest = _digest(canonical)
         candidate_id = connection.execute(
             "INSERT INTO blueprint_candidates (organization_id, case_id, proposal, content_hash, proposed_by) "
@@ -647,11 +665,15 @@ def review_candidate(
         )
         return {
             "id": row[0],
+            "name": row[1].get("name") or "Workflow draft",
             "content_hash": row[2],
             "recorded_at": row[3],
             "behavior": row[1]["behavior"],
             "acceptance_examples": row[1]["acceptance_examples"],
+            "open_decisions": unique_decisions(row[1].get("open_decisions", [])),
             "clarifications": row[1].get("clarifications", []),
+            "suggested_definition": row[1].get("suggested_definition"),
+            "email_requirements": row[1].get("email_requirements", []),
             "changes": _candidate_changes(previous[0], row[1]) if previous else [],
             "revisions": [
                 {**item, "sources": manifest["sources"][item["id"]]} for item in revisions
@@ -669,6 +691,9 @@ def _candidate_changes(previous: dict, current: dict) -> list[str]:
             "edge_ids",
             "behavior",
             "acceptance_examples",
+            "suggested_definition",
+            "email_requirements",
+            "open_decisions",
             "clarifications",
         )
         if previous.get(field) != current.get(field)
@@ -681,18 +706,23 @@ def answer_question(
     case_id: UUID,
     question_index: int,
     answer: str,
+    content_hash: str | None = None,
 ) -> dict:
     _admin(context)
     if not answer.strip() or len(answer) > 5000:
         raise ValueError("A concise clarification answer is required")
     with tenant_transaction(connection, context):
+        connection.execute("SELECT id FROM onboarding_cases WHERE organization_id = %s AND id = %s FOR UPDATE",
+                           (context.organization_id, case_id))
         row = connection.execute(
-            "SELECT proposal FROM blueprint_candidates WHERE organization_id = %s AND case_id = %s "
+            "SELECT proposal, content_hash FROM blueprint_candidates WHERE organization_id = %s AND case_id = %s "
             "ORDER BY candidate_order DESC LIMIT 1",
             (context.organization_id, case_id),
         ).fetchone()
         if row is None:
             raise LookupError("Candidate not found")
+        if content_hash is not None and row[1] != content_hash:
+            raise ValueError("The candidate changed. Review the current question.")
         issues, manifest = _checks(connection, context.organization_id, row[0])
         questions = questions_for(issues, manifest)
         if question_index < 0 or question_index >= len(questions):
@@ -709,7 +739,7 @@ def answer_question(
                 },
             ],
         }
-    return propose_candidate(connection, context, case_id, revised)
+        return propose_candidate(connection, context, case_id, revised)
 
 
 def confirm_candidate(
@@ -736,6 +766,9 @@ def confirm_candidate(
         issues, manifest = _checks(connection, context.organization_id, row[1])
         if issues:
             raise ValueError(f"Candidate has unresolved critical questions: {issues}")
+        # Different workflow cases allocate from the same organization version sequence.
+        connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                           (str(context.organization_id),))
         version = connection.execute(
             "SELECT coalesce(max(blueprint_version), 0) + 1 FROM blueprints "
             "WHERE organization_id = %s",

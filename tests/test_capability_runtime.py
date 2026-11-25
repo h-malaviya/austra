@@ -1,6 +1,7 @@
 """First capability slice against a disposable tenant schema and fake provider."""
 
 import os
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import psycopg
@@ -25,6 +26,8 @@ from austra.capabilities.projections import projection_data
 from austra.capabilities.routes import install_capability_routes
 from austra.capabilities.runtime import capability_view, execute_command, explain_event
 from austra.capabilities.verifier import verify_build
+from austra.semantics.purchase_workflow import prepare_purchase_workflow
+from austra.semantics.service import confirm_candidate
 from austra.storage.migrate import apply_migrations
 from austra.tenant.context import TenantContext, tenant_transaction
 from austra.tenant.permissions.evaluator import AuthContext, DepartmentGrant
@@ -181,6 +184,29 @@ def stock_lot(connection, context, department_id):
         "state, data) VALUES (%s, %s, 'stock_lot', 'LOT-1', 'available', %s) RETURNING id",
         (context.organization_id, department_id, Jsonb(data)),
     ).fetchone()[0]
+
+
+def test_approved_legacy_purchase_workflow_reaches_release(database, tmp_path):
+    context, department = setup_tenant(database)
+    draft = {"id": uuid4().hex, "kind": "workflow", "status": "approved",
+             "name": "demo_sales_order", "summary": "Reserve remaining stock and review the purchase.",
+             "content": "Reserve verified stock. Approve the remaining purchase and exact email separately."}
+    prepared = prepare_purchase_workflow(database, context, tmp_path, draft, department, Decimal(0))
+    assert prepared["issues"] == []
+    blueprint = confirm_candidate(database, context, prepared["case_id"], prepared["content_hash"])
+    build = create_build(database, context, blueprint["blueprint_id"])
+    build_capability(database, context, build["id"], "Restore the previous release")
+    revision = transition_build(database, context, build["id"], "testing", 1, uuid4())
+    verified = verify_build(database, context, build["id"])
+    assert verified["passed"], verified
+    revision = transition_build(database, context, build["id"], "admin_preview", revision, uuid4())
+    with tenant_transaction(database, context):
+        database.execute(
+            "INSERT INTO capability_connection_health (organization_id, provider_key, state) "
+            "VALUES (%s, 'email', 'healthy')", (context.organization_id,),
+        )
+    release_build(database, context, build, revision)
+    assert capability_view(database, context, department)["build_id"] == str(build["id"])
 
 
 def quality_manifest():

@@ -1,5 +1,6 @@
 """Independent checks of a pinned capability artifact before admin preview."""
 
+from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -58,6 +59,16 @@ def _sandbox_scenarios(
                 "VALUES (%s, 'fixture', 'Fixture') RETURNING id",
                 (organization_id,),
             ).fetchone()[0]
+            # Replay scoped actors and departments with identities owned by the disposable tenant.
+            manifest = deepcopy(manifest)
+            if manifest.get("department_ids"):
+                manifest["department_ids"] = [str(department_id)]
+            for capability in manifest.get("capabilities", []):
+                if capability.get("department_ids"):
+                    capability["department_ids"] = [str(department_id)]
+            for rule in manifest.get("decision_tables", []):
+                if rule["content"].get("allowed_user_ids"):
+                    rule["content"]["allowed_user_ids"] = [str(admin_id)]
             context = TenantContext.from_auth(
                 AuthContext(admin_id, organization_id, "org_admin", True, True)
             )
@@ -85,7 +96,14 @@ def _sandbox_scenarios(
             if manifest.get("engine") == "state_machine":
                 definition = manifest["capabilities"][0]
                 creation = next(item for item in definition["transitions"] if item["from"] is None)
-                fields = {name: "1" for name in creation["fields"] if name != "external_id"}
+                types = {field["key"]: field["type"] for field in definition["fields"]}
+                fields = {name: str(uuid4()) if types[name] == "reference" else "1"
+                          for name in creation["fields"] if name != "external_id"}
+                for rule in manifest["decision_tables"]:
+                    content = rule["content"]
+                    guard = content.get("guard")
+                    if guard and content["decision_key"] == f"command.{definition['key']}.{creation['key']}":
+                        fields[guard["field"]] = str(guard["value"])
                 payload = {
                     "capability_key": definition["key"],
                     "transition_key": creation["key"],

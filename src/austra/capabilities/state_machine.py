@@ -9,6 +9,9 @@ from uuid import UUID
 import psycopg
 
 from austra.capabilities.contracts import CapabilityCommand
+from austra.capabilities.email_automation import compile_email_automation
+from austra.capabilities.reply_mapping import validate_document, validate_mapping
+from austra.integrations.catalog import GMAIL_SEND
 from austra.tenant.context import TenantContext
 
 KEY = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
@@ -21,6 +24,7 @@ def compile_state_machine(source: dict, blueprint_hash: str) -> dict:
     rules = []
     routes = []
     seen_kinds = set()
+    email_authorities = []
     for revision in source.get("revisions", []):
         if (
             revision.get("kind") != "capability"
@@ -64,6 +68,8 @@ def compile_state_machine(source: dict, blueprint_hash: str) -> dict:
         ):
             raise ValueError("State machine needs named states and transitions")
         transition_keys = set()
+        automatic_authority = {}
+        protected = set()
         for transition in transitions:
             name = transition.get("key")
             origin = transition.get("from")
@@ -90,6 +96,11 @@ def compile_state_machine(source: dict, blueprint_hash: str) -> dict:
             ]
             if not matching:
                 raise ValueError(f"Dated authority required for {decision_key}")
+            automatic_authority[name] = len(matching) == 1 and bool(
+                matching[0]["content"].get("allow_automatic_email")
+                and matching[0]["content"].get("guard") is None
+                and not matching[0].get("valid_to")
+            )
             intervals = []
             for rule in matching:
                 start = datetime.fromisoformat(str(rule.get("valid_from")))
@@ -121,6 +132,7 @@ def compile_state_machine(source: dict, blueprint_hash: str) -> dict:
                         or threshold < 0
                     ):
                         raise ValueError("Invalid typed decision guard")
+                    protected.add(guard["field"])
                 intervals.append((start, end))
                 rules.append(
                     {
@@ -139,6 +151,8 @@ def compile_state_machine(source: dict, blueprint_hash: str) -> dict:
             routes.append(
                 {"capability": key, "transition": name, "from": origin, "to": transition["to"]}
             )
+            if transition["permission"] == "workflows.approve":
+                protected.update(transition["fields"])
         examples = content.get("acceptance_examples", [])
         if not all(
             any(
@@ -150,10 +164,39 @@ def compile_state_machine(source: dict, blueprint_hash: str) -> dict:
             raise ValueError("Normal, boundary, and adverse examples are required")
         if not content.get("failure_path") or not content.get("owner"):
             raise ValueError("Workflow owner and failure path are required")
+        email = {}
+        if content.get("reply_mapping") is not None:
+            email["reply_mapping"] = validate_mapping(content["reply_mapping"], field_map, states, protected)
+        if content.get("email_document") is not None:
+            email["email_document"] = validate_document(content["email_document"], field_map)
+        if content.get("automatic_email") is not None:
+            email["automatic_email"] = compile_email_automation(
+                content["automatic_email"], field_map, states, transitions, automatic_authority,
+            )
+            mapped = {item["target"] for item in email.get("reply_mapping", {}).get("fields", [])}
+            for rule in email["automatic_email"]["rules"]:
+                prerequisites = {check.get("expected_field") for check in rule["checks"]}
+                prerequisites.update(check["name"] for check in rule["checks"] if check["source"] == "record")
+                if mapped.intersection(prerequisites):
+                    raise ValueError("Supplier replies cannot update internal prerequisite fields")
+                for branch in (rule["on_match"], rule["on_mismatch"]):
+                    if mapped.intersection(branch.get("document", {}).get("fields", [])):
+                        raise ValueError("Automatic attachments can include only internal approved record fields")
+        if email:
+            matches = [
+                item for item in source.get("decision_tables", [])
+                if item["content"].get("decision_key") == "command.approve_email"
+                and item["content"].get("scope") == key
+                and item["content"].get("required_permission") == "workflows.approve"
+            ]
+            if len(matches) != 1 or not matches[0].get("id"):
+                raise ValueError("Record email requires a scoped approval rule")
+            email_authorities.extend(matches)
         definitions.append(
             {
                 "key": key,
                 "record_kind": kind,
+                "department_ids": content.get("department_ids", []),
                 "fields": fields,
                 "states": states,
                 "transitions": transitions,
@@ -162,6 +205,7 @@ def compile_state_machine(source: dict, blueprint_hash: str) -> dict:
                 "acceptance_examples": examples,
                 "idempotency": "organization_department_key",
                 "audit": "runtime_event_and_record_revision",
+                **email,
             }
         )
     if not definitions:
@@ -226,10 +270,13 @@ def compile_state_machine(source: dict, blueprint_hash: str) -> dict:
         "blueprint_hash": blueprint_hash,
         "capabilities": definitions,
         "commands": ["transition_record"],
-        "decision_tables": rules,
+        "decision_tables": rules + email_authorities,
         "event_routes": routes,
         "mappings": source.get("typed_mappings", []),
         "integration_mappings": integration_mappings,
+        **({"allowed_actions": [{"content": {"action_ids": [GMAIL_SEND.name],
+                                             "requested_scopes": list(GMAIL_SEND.scopes)}}]}
+           if email_authorities else {}),
         "projections": compile_projections(standard_projections, definitions),
         "custom_module_drafts": custom_modules,
     }

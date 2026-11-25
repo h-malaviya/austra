@@ -403,6 +403,18 @@ async function renderPlatformDetail(item) {
         });
     });
   }
+  if (item.test_reset_enabled) {
+    platformButton(actions, "Reset test data", "platform-button ghost", () => {
+      platformModal("Reset test data", `This clears ${item.name}'s onboarding, chats, documents, workflows, and people. The organization login and Anthropic key remain. Type ${item.slug} to confirm.`,
+        [["Subdomain", "confirm_slug", "", true]], "Reset test data", async values => {
+          await api(`/api/platform/organizations/${item.id}/test-reset`, {
+            method: "POST", body: JSON.stringify(values)
+          });
+          await platformReload();
+          platformNotice("Test data cleared. The organization can start onboarding again.");
+        });
+    });
+  }
 
   const adminHead = add(detail, "div", "", "platform-admin-head");
   const adminTitle = add(adminHead, "div");

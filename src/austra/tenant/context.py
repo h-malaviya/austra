@@ -35,6 +35,13 @@ class TenantContext:
         if not permits(self.actor, self.organization_id, department_id, permission):
             raise PermissionError(f"{permission} denied")
 
+    def require_active_department(self, connection: psycopg.Connection, department_id: UUID) -> None:
+        if not connection.execute(
+            "SELECT 1 FROM departments WHERE organization_id = %s AND id = %s AND archived_at IS NULL",
+            (self.organization_id, department_id),
+        ).fetchone():
+            raise LookupError("Active department not found")
+
     @property
     def can_write(self) -> bool:
         return self.actor.role == "org_admin" or any(
@@ -52,16 +59,36 @@ def tenant_transaction(
     connection: psycopg.Connection, context: TenantContext
 ) -> Iterator[psycopg.Connection]:
     """Run new-table queries as the non-owner role with a local authenticated scope."""
+    department_ids = ",".join(
+        str(grant.department_id)
+        for grant in context.actor.grants
+        if grant.department_active
+        and grant.membership_active
+        and grant.role_active
+        and grant.assignment_active
+    )
+    with _scoped_transaction(
+        connection, context.organization_id, str(context.actor.user_id), department_ids,
+        context.actor.role == "org_admin", context.can_write,
+    ):
+        yield connection
+
+
+@contextmanager
+def system_department_transaction(
+    connection: psycopg.Connection, organization_id: UUID, department_id: UUID
+) -> Iterator[psycopg.Connection]:
+    """Scope an internal job to its one department without impersonating a user."""
+    with _scoped_transaction(connection, organization_id, "", str(department_id), False, True):
+        yield connection
+
+
+@contextmanager
+def _scoped_transaction(
+    connection, organization_id, actor_id, department_ids, all_departments, can_write
+):
     with connection.transaction():
         connection.execute("SET LOCAL ROLE austra_tenant_app")
-        department_ids = ",".join(
-            str(grant.department_id)
-            for grant in context.actor.grants
-            if grant.department_active
-            and grant.membership_active
-            and grant.role_active
-            and grant.assignment_active
-        )
         connection.execute(
             "SELECT set_config('austra.organization_id', %s, true), "
             "set_config('austra.actor_id', %s, true), "
@@ -69,11 +96,11 @@ def tenant_transaction(
             "set_config('austra.all_departments', %s, true), "
             "set_config('austra.can_write', %s, true)",
             (
-                str(context.organization_id),
-                str(context.actor.user_id),
+                str(organization_id),
+                actor_id,
                 department_ids,
-                "on" if context.actor.role == "org_admin" else "off",
-                "on" if context.can_write else "off",
+                "on" if all_departments else "off",
+                "on" if can_write else "off",
             ),
         )
         yield connection

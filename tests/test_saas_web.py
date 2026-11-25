@@ -1,4 +1,5 @@
 import os
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import psycopg
@@ -13,6 +14,86 @@ from austra.files import Files
 from austra.platform import auth as platform_auth
 from austra.platform.auth import password_hash
 from austra.web import create_app
+
+
+def test_employee_ask_uses_department_scope_and_clear_access_reply(tmp_path, monkeypatch):
+    url = os.environ.get("AUSTRA_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("AUSTRA_TEST_DATABASE_URL is required for PostgreSQL integration tests")
+    schema = f"employee_ask_test_{uuid4().hex}"
+    with psycopg.connect(url, autocommit=True) as admin_connection:
+        admin_connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+        try:
+            database_url = psycopg.conninfo.make_conninfo(url, options=f"-c search_path={schema}")
+            monkeypatch.setenv("AUSTRA_DATABASE_URL", database_url)
+            monkeypatch.setenv("AUSTRA_SUPER_ADMIN_USERNAME", "superadmin")
+            monkeypatch.setenv("AUSTRA_SUPER_ADMIN_PASSWORD", "test platform password 123")
+            monkeypatch.setenv("AUSTRA_LEGACY_ORGANIZATION_SLUG", "legacy")
+            app = create_app(tmp_path)
+            with psycopg.connect(database_url) as db:
+                organization_id = db.execute(
+                    "INSERT INTO organizations (slug, name) VALUES ('acme', 'Acme') RETURNING id"
+                ).fetchone()[0]
+                worker_id = db.execute(
+                    "INSERT INTO users (organization_id, username_normalized, role, "
+                    "password_hash, must_change_password) VALUES (%s, 'worker', 'employee', "
+                    "%s, false) RETURNING id",
+                    (organization_id, password_hash("fixture worker password")),
+                ).fetchone()[0]
+                department_id = db.execute(
+                    "INSERT INTO departments (organization_id, slug, name) "
+                    "VALUES (%s, 'sales', 'Sales') RETURNING id",
+                    (organization_id,),
+                ).fetchone()[0]
+                membership_id = db.execute(
+                    "INSERT INTO department_memberships (organization_id, department_id, user_id) "
+                    "VALUES (%s, %s, %s) RETURNING id",
+                    (organization_id, department_id, worker_id),
+                ).fetchone()[0]
+                role_id = db.execute(
+                    "INSERT INTO department_roles (organization_id, department_id, slug, "
+                    "name, current_version) VALUES (%s, %s, 'chat', 'Chat', 1) RETURNING id",
+                    (organization_id, department_id),
+                ).fetchone()[0]
+                version_id = db.execute(
+                    "INSERT INTO role_versions (role_id, version, change_reason, approved_by) "
+                    "VALUES (%s, 1, 'Fixture', %s) RETURNING id",
+                    (role_id, worker_id),
+                ).fetchone()[0]
+                db.execute(
+                    "INSERT INTO role_permissions (role_version_id, permission_key) "
+                    "VALUES (%s, 'chat.use')",
+                    (version_id,),
+                )
+                db.execute(
+                    "INSERT INTO role_assignments (organization_id, department_id, "
+                    "department_membership_id, role_id, assigned_by) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (organization_id, department_id, membership_id, role_id, worker_id),
+                )
+            client = TestClient(app, base_url="http://acme.localhost:8000")
+            assert client.post(
+                "/api/login", json={"username": "worker", "password": "fixture worker password"}
+            ).status_code == 200
+            assert client.get("/api/org/ask/departments").json() == [
+                {"id": str(department_id), "name": "Sales"}
+            ]
+            headers = {"X-Austra-Request": "1"}
+            status = client.post(
+                "/api/org/ask", headers=headers,
+                json={"question": "What is the status of our workflow?", "department_id": str(department_id)},
+            )
+            assert status.status_code == 200, status.text
+            assert "organization admin" in status.json()["answer"]["answer"]
+            missing = client.post(
+                "/api/org/ask", headers=headers,
+                json={"question": "What is the approval rule?", "department_id": str(department_id)},
+            )
+            assert missing.status_code == 200, missing.text
+            assert "your current role" in missing.json()["answer"]["answer"]
+            assert len(client.get("/api/org/chats").json()) == 2
+        finally:
+            admin_connection.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
 def test_organization_model_key_is_private_and_testable(tmp_path, monkeypatch):
@@ -131,9 +212,9 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             Access(tmp_path).setup("existing admin password")
             Files(tmp_path).create_chat("Show stock", "Admin", title="Current raw material stock")
 
-            client = TestClient(
-                create_app(tmp_path), base_url="http://polysilicon-manufacturing.localhost"
-            )
+            monkeypatch.setenv("AUSTRA_PUBLIC_URL", "http://127.0.0.1:8000")
+            app = create_app(tmp_path)
+            client = TestClient(app, base_url="http://polysilicon-manufacturing.localhost:8000")
             signed_in = client.post(
                 "/api/login",
                 json={
@@ -161,7 +242,7 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
                 ).status_code
                 == 401
             )
-            bare = TestClient(create_app(tmp_path), base_url="http://localhost:8000")
+            bare = TestClient(app, base_url="http://localhost:8000")
             assert bare.get("/api/config").status_code == 200
             assert bare.get("/", follow_redirects=False).headers["location"] == (
                 "http://admin.localhost:8000/"
@@ -179,6 +260,7 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
                 "planning-operations",
             }
             assert sum(item["object_count"] for item in departments) >= 1
+
             original_catalog = platform_auth.catalog_legacy_workspace
             catalog_calls = []
 
@@ -418,6 +500,7 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
                 == 200
             )
             assert worker.get("/api/config").json()["must_change_password"] is True
+            assert worker.get("/api/org/ask/departments").status_code == 403
             assert worker.get("/api/chats").status_code == 403
 
             platform = TestClient(create_app(tmp_path), base_url="http://admin.localhost")
@@ -652,8 +735,25 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
             assert current_case.json()["next_actions"] == ["start_collecting"]
             assert other_admin.get("/api/config").json()["legacy_workspace"] is False
             assert client.get("/api/config").json()["legacy_workspace"] is True
-            assert other_admin.get("/organization/onboarding").status_code == 200
+            onboarding_page = other_admin.get("/organization/onboarding")
+            assert onboarding_page.status_code == 200
+            assert onboarding_page.headers["Cache-Control"] == "no-store"
+            assert "id=\"askDepartment\"" in onboarding_page.text
             assert other_admin.get("/organization/capability").status_code == 200
+            for path in (
+                "/organization/info",
+                "/organization/people",
+                "/organization/workflows",
+                "/organization/workflow-reviews",
+                "/connections",
+                "/profile",
+                "/workspace",
+                "/infrastructure",
+            ):
+                page = other_admin.get(path)
+                assert page.status_code == 200
+                assert page.headers["Cache-Control"] == "no-store"
+                assert 'id="appShell"' in page.text
             assert other_admin.get("/api/chats").status_code == 403
             assert client.post("/api/org/users", json={"username": "unsafe"}).status_code == 403
             new_employee = client.post(
@@ -699,6 +799,42 @@ def test_legacy_admin_migrates_and_other_roles_are_denied(tmp_path, monkeypatch)
                 ).status_code
                 == 401
             )
+
+            for field in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET"):
+                monkeypatch.delenv(field, raising=False)
+            headers = {"X-Austra-Request": "1"}
+            saved = client.post(
+                "/api/credentials/gmail",
+                headers=headers,
+                json={"values": {"GMAIL_CLIENT_ID": "fixture-id", "GMAIL_CLIENT_SECRET": "secret"}},
+            )
+            assert saved.status_code == 200
+            started = client.post("/api/connections/gmail/start", headers=headers)
+            assert started.status_code == 200
+            redirect = "http://localhost:8000/api/connections/gmail/callback"
+            query = parse_qs(urlsplit(started.json()["authorization_url"]).query)
+            assert query["redirect_uri"] == [redirect]
+            assert client.get("/api/config").json()["gmail_redirect_uri"] == redirect
+
+            def exchange(code, client_id, client_secret, redirect_uri):
+                assert (code, client_id, client_secret, redirect_uri) == (
+                    "one-time-code", "fixture-id", "secret", redirect,
+                )
+                return "fixture-refresh-token", "mailbox@example.com"
+
+            monkeypatch.setattr("austra.web.exchange_gmail_code", exchange)
+            callback_path = "/api/connections/gmail/callback"
+            params = {"state": query["state"][0], "code": "one-time-code"}
+            assert client.get(callback_path, params=params).status_code == 400
+            completed = bare.get(callback_path, params=params, follow_redirects=False)
+            assert completed.status_code == 303
+            assert completed.headers["location"] == (
+                "http://polysilicon-manufacturing.localhost:8000/?connection=gmail&oauth=connected"
+            )
+            assert "set-cookie" not in completed.headers
+            assert bare.get(callback_path, params=params).status_code == 400
+            assert client.get("/api/config").json()["authenticated"] is True
+            assert Access(tmp_path).get("GMAIL_REFRESH_TOKEN") == "fixture-refresh-token"
         finally:
             admin_connection.execute(
                 sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema))

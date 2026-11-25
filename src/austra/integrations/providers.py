@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from austra.integrations.google_workspace import remote_access_token
 from austra.mcp_gateway import ExternalToolError, call_external, call_remote, remote_tools
 
 
@@ -113,7 +114,7 @@ def perform(
         return asyncio.run(
             call_remote(
                 endpoint_url,
-                secrets.get("token", ""),
+                remote_access_token(endpoint_url, secrets),
                 action.removeprefix("remote_mcp."),
                 arguments,
             )

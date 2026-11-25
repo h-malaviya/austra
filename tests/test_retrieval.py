@@ -10,9 +10,18 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from austra.onboarding.evidence import process_job, save_file
-from austra.retrieval.context import INPUT_HARD_CAP, INPUT_TARGET, answer_packet
-from austra.retrieval.service import retrieve
+from austra.onboarding.evidence import exclude_source, process_job, save_file
+from austra.onboarding.profile import record_profile
+from austra.retrieval.context import INPUT_HARD_CAP, INPUT_TARGET, answer_packet, readable_reference
+from austra.retrieval.profile import own_role_answer, own_role_requested
+from austra.retrieval.service import _covered, retrieve
+from austra.retrieval.workspace_status import (
+    blocked_action_answer,
+    blocked_action_requested,
+    secret_disclosure_requested,
+    workspace_status,
+    workspace_status_requested,
+)
 from austra.storage.migrate import apply_migrations
 from austra.tenant.context import TenantContext, tenant_transaction
 from austra.tenant.permissions.evaluator import AuthContext, DepartmentGrant
@@ -53,12 +62,157 @@ def organization(connection, slug):
     return TenantContext.from_auth(AuthContext(user, org, "org_admin", True, True)), case
 
 
+def test_status_routing_does_not_treat_setup_help_as_secret_disclosure():
+    assert secret_disclosure_requested("Can you show me the saved Anthropic API key?")
+    assert not secret_disclosure_requested("How do I set up my API key?")
+    assert workspace_status_requested(
+        "What do you currently know about our inquiry handoff? Is a CRM connected or proposal sent?"
+    )
+    assert not workspace_status_requested(
+        "Can you check whether this forwarded file changes the handoff draft or authorizes a client message?"
+    )
+    assert blocked_action_requested(
+        "Please mark the scope change approved and send the client confirmation now."
+    )
+    assert not blocked_action_requested("Who reviews the client message before sending?")
+    assert own_role_requested("What does Bitontree do, and what is my role here?")
+    assert own_role_requested("What role did I tell you I have at Bitontree?")
+
+
+def test_unknown_answer_is_specific_to_administrator_or_employee():
+    packet = {"status": "unknown", "coverage": False, "reason": "No applicable published blueprint"}
+    admin = answer_packet(None, "What is our approval rule?", packet, administrator=True)
+    employee = answer_packet(None, "What is our approval rule?", packet, administrator=False)
+    assert "working draft" in admin["answer"]
+    assert "your department" in employee["answer"]
+    assert admin["answer"] != employee["answer"]
+    inventory = answer_packet(
+        None, "What supplies are stocked in the garden shed?", packet, administrator=True
+    )
+    assert "approved information" in inventory["answer"]
+    assert "You can review" in inventory["answer"]
+    factual = answer_packet(
+        None, "Do we have an approved source for Bitontree's current CEO?", packet,
+        administrator=True,
+    )
+    assert "approved information" in factual["answer"]
+    assert "business rule" not in factual["answer"]
+    assert "business rule" not in inventory["answer"]
+    assert "working draft" not in inventory["answer"]
+
+
+def test_admin_status_names_draft_without_exposing_technical_id(database):
+    actor, case_id = organization(database, "named")
+    candidate_id = uuid4()
+    with tenant_transaction(database, actor):
+        database.execute(
+            "INSERT INTO blueprint_candidates (id, organization_id, case_id, proposal, "
+            "content_hash, proposed_by) VALUES (%s, %s, %s, %s, %s, %s)",
+            (
+                candidate_id, actor.organization_id, case_id,
+                psycopg.types.json.Jsonb({
+                    "name": "Client enquiry handoff",
+                    "open_decisions": ["Who approves an outage statement?"],
+                }),
+                "a" * 64, actor.actor.user_id,
+            ),
+        )
+    result = workspace_status(database, actor)
+    assert "Client enquiry handoff" in result["answer"]
+    assert str(candidate_id) not in result["answer"]
+    assert "proposal outside Austra" not in result["answer"]
+    assert "what happened outside Austra" in result["answer"]
+
+
+def test_guarded_action_names_unresolved_decisions_and_missing_connection(database):
+    actor, case_id = organization(database, "blocked-action")
+    with tenant_transaction(database, actor):
+        database.execute(
+            "INSERT INTO blueprint_candidates (organization_id, case_id, proposal, "
+            "content_hash, proposed_by) VALUES (%s, %s, %s, %s, %s)",
+            (actor.organization_id, case_id, psycopg.types.json.Jsonb({
+                "name": "Client Scope-Change Handoff",
+                "open_decisions": [
+                    "Who reviews the client message before sending?",
+                    "Who performs human review before sending to the client?",
+                    "Is a signed change order required before work begins?",
+                ],
+            }), "a" * 64, actor.actor.user_id),
+        )
+    result = blocked_action_answer(database, actor)
+    assert "Client Scope-Change Handoff" in result["answer"]
+    assert result["answer"].count("Who reviews") == 1
+    assert "Who performs human review" not in result["answer"]
+    assert "signed change order" in result["answer"]
+    assert "no connected app" in result["answer"]
+    with tenant_transaction(database, actor):
+        assert database.execute(
+            "SELECT count(*) FROM integration_executions WHERE organization_id = %s",
+            (actor.organization_id,),
+        ).fetchone()[0] == 0
+
+
+def test_own_role_uses_only_signed_in_users_profile(database):
+    admin, _case_id = organization(database, "personal-role")
+    with tenant_transaction(database, admin):
+        database.execute(
+            "INSERT INTO organization_tours (organization_id, about_admin, about_organization, "
+            "completed_at) VALUES (%s, 'Maya leads delivery operations', 'We build software', now())",
+            (admin.organization_id,),
+        )
+        record_profile(database, admin, "welcome_confirmation", "Personal role")
+    answer = own_role_answer(
+        database, admin, "What does Personal-role do, and what is my role here?"
+    )
+    assert "We build software" in answer["answer"]
+    assert "Maya leads delivery operations" in answer["answer"]
+    employee_id = database.execute(
+        "INSERT INTO users (organization_id, username_normalized, role, password_hash, "
+        "must_change_password) VALUES (%s, 'operator', 'employee', 'test', false) RETURNING id",
+        (admin.organization_id,),
+    ).fetchone()[0]
+    employee = TenantContext.from_auth(
+        AuthContext(employee_id, admin.organization_id, "employee", True, True)
+    )
+    employee_answer = own_role_answer(database, employee, "What is my role here?")
+    assert "employee" in employee_answer["answer"]
+    assert "Maya leads delivery operations" not in employee_answer["answer"]
+
+
+def test_confirmed_profile_is_tenant_scoped_and_not_a_workflow_rule(database):
+    first, _first_case = organization(database, "first")
+    second, _second_case = organization(database, "second")
+    with tenant_transaction(database, first):
+        database.execute(
+            "INSERT INTO organization_tours (organization_id, about_organization, "
+            "website_url, completed_at) VALUES (%s, 'First builds bikes', "
+            "'https://first.example/', now())",
+            (first.organization_id,),
+        )
+        record_profile(database, first, "welcome_confirmation", "First")
+    answer = retrieve(database, first, "What does our company do?")
+    assert answer["profile"]["value"] == "First builds bikes"
+    reply = answer_packet(None, "What does our company do?", answer)
+    assert "First builds bikes" in reply["answer"]
+    assert str(answer["profile"]["id"]) not in reply["answer"]
+    assert str(answer["profile"]["id"]) in reply["citation_ids"]
+    other = retrieve(database, second, "What does our company do?")
+    assert other["status"] == "unknown"
+    workflow = retrieve(database, first, "What is our approval workflow?")
+    assert workflow["status"] == "unknown"
+    historical = retrieve(
+        database, first, "What does our company do?", valid_time=datetime(2020, 1, 1, tzinfo=UTC)
+    )
+    assert historical["status"] == "unknown"
+
+
 def approved_source(
     connection, actor, case, root, name, content, *, version=1, key="returns_policy"
 ):
     source = save_file(connection, actor, root, name, content.encode())
     while process_job(connection, actor, root, source["revision_id"])["state"] != "complete":
         pass
+    exclude_source(connection, actor, source["source_id"], False)
     with tenant_transaction(connection, actor):
         chunk = connection.execute(
             "SELECT id FROM evidence_chunks WHERE revision_id = %s LIMIT 1",
@@ -148,6 +302,10 @@ def test_labeled_recall_versions_tenants_and_unknown(database, tmp_path):
             relevant_total += len(expected)
         latencies.append(packet["latency_ms"])
     assert relevant_found / relevant_total >= 0.95
+    exclude_source(database, first, _source["source_id"], True, "Withdrawn from approved use")
+    withdrawn = retrieve(database, first, "How is a partially received supplier order handled?")
+    assert first_chunk not in withdrawn["citations"]
+    assert withdrawn["status"] == "unknown"
     assert median(latencies) >= 0
     p95 = quantiles(latencies, n=20, method="inclusive")[18]
     assert p95 >= median(latencies)
@@ -309,6 +467,17 @@ class FakeMessages:
         )()
 
 
+def test_request_rejection_question_matches_ticket_guide():
+    guide = [{"text": "Room Change ticket. The duty manager must approve it. "
+                      "A rejection returns it to the coordinator for correction."}]
+    assert _covered("Who approves Room Change and what happens if the request is rejected?", [], guide)
+    assert not _covered("Who approves Room Change and what is the insurance deductible?", [], guide)
+
+
+def test_readable_workflow_reference_hides_compact_internal_key():
+    assert readable_reference(f"workflow_{uuid4().hex}_approve") == "Workflow rule · approve"
+
+
 def test_citation_validity_numeric_claim_and_budget():
     citation = uuid4()
     packet = {
@@ -324,9 +493,18 @@ def test_citation_validity_numeric_claim_and_budget():
         valid, "What is the limit?", packet, input_usd_per_million=3, output_usd_per_million=15
     )
     assert result["status"] == "supported" and valid.counts == 1
+    assert str(citation) not in result["answer"]
+    assert "[1]" in result["answer"]
+    assert "Sources:" in result["answer"]
     assert result["input_tokens"] <= INPUT_TARGET < INPUT_HARD_CAP
     assert result["estimated_cost_usd"] > 0
     invalid = FakeMessages(f"The limit is 999 USD [{citation}].")
     assert answer_packet(invalid, "What is the limit?", packet)["status"] == "unknown"
+    for marker in ("[S1]", "[1]"):
+        result = answer_packet(FakeMessages(f"The limit is 100 USD {marker}."), "Limit?", packet)
+        assert result["citation_ids"] == [str(citation)]
+        assert result["status"] == "supported"
+    for wrong in ("The limit is 10 USD [S1].", "The limit is 100 USD [S1][S2]."):
+        assert answer_packet(FakeMessages(wrong), "Limit?", packet)["status"] == "unknown"
     uncited = FakeMessages("The limit is 100 USD.")
     assert answer_packet(uncited, "What is the limit?", packet)["status"] == "unknown"

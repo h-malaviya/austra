@@ -14,6 +14,12 @@ from austra.build_release.service import (
     transition_build,
 )
 from austra.capabilities.builder import build_capability
+from austra.capabilities.chat import (
+    released_workflow_catalog,
+    save_workflow_context,
+    start_workflow_chat,
+    workflow_chats,
+)
 from austra.capabilities.contracts import CapabilityCommand
 from austra.capabilities.projections import projection_data
 from austra.capabilities.runtime import capability_view, execute_command, explain_event
@@ -44,6 +50,17 @@ class FixInput(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class WorkflowChatStart(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class WorkflowChatSelection(BaseModel):
+    department_id: UUID
+    build_id: UUID
+    step: str | None = Field(default=None, max_length=160)
+    email_reference: str | None = Field(default=None, max_length=100)
+
+
 def install_capability_routes(app: FastAPI, identity: SaasIdentity) -> None:
     def run(request: Request, operation, *, admin: bool = False):
         actor, _remaining = identity.session(request.cookies.get("austra_session"))
@@ -69,19 +86,46 @@ def install_capability_routes(app: FastAPI, identity: SaasIdentity) -> None:
     app.add_api_route("/api/org/capability-chat/commands", command, methods=["POST"])
     app.add_api_route("/api/org/capability-ui/commands", command, methods=["POST"])
 
+    @app.get("/api/org/released-workflows")
+    def released_workflows(request: Request):
+        return run(request, released_workflow_catalog)
+
+    @app.get("/api/org/workflow-chats")
+    def list_workflow_chats(request: Request):
+        return run(request, workflow_chats)
+
+    @app.post("/api/org/workflow-chats")
+    def create_workflow_chat(payload: WorkflowChatStart, request: Request):
+        return run(request, lambda db, context: start_workflow_chat(db, context, payload.message))
+
+    @app.patch("/api/org/workflow-chats/{chat_id}")
+    def select_workflow(payload: WorkflowChatSelection, chat_id: UUID, request: Request):
+        return run(request, lambda db, context: save_workflow_context(
+            db, context, chat_id, payload.model_dump(mode="json"),
+        ))
+
     @app.get("/api/org/capability/{department_id}")
-    def view(department_id: UUID, request: Request):
-        return run(request, lambda db, context: capability_view(db, context, department_id))
+    def view(department_id: UUID, request: Request, build_id: UUID | None = None):
+        return run(request, lambda db, context: capability_view(db, context, department_id, build_id))
 
     @app.get("/api/org/capability/{department_id}/projections/{key}")
-    def projection(department_id: UUID, key: str, request: Request, offset: int = 0):
+    def projection(
+        department_id: UUID, key: str, request: Request, offset: int = 0,
+        group_value: str | None = None, build_id: UUID | None = None,
+    ):
         def operation(db, context):
-            from austra.capabilities.runtime import _active_build
+            from austra.capabilities.runtime import active_builds, select_build
             from austra.tenant.context import tenant_transaction
 
             with tenant_transaction(db, context):
-                manifest = _active_build(db, context)["manifest"]
-            return projection_data(db, context, department_id, key, manifest, offset=offset)
+                manifest = select_build(active_builds(db, context), lambda b: (
+                    (build_id is None or b["build_id"] == build_id) and any(
+                        item["key"] == key for item in b["manifest"].get("projections", [])
+                    )
+                ))["manifest"]
+            return projection_data(
+                db, context, department_id, key, manifest, offset=offset, group_value=group_value
+            )
 
         return run(request, operation)
 
