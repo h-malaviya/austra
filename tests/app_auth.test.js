@@ -28,7 +28,7 @@ beforeEach(() => {
   const app = fs.readFileSync(path.join(staticRoot, "app.js"), "utf8");
   window.eval(app.replace(
     /\nstart\(\);\s*$/,
-    "\nwindow.authTest = { api, refreshConfig, showSignedOut, showModal };"
+    "\nwindow.authTest = { api, refreshConfig, showConnections, showSignedOut, showModal, navigateAustra };"
   ));
   window.fetch = jest.fn(async url => url === "/api/config"
     ? response({
@@ -44,6 +44,7 @@ afterEach(() => {
   window.authTest.showSignedOut(false);
   delete window.authTest;
   delete window.BroadcastChannel;
+  delete window.AustraA2UI;
   jest.useRealTimers();
 });
 
@@ -60,6 +61,17 @@ test("sign out shows sign in immediately and removes private content", async () 
   expect(document.getElementById("messages").textContent).not.toContain("Private answer");
   expect(document.getElementById("chatList").textContent).toBe("");
   expect(channels[0].postMessage).toHaveBeenCalledWith("signed-out");
+});
+
+test("temporary employee credentials can reach the password change screen before department lookup", async () => {
+  window.fetch = jest.fn(async url => {
+    if (url !== "/api/config") throw new Error("Unexpected protected request " + url);
+    return response({ authenticated: true, role: "employee", legacy_workspace: false,
+      must_change_password: true, connectors: { anthropic: true }, session_seconds_remaining: 120 });
+  });
+  await window.authTest.refreshConfig();
+  expect(document.getElementById("askDepartment").hidden).toBe(true);
+  expect(window.fetch).toHaveBeenCalledTimes(1);
 });
 
 test("organization admin can open the department ownership view", async () => {
@@ -85,6 +97,97 @@ test("organization admin can open the department ownership view", async () => {
   expect(document.getElementById("departmentsContent").textContent).toContain("Inventory");
   expect(document.getElementById("departmentsContent").textContent).toContain("52");
   expect(window.location.pathname).toBe("/organization/departments");
+});
+
+test("organization info has its own route and a summary for legacy organizations", async () => {
+  window.fetch = jest.fn(async url => {
+    if (url !== "/api/config") throw new Error("Unexpected request " + url);
+    return response({ authenticated: true, saas_mode: true, legacy_workspace: true, role: "org_admin",
+      organization_name: "Northstar", connectors: { anthropic: true }, session_seconds_remaining: 3600 });
+  });
+  await window.authTest.refreshConfig();
+  await window.authTest.navigateAustra("/organization/info");
+
+  expect(window.location.pathname).toBe("/organization/info");
+  expect(document.getElementById("accountTitle").textContent).toBe("Organization info");
+  expect(document.querySelector("#accountContent dd").textContent).toBe("Northstar");
+  expect(document.getElementById("departmentsPage").hidden).toBe(true);
+  expect(document.getElementById("orgInfoButton").getAttribute("aria-current")).toBe("page");
+});
+
+test("employees are not sent to organization administration or model credential APIs", async () => {
+  window.fetch = jest.fn(async url => {
+    if (url === "/api/config") return response({
+      authenticated: true, saas_mode: true, legacy_workspace: false, role: "employee",
+      connectors: { anthropic: true }, session_seconds_remaining: 3600
+    });
+    if (url === "/api/org/ask/departments") return response([]);
+    throw new Error("Unexpected protected request " + url);
+  });
+  await window.authTest.refreshConfig();
+  for (const page of ["/organization/people", "/organization/info", "/connections"]) {
+    await window.authTest.navigateAustra(page);
+    expect(window.location.pathname).toBe("/");
+    expect(document.getElementById("chatArea").hidden).toBe(false);
+  }
+  expect(document.getElementById("organizationNavigation").hidden).toBe(true);
+  expect(document.getElementById("connectionsButton").hidden).toBe(true);
+  expect(window.fetch).toHaveBeenCalledTimes(2);
+});
+
+test("workspace ignores an older response after returning to the same section", async () => {
+  await window.authTest.refreshConfig();
+  const workspace = label => ({ surface: { label }, items: [], total: 1, page_size: 20 });
+  let resolveOldRecords;
+  let recordsCalls = 0;
+  window.AustraA2UI = { mount: (target, surface) => { target.textContent = surface.label; } };
+  window.fetch = jest.fn(async url => {
+    if (url.includes("section=files")) return response({ items: [], total: 0, page_size: 20 });
+    if (url.includes("section=records")) {
+      recordsCalls += 1;
+      if (recordsCalls === 1) return new Promise(resolve => { resolveOldRecords = resolve; });
+      return response(workspace("Current records"));
+    }
+    throw new Error("Unexpected request " + url);
+  });
+  await window.authTest.navigateAustra("/workspace");
+  expect(document.getElementById("workspacePagination").hidden).toBe(true);
+  const files = document.querySelector('[data-section="files"]');
+  files.focus();
+  files.click();
+  expect(document.activeElement).toBe(files);
+  document.querySelector('[data-section="records"]').click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  resolveOldRecords(response(workspace("Stale records")));
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  expect(document.getElementById("workspaceContent").textContent).toBe("Current records");
+  expect(document.getElementById("workspacePagination").hidden).toBe(false);
+});
+
+test("saving Gmail OAuth details directs the user to consent again", async () => {
+  window.fetch = jest.fn(async url => {
+    if (url === "/api/config") return response({
+      admin_ready: true, authenticated: true, legacy_workspace: true,
+      session_seconds_remaining: 3600,
+      connectors: { gmail: true },
+      guides: { gmail: { title: "Gmail", steps: "Connect Gmail", url: "https://example.test" } },
+      fields: { gmail: ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET"] },
+      missing: { gmail: [] },
+      gmail_redirect_uri: "http://localhost:8000/api/connections/gmail/callback"
+    });
+    if (url === "/api/credentials/gmail") return response({ configured: true });
+    throw new Error("Unexpected request " + url);
+  });
+
+  await window.authTest.refreshConfig();
+  window.authTest.showConnections("gmail");
+  document.querySelector('[aria-label="GMAIL_CLIENT_SECRET"]').value = "replacement-secret";
+  await document.querySelector("#connectionDetail form").onsubmit({ preventDefault() {} });
+
+  expect(document.getElementById("connectionFeedback").textContent)
+    .toBe("OAuth client saved. Choose Connect with Google.");
+  expect(window.fetch).toHaveBeenCalledTimes(3);
 });
 
 test("expired session on an API response returns to sign in without reload", async () => {

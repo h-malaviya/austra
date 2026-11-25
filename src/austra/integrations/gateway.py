@@ -10,6 +10,8 @@ import psycopg
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from psycopg.types.json import Jsonb
 
+from austra.connectors import GMAIL_CONTENT_SCOPE
+from austra.integrations.google_workspace import GOOGLE_WORKSPACE_SCOPE
 from austra.integrations.providers import perform
 from austra.integrations.secrets import ConnectionSecrets
 from austra.tenant.context import TenantContext, tenant_transaction
@@ -35,16 +37,16 @@ def _validate(action: dict, arguments: dict) -> None:
         raise ValueError("Arguments do not match the approved action schema") from error
 
 
-def _active_build(db: psycopg.Connection, context: TenantContext) -> tuple:
+def _active_build(db: psycopg.Connection, context: TenantContext, build_id: UUID) -> tuple:
     row = db.execute(
         "SELECT r.blueprint_id, r.build_id, b.content_hash, a.manifest FROM releases r "
         "JOIN blueprints b ON b.organization_id = r.organization_id AND b.id = r.blueprint_id "
         "JOIN capability_build_artifacts a ON a.organization_id = r.organization_id "
-        "AND a.build_id = r.build_id WHERE r.organization_id = %s AND r.state = 'active'",
-        (context.organization_id,),
+        "AND a.build_id = r.build_id WHERE r.organization_id = %s AND r.state = 'active' AND r.build_id = %s",
+        (context.organization_id, build_id),
     ).fetchone()
     if row is None or row[2] != row[3].get("blueprint_hash"):
-        raise ValueError("An active release pinned to its blueprint is required")
+        raise PermissionError("Approval is not pinned to the active blueprint and build")
     return row
 
 
@@ -100,9 +102,9 @@ def _load_action(
         raise ValueError("Action catalog changed; review the schema and approval")
     if row[11] != "healthy":
         raise ValueError("Connection needs repair or review; reconnect before retrying")
-    if not set(action["scopes"]) <= set(row[9]) and row[7] != "remote_mcp":
+    if (row[7] != "remote_mcp" or GOOGLE_WORKSPACE_SCOPE in row[9]) and not set(action["scopes"]) <= set(row[9]):
         raise PermissionError("Connection lacks the action scope; reconnect")
-    active = _active_build(db, context)
+    active = _active_build(db, context, row[2])
     if row[1] != active[0] or row[2] != active[1]:
         raise PermissionError("Approval is not pinned to the active blueprint and build")
     if not _authorized_action(active[3], row[3], set(row[9]) | set(action["scopes"])):
@@ -160,7 +162,7 @@ def approve_workflow(
         action = next((item for item in conn[3] if item["name"] == action_name), None)
         if action is None or action["effect"] not in {"read", "write"}:
             raise ValueError("Action effect must be reviewed")
-        if conn[0] != "remote_mcp" and not set(action["scopes"]) <= set(conn[2]):
+        if (conn[0] != "remote_mcp" or GOOGLE_WORKSPACE_SCOPE in conn[2]) and not set(action["scopes"]) <= set(conn[2]):
             raise PermissionError("Connection lacks required scope")
         if not _authorized_action(build[1], action_name, set(conn[2]) | set(action["scopes"])):
             raise PermissionError("Blueprint does not permit this action")
@@ -218,11 +220,21 @@ def preview_action(
     arguments: dict,
     source_records: list[dict],
     reason: str = "",
+    *,
+    workflow_email: dict | None = None,
 ) -> dict:
     context.require("integrations.use", department_id)
     context.require("workflows.run", department_id)
     with tenant_transaction(db, context):
         row, action = _load_action(db, context, department_id, approval_id)
+        if row[3] == "gmail.send_email":
+            manifest = _active_build(db, context, row[2])[3]
+            if manifest.get("engine") == "state_machine" and (
+                not workflow_email or workflow_email["build_id"] != str(row[2])
+            ):
+                raise PermissionError("Prepare a record email in the released workflow")
+            if workflow_email and workflow_email["content_required"] and GMAIL_CONTENT_SCOPE not in row[9]:
+                raise PermissionError("Authorize Gmail reply text and attachments before sending")
         _validate(action, arguments)
         if action["effect"] == "write":
             context.require("workflows.approve", department_id)
@@ -252,6 +264,8 @@ def preview_action(
             "blueprint_id": str(row[1]),
             "build_id": str(row[2]),
         }
+        if workflow_email:
+            preview["workflow_email"] = workflow_email
         proposal = db.execute(
             "INSERT INTO integration_action_proposals (organization_id, department_id, "
             "approval_id, actor_user_id, argument_hash, arguments, preview) "

@@ -16,6 +16,8 @@ function connectionActions(parent, connection) {
     add(row, "small", `Schema ${action.schema_hash.slice(0, 12)}…`);
     if (action.effect !== "unreviewed") continue;
     const effect = add(row, "select");
+    effect.setAttribute("aria-label", `Access for ${action.name}`);
+    add(effect, "option", "Choose read or write").value = "";
     for (const value of ["read", "write"]) {
       const option = add(effect, "option", value === "read" ? "Reads data" : "Changes data");
       option.value = value;
@@ -25,6 +27,11 @@ function connectionActions(parent, connection) {
     const scopes = connectionField(row, "Required scopes, comma separated", "scopes");
     scopes.required = false;
     orgButton(row, "Review action", "org-button secondary", async () => {
+      if (!effect.value) {
+        orgNotice("Choose whether the action reads or changes data.", true);
+        effect.focus();
+        return;
+      }
       try {
         await api(`/api/org/connections/${connection.id}/review-action`, { method: "POST",
           body: JSON.stringify({ action_name: action.name, effect: effect.value,
@@ -40,19 +47,23 @@ function connectionActions(parent, connection) {
 async function orgConnectionsPage(content) {
   const [templates, connections] = await Promise.all([
     api("/api/org/connection-catalog"), api("/api/org/connections")]);
-  const intro = add(content, "section", "", "org-panel");
-  add(intro, "h2", "Choose an app");
-  add(intro, "p", "Credentials stay in the private connection vault. Connecting an app does not approve a workflow action.");
+  const intro = add(content, "header", "", "connection-catalog-heading");
+  add(intro, "h2", "Available apps");
+  add(intro, "p", "Connect an account here. Review and approve each workflow action separately.");
+  const catalog = add(content, "div", "", "connection-catalog-grid");
+  if (!templates.length) add(catalog, "p", "No apps are available for this workspace.");
   for (const template of templates) {
-    const panel = add(content, "section", "", "org-panel org-onboarding-form");
+    const panel = add(catalog, "section", "", "org-panel org-onboarding-form connection-template");
     add(panel, "h3", template.label);
     add(panel, "p", template.verification);
     add(panel, "small", `Can request: ${template.actions.map(action => `${action.label} (${action.effect})`).join(", ") || "Actions discovered after setup"}`);
     add(panel, "p", `Permissions: ${template.scopes.join(", ") || "Review each discovered action"}`);
-    add(panel, "small", `Triggers: ${template.triggers.join(", ") || "None configured"}`);
-    add(panel, "p", `Health check: ${template.health_check}. Up to ${template.rate_per_minute} calls per minute.`);
-    add(panel, "small", template.error_handling);
-    add(panel, "small", template.revocation);
+    const details = add(panel, "details", "", "connection-template-details");
+    add(details, "summary", "Technical details");
+    add(details, "p", `Triggers: ${template.triggers.join(", ") || "None configured"}`);
+    add(details, "p", `Health check: ${template.health_check}. Up to ${template.rate_per_minute} calls per minute.`);
+    if (template.error_handling) add(details, "p", template.error_handling);
+    if (template.revocation) add(details, "p", template.revocation);
     if (template.setup === "oauth") {
       orgButton(panel, "Connect with Google", "org-button primary", async () => {
         try {
@@ -93,7 +104,7 @@ async function orgConnectionsPage(content) {
       } catch (error) { orgNotice(error.message, true); button.disabled = false; }
     };
   }
-  const saved = add(content, "section", "", "org-panel");
+  const saved = add(content, "section", "", "org-panel connection-accounts");
   add(saved, "h2", "Your connections");
   if (!connections.length) add(saved, "p", "No apps connected yet.");
   for (const connection of connections) {

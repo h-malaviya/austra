@@ -25,9 +25,9 @@ def compile_manifest(source: dict, blueprint_hash: str) -> dict:
         for item in revisions
     ):
         return compile_state_machine(source, blueprint_hash)
-    if not any(
-        item.get("kind") == "capability" and item.get("key") == CAPABILITY_KEY for item in revisions
-    ):
+    capability = next((item for item in revisions if item.get("kind") == "capability"
+                       and item.get("key") == CAPABILITY_KEY), None)
+    if capability is None:
         raise ValueError("Locked blueprint does not include the first capability")
     rules = {}
     for item in source.get("decision_tables", []):
@@ -86,6 +86,7 @@ def compile_manifest(source: dict, blueprint_hash: str) -> dict:
         "capability": CAPABILITY_KEY,
         "blueprint_hash": blueprint_hash,
         "engine": "reviewed_handler",
+        "department_ids": capability.get("content", {}).get("department_ids", []),
         "capabilities": [
             {
                 "key": CAPABILITY_KEY,

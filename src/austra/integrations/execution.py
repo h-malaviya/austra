@@ -8,6 +8,7 @@ from uuid import UUID
 import httpx
 import psycopg
 
+from austra.connectors import GMAIL_CONTENT_SCOPE
 from austra.integrations.catalog import TEMPLATES
 from austra.integrations.connections import check_health
 from austra.integrations.gateway import _load_action, _validate, digest
@@ -60,11 +61,20 @@ def execute_proposal(
     department_id: UUID,
     proposal_id: UUID,
     idempotency_key: str,
+    *,
+    workflow_job_id: UUID | None = None,
+    follow_up_days: int | None = None,
+    owner_email_alerts: bool = False,
+    automatic_replies: bool = False,
 ) -> dict:
     context.require("integrations.use", department_id)
     context.require("workflows.run", department_id)
     if not idempotency_key or len(idempotency_key) > 200:
         raise ValueError("Idempotency key is required")
+    if idempotency_key.startswith("email-job:") and (
+        workflow_job_id is None or idempotency_key != f"email-job:{workflow_job_id}"
+    ):
+        raise PermissionError("Use the reviewed workflow email to claim this delivery")
     with tenant_transaction(db, context):
         proposal = db.execute(
             "SELECT approval_id, actor_user_id, argument_hash, arguments, preview, expires_at "
@@ -76,6 +86,12 @@ def execute_proposal(
             raise LookupError("Action preview not found")
         if proposal[1] != context.actor.user_id or proposal[5] <= datetime.now(UTC):
             raise PermissionError("Action preview expired or belongs to another actor")
+        workflow_email = proposal[4].get("workflow_email")
+        if workflow_email and workflow_email["id"] != str(workflow_job_id):
+            raise PermissionError("Send this email from the workflow preview")
+        if automatic_replies and (context.actor.role != "org_admin" or not workflow_email
+                                  or not workflow_email.get("automatic_email")):
+            raise PermissionError("Administrator approval for the exact automatic replies is required")
     health = check_health(db, context, root, UUID(proposal[4]["account_id"]))
     if health["health"] != "healthy":
         raise ValueError(health["repair_reason"] or "Reconnect this app")
@@ -98,6 +114,8 @@ def execute_proposal(
             return {"state": prior[2], "receipt": prior[3]}
     with tenant_transaction(db, context):
         row, action = _load_action(db, context, department_id, proposal[0])
+        if workflow_email and workflow_email["content_required"] and GMAIL_CONTENT_SCOPE not in row[9]:
+            raise PermissionError("Authorize Gmail reply text and attachments before sending")
         _validate(action, proposal[3])
         if digest(proposal[3]) != proposal[2]:
             raise ValueError("Preview arguments changed")
@@ -145,6 +163,17 @@ def execute_proposal(
         ).fetchone()
         if inserted is None:
             raise ValueError("Action is already reserved; inspect its receipt before retrying")
+        if workflow_job_id is not None:
+            updated = db.execute(
+                "UPDATE outbox_jobs SET follow_up_days=%s,owner_email_alerts=%s,automatic_reply_approved_by=%s "
+                "WHERE organization_id=%s AND department_id=%s AND id=%s "
+                "AND topic='capability.email' AND state IN ('pending','repair')",
+                (follow_up_days, owner_email_alerts, context.actor.user_id if automatic_replies else None,
+                 context.organization_id, department_id,
+                 workflow_job_id),
+            ).rowcount
+            if updated != 1:
+                raise ValueError("Workflow email is no longer awaiting delivery")
     state, receipt, result = "uncertain", None, {"state": "uncertain"}
     try:
         credentials = ConnectionSecrets(root).read(context.organization_id, row[6])
@@ -159,7 +188,11 @@ def execute_proposal(
                 != action["schema_hash"]
             ):
                 raise ValueError("MCP schema changed; review the connection")
-        response = perform(row[7], row[3], proposal[3], credentials, row[8])
+        arguments = proposal[3]
+        if workflow_email and (attachment := workflow_email.get("attachment")):
+            arguments = {**arguments, "attachment_name": attachment["name"],
+                         "attachment_base64": attachment["base64"]}
+        response = perform(row[7], row[3], arguments, credentials, row[8])
         receipt, result = _provider_result(action, response, credentials)
         state = "succeeded"
     except (

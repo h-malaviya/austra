@@ -8,6 +8,7 @@ from uuid import UUID
 import psycopg
 
 from austra.onboarding.evidence import EMBEDDING_MODEL, _embedding
+from austra.retrieval.profile import profile_fields
 from austra.tenant.context import TenantContext, tenant_transaction
 
 LANE_LIMIT = 30
@@ -15,6 +16,7 @@ PASSAGE_LIMIT = 8
 EVIDENCE_TOKEN_LIMIT = 4000
 FUSION_OFFSET = 60
 IDENTIFIER = re.compile(r"\b[A-Za-z]{1,12}[-_][A-Za-z0-9_-]{2,64}\b")
+WORKFLOW_SUFFIX = re.compile(r"\s+(?:review and approval|approval workflow|workflow)$", re.IGNORECASE)
 WORDS = re.compile(r"[a-z0-9_]{3,}")
 STOP_WORDS = frozenset(
     {
@@ -74,6 +76,7 @@ def _visible_sql() -> str:
         "JOIN evidence_sources s ON s.id = r.source_id AND s.organization_id = r.organization_id "
         "WHERE r.organization_id = %(organization_id)s AND r.status = 'complete' "
         "AND r.captured_at <= %(recorded_time)s AND s.excluded = false "
+        "AND s.review_state = 'included' "
         "AND EXISTS (SELECT 1 FROM source_claims cl "
         "JOIN evidence_chunks support ON support.id = cl.chunk_id "
         "JOIN semantic_revision_claims link ON link.claim_id = cl.id "
@@ -92,8 +95,10 @@ def _semantic_visible() -> str:
         "JOIN source_claims claim ON claim.id = link.claim_id "
         "LEFT JOIN evidence_chunks support ON support.id = claim.chunk_id "
         "LEFT JOIN evidence_revisions source_revision ON source_revision.id = support.revision_id "
+        "LEFT JOIN evidence_sources source ON source.id = source_revision.source_id "
         "WHERE link.revision_id = sr.id AND (support.id IS NULL "
         "OR source_revision.status <> 'complete' "
+        "OR source.id IS NULL OR source.excluded OR source.review_state <> 'included' "
         "OR source_revision.captured_at > %(recorded_time)s "
         "OR (SELECT decision FROM claim_decisions d WHERE d.claim_id = claim.id "
         "AND d.recorded_at <= %(recorded_time)s "
@@ -119,10 +124,14 @@ def _fuse(lanes: list[list[dict]]) -> list[dict]:
 def _covered(question: str, exact: list[dict], passages: list[dict]) -> bool:
     if exact:
         return True
-    text = " ".join(row["text"] for row in passages).casefold()
+    def workflow_terms(text: str) -> str:
+        text = re.sub(r"\b(?:rejected|rejecting|rejections?)\b", "reject", text.casefold())
+        return re.sub(r"\b(?:tickets?|requests?)\b", "request", text)
+
+    text = workflow_terms(" ".join(row["text"] for row in passages))
     if not text:
         return False
-    clauses = re.split(r"\s+(?:and|also)\s+|[;?]", question.casefold())
+    clauses = re.split(r"\s+(?:and|also)\s+|[;?]", workflow_terms(question))
     for clause in clauses:
         terms = {word for word in WORDS.findall(clause) if word not in STOP_WORDS}
         if terms and sum(word in text for word in terms) < min(2, len(terms)):
@@ -149,7 +158,31 @@ def retrieve(
         context.require("records.read", department_id)
     if valid_time and valid_time.tzinfo is None or recorded_time and recorded_time.tzinfo is None:
         raise ValueError("Times must include an offset")
+    if not (valid_time or recorded_time or blueprint_id):
+        with tenant_transaction(connection, context):
+            profile = connection.execute(
+                "SELECT id, organization_name, about_organization, desired_outcome, "
+                "website_url, social_url FROM organization_profile_revisions "
+                "WHERE organization_id = %s ORDER BY profile_order DESC LIMIT 1",
+                (context.organization_id,),
+            ).fetchone()
+        if profile:
+            values = dict(zip(
+                ("id", "organization_name", "about_organization", "desired_outcome",
+                 "website_url", "social_url"), profile, strict=True,
+            ))
+            fields = profile_fields(question, values["organization_name"])
+            if fields:
+                parts = [values[field] or f"No {field.replace('_', ' ')} is recorded in the company profile."
+                         for field in fields]
+                return {
+                    "status": "supported", "plan": "confirmed_profile", "profile": {
+                        "id": values["id"], "field": fields[0], "value": "\n\n".join(parts),
+                    },
+                    "passages": [], "citations": [{"id": values["id"]}], "coverage": True,
+                }
     historical = valid_time is not None or blueprint_id is not None
+    current_only = not (valid_time or recorded_time or blueprint_id)
     valid_time = valid_time or datetime.now(UTC)
     recorded_time = recorded_time or datetime.now(UTC)
     started = perf_counter()
@@ -189,6 +222,27 @@ def retrieve(
                 "AND confirmed_at <= %s",
                 (context.organization_id, blueprint_id, recorded_time),
             ).fetchone()
+        elif current_only:
+            active = connection.execute(
+                "SELECT b.id, b.blueprint_version, c.workflow_name FROM blueprints b "
+                "LEFT JOIN onboarding_cases c ON (c.organization_id, c.blueprint_id) = (b.organization_id, b.id) "
+                "WHERE b.organization_id = %s AND b.status = 'active' AND b.confirmed_at <= %s "
+                "AND coalesce(b.effective_at, b.confirmed_at) <= %s ORDER BY b.blueprint_version DESC",
+                (context.organization_id, recorded_time, valid_time),
+            ).fetchall()
+            if len(active) > 1 and aggregate is None:
+                matches = [item for item in active if item[2] and item[2].casefold() in question.casefold()]
+                matches = matches or [
+                    item for item in active if item[2] and re.search(
+                        r"(?<!\w)" + re.escape(WORKFLOW_SUFFIX.sub("", item[2])) + r"(?!\w)",
+                        question, re.IGNORECASE,
+                    )
+                ]
+                if len(matches) != 1:
+                    return {"status": "unknown", "reason": "Choose a workflow", "plan": plan,
+                            "passages": [], "citations": [], "coverage": False}
+                active = matches
+            blueprint = active[0] if active else None
         else:
             blueprint = connection.execute(
                 "SELECT id, blueprint_version FROM blueprints WHERE organization_id = %s "

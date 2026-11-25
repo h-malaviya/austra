@@ -60,6 +60,41 @@ test("chat is deleted only after the site modal is confirmed", async () => {
   expect(window.confirm).not.toHaveBeenCalled();
 });
 
+test("Escape dismisses the sidebar menu, page links, and drawer in order", async () => {
+  const title = "Quartz suppliers and November inventory reconciliation";
+  window.fetch = jest.fn(async () => ({ ok: true, json: async () => [{ id: "chat-1", title }] }));
+  await window.testLoadChats();
+
+  const drawer = document.getElementById("sidebar");
+  const pages = document.getElementById("sidebarPages");
+  const menuButton = document.getElementById("menuButton");
+  const chat = drawer.querySelector(".chat-link");
+  const chatMenu = drawer.querySelector(".chat-menu-trigger");
+  const escape = () => document.activeElement.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })
+  );
+
+  expect(chat.textContent).toBe(title);
+  expect(chat.compareDocumentPosition(pages) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  menuButton.click();
+  pages.open = true;
+  chatMenu.click();
+  drawer.querySelector(".chat-menu-delete").focus();
+
+  escape();
+  expect(chatMenu.getAttribute("aria-expanded")).toBe("false");
+  expect(document.activeElement).toBe(chatMenu);
+  expect(pages.open).toBe(true);
+  expect(drawer.classList.contains("open")).toBe(true);
+
+  escape();
+  expect(pages.open).toBe(false);
+  expect(document.activeElement).toBe(document.getElementById("sidebarPagesToggle"));
+  escape();
+  expect(menuButton.getAttribute("aria-expanded")).toBe("false");
+  expect(document.activeElement).toBe(menuButton);
+});
+
 test("errors use the same site modal instead of a browser alert", () => {
   window.testShowError("Could not save the chat.");
   const dialog = document.querySelector('[role="dialog"]');

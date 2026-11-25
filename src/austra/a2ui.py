@@ -120,8 +120,26 @@ def _draft_card(surface: Surface, draft: dict[str, Any]) -> str:
     return surface.card(children)
 
 
-def chat_surfaces(files: Files, chat_id: str) -> list[dict[str, Any]]:
-    chat = files.chat(chat_id)
+def workspace_consent_surface(
+    message_id: str, app: str, workflow_id: str | None = None
+) -> dict[str, Any]:
+    surface = Surface(f"workspace_consent_{message_id}")
+    buttons = [
+        surface.button("Connect Google Workspace", "connect_google_workspace", {}),
+        surface.button("Check access", "check_google_workspace", {}),
+    ]
+    return {
+        "id": surface.id,
+        "kind": "workspace_consent",
+        "message_id": message_id,
+        "app": app,
+        "workflow_id": workflow_id,
+        "messages": surface.messages(surface.add("Row", children=buttons)),
+    }
+
+
+def chat_surfaces(files: Files, chat: dict[str, Any]) -> list[dict[str, Any]]:
+    chat_id = chat["id"]
     surfaces = []
     for message in chat["messages"]:
         if message["role"] == "assistant" and isinstance(message.get("report"), dict):
@@ -156,6 +174,7 @@ def chat_surfaces(files: Files, chat_id: str) -> list[dict[str, Any]]:
             {
                 "id": surface.id,
                 "kind": "draft",
+                "can_prepare_workflow": draft["kind"] == "workflow" and draft["status"] == "approved",
                 "source": draft["content"],
                 "messages": surface.messages(_draft_card(surface, draft)),
             }

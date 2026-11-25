@@ -2,8 +2,8 @@
   {
     "feature": "retrieval",
     "owner": "retrieval",
-    "public_entrypoints": ["retrieval/service.py", "retrieval/context.py", "retrieval/routes.py"],
-    "tables": ["evidence_sources", "evidence_revisions", "evidence_chunks", "semantic_revision_embeddings", "blueprint_members", "business_objects"],
+    "public_entrypoints": ["retrieval/service.py", "retrieval/context.py", "retrieval/profile.py", "retrieval/workspace_status.py", "retrieval/routes.py"],
+    "tables": ["evidence_sources", "evidence_revisions", "evidence_chunks", "semantic_revision_embeddings", "blueprint_members", "business_objects", "organization_profile_revisions", "organization_tours", "users", "blueprint_candidates", "integration_connections"],
     "events": [],
     "skills": ["retrieving-evidence"],
     "tests": ["tests/test_retrieval.py"],
@@ -22,11 +22,11 @@
   {
     "feature": "onboarding",
     "owner": "onboarding",
-    "public_entrypoints": ["onboarding/service.py", "onboarding/routes.py"],
-    "tables": ["onboarding_cases", "blueprints", "lifecycle_events"],
-    "events": ["organization.created"],
-    "skills": [],
-    "tests": ["tests/test_proactive_foundation.py"],
+    "public_entrypoints": ["onboarding/service.py", "onboarding/routes.py", "onboarding/profile.py"],
+    "tables": ["onboarding_cases", "blueprints", "lifecycle_events", "organization_profile_revisions"],
+    "events": ["organization.created", "onboarding.case_initialized", "onboarding.source_rejected", "onboarding.source_excluded", "onboarding.source_included"],
+    "skills": ["eliciting-requirements", "planning-workflow-solutions"],
+    "tests": ["tests/test_proactive_foundation.py", "tests/test_onboarding_evidence.py", "tests/test_tour_regression.py", "tests/test_model_led_onboarding.py", "tests/test_discovery_workflow_draft.py"],
     "legacy_seams": ["platform/routes.py", "web.py"]
   },
   {
@@ -72,11 +72,51 @@
   {
     "feature": "semantic_blueprints",
     "owner": "semantics",
-    "public_entrypoints": ["semantics/service.py", "semantics/routes.py"],
+    "public_entrypoints": ["semantics/service.py", "semantics/routes.py", "semantics/workflow_definition.py", "semantics/purchase_workflow.py"],
     "tables": ["semantic_objects", "semantic_revisions", "semantic_edges", "source_claims", "blueprint_candidates", "blueprint_members", "blueprint_manifests"],
     "events": ["blueprint.candidate_confirmed"],
     "skills": ["eliciting-requirements", "modeling-organization"],
-    "tests": ["tests/test_semantic_blueprints.py"],
+    "tests": ["tests/test_semantic_blueprints.py", "tests/test_capability_runtime.py"],
     "legacy_seams": ["onboarding/service.py", "build_release/service.py", "files.py"]
+  },
+  {
+    "feature": "released_workflow_chat",
+    "owner": "capabilities",
+    "public_entrypoints": ["capabilities/chat.py", "capabilities/routes.py", "static/workflow-chat.js"],
+    "tables": ["organization_chats", "organization_chat_messages"],
+    "events": ["capability.command"],
+    "skills": [],
+    "tests": ["tests/organization_admin.test.js", "tests/test_capability_runtime.py"],
+    "legacy_seams": ["static/app.js"]
+  },
+  {
+    "feature": "department_workflow_planning",
+    "owner": "onboarding",
+    "public_entrypoints": ["onboarding/workflow_plans.py", "semantics/workflow_definition.py", "static/workflow-planning.js"],
+    "tables": ["department_workflow_plans", "onboarding_cases", "blueprint_candidates", "evidence_sources"],
+    "events": [],
+    "skills": ["eliciting-requirements", "planning-workflow-solutions"],
+    "tests": ["tests/test_semantic_blueprints.py", "tests/organization_admin.test.js"],
+    "legacy_seams": ["static/app.js"]
+  },
+  {
+    "feature": "workflow_gmail_delivery",
+    "owner": "integrations",
+    "public_entrypoints": ["integrations/email_jobs.py", "integrations/email_delivery_recovery.py", "integrations/gmail_replies.py", "integrations/gmail_reply_worker.py", "integrations/reply_recovery.py", "integrations/routes.py", "integrations/automatic_replies.py", "capabilities/email_automation.py", "build_release/monitoring.py"],
+    "tables": ["outbox_jobs", "integration_executions", "capability_action_receipts", "capability_record_revisions", "workflow_reply_evidence", "workflow_notifications", "workflow_automatic_replies"],
+    "events": ["capability.email_reply_captured", "capability.email_reply_processed", "capability.reply_recovery", "capability.automatic_email_transition"],
+    "skills": [],
+    "tests": ["tests/test_integration_gateway.py", "tests/test_integration_oauth.py", "tests/test_semantic_blueprints.py", "tests/organization_admin.test.js"],
+    "legacy_seams": ["web.py", "external_mcp_server.py"]
+  },
+  {
+    "feature": "workflow_google_workspace_consent",
+    "owner": "integrations",
+    "public_entrypoints": ["integrations/workspace_oauth.py", "integrations/google_workspace.py", "a2ui.py", "onboarding/routes.py", "static/app.js"],
+    "tables": ["integration_connections", "onboarding_cases", "organization_tours"],
+    "events": [],
+    "skills": [],
+    "tests": ["tests/test_integration_oauth.py", "tests/app_tour.test.js"],
+    "legacy_seams": ["web.py"]
   }
 ]

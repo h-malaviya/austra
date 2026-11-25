@@ -68,16 +68,18 @@ def observed_message(
     client: Any, stage: str, *, on_text: Callable[[str], None] | None = None, **kwargs: Any
 ) -> Any:
     """Call Anthropic and record provider usage without exporting message content."""
+    # Anthropic keys cache entries to the exact prompt, so a prompt edit creates a new entry.
+    request = {"cache_control": {"type": "ephemeral"}, **kwargs}
     langfuse = _client()
     if langfuse is None:
-        return _create_message(client, on_text, kwargs)
+        return _create_message(client, on_text, request)
     with langfuse.start_as_current_observation(
         name=stage,
         as_type="generation",
-        model=kwargs["model"],
-        model_parameters={"max_tokens": kwargs["max_tokens"]},
+        model=request["model"],
+        model_parameters={"max_tokens": request["max_tokens"]},
     ) as generation:
-        response = _create_message(client, on_text, kwargs)
+        response = _create_message(client, on_text, request)
         usage = getattr(response, "usage", None)
         if usage is not None:
             details = {

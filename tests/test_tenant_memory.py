@@ -287,5 +287,24 @@ def test_organization_ask_persists_and_deletes_chat(database, monkeypatch, tmp_p
     assert "event: accepted" in streamed.text
     assert "event: done" in streamed.text
     assert len(client.get(f"/api/org/chats/{chat_id}").json()["chat"]["messages"]) == 6
+    monkeypatch.setattr(
+        "austra.retrieval.routes.ModelCredentials.get", lambda *_args: "fixture-key"
+    )
+    monkeypatch.setattr(
+        "austra.retrieval.routes.extract_memory_update", lambda *_args, **_kwargs: MemoryUpdate()
+    )
+
+    def fail_memory_update(*_args, **_kwargs):
+        raise RuntimeError("memory unavailable")
+
+    monkeypatch.setattr("austra.retrieval.routes.save_memory_update", fail_memory_update)
+    after_memory_failure = client.post(
+        "/api/org/ask/stream",
+        headers=headers,
+        json={"question": "How many active records now?", "chat_id": chat_id},
+    )
+    assert "event: done" in after_memory_failure.text
+    assert "event: error" not in after_memory_failure.text
+    assert len(client.get(f"/api/org/chats/{chat_id}").json()["chat"]["messages"]) == 8
     assert client.delete(f"/api/org/chats/{chat_id}", headers=headers).status_code == 200
     assert client.get(f"/api/org/chats/{chat_id}").status_code == 404

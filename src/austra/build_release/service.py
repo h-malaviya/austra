@@ -68,7 +68,7 @@ def create_build(
     context.require("workflows.approve")
     with tenant_transaction(connection, context):
         blueprint = connection.execute(
-            "SELECT status FROM blueprints WHERE organization_id = %s AND id = %s",
+            "SELECT status FROM blueprints WHERE organization_id = %s AND id = %s FOR UPDATE",
             (context.organization_id, blueprint_id),
         ).fetchone()
         if blueprint is None:
@@ -266,6 +266,16 @@ def fix_defect(
     return {"id": new_build_id, "blueprint_id": build[0], "build_revision": next_revision}
 
 
+def workflow_keys(manifest: dict) -> set[tuple[str, str]]:
+    keys = {("projection", view["key"]) for view in manifest.get("projections", [])}
+    if manifest.get("engine") == "state_machine":
+        for cap in manifest["capabilities"]:
+            keys.update({("capability", cap["key"]), ("record", cap["record_kind"])})
+    else:
+        keys.update(("record", kind) for kind in ("sales_order", "stock_lot", "purchase_order", "email_proposal"))
+    return keys
+
+
 def publish(
     connection: psycopg.Connection,
     context: TenantContext,
@@ -277,7 +287,7 @@ def publish(
     with tenant_transaction(connection, context):
         gate = connection.execute(
             "SELECT p.content_hash, m.manifest, a.blueprint_hash, a.verification, "
-            "a.preview_state, a.rollback_plan FROM builds b "
+            "a.preview_state, a.rollback_plan, a.manifest FROM builds b "
             "JOIN blueprints p ON p.id = b.blueprint_id "
             "JOIN blueprint_manifests m ON m.blueprint_id = p.id "
             "LEFT JOIN capability_build_artifacts a ON a.build_id = b.id "
@@ -322,10 +332,34 @@ def publish(
         blueprint_id, _revision = _transition(
             connection, context, build_id, "released", expected_revision, correlation_id
         )
+        connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                           (str(context.organization_id),))
+        scope = connection.execute(
+            "SELECT CASE WHEN workflow_name IS NOT NULL THEN coalesce(workflow_root_id, id) END "
+            "FROM onboarding_cases WHERE organization_id = %s AND blueprint_id = %s",
+            (context.organization_id, blueprint_id),
+        ).fetchone()
+        lineage = scope[0] if scope else None
+        # Preserve the rollback chain of builds published before workflow-specific releases.
+        if connection.execute(
+            "SELECT 1 FROM releases WHERE organization_id = %s AND blueprint_id = %s "
+            "AND workflow_case_id IS NULL LIMIT 1", (context.organization_id, blueprint_id),
+        ).fetchone():
+            lineage = None
+        if gate[6]:
+            neighbors = connection.execute(
+                "SELECT DISTINCT a.manifest FROM releases r JOIN capability_build_artifacts a "
+                "ON (a.organization_id, a.build_id) = (r.organization_id, r.build_id) "
+                "WHERE r.organization_id = %s AND r.workflow_case_id IS DISTINCT FROM %s",
+                (context.organization_id, lineage),
+            ).fetchall()
+            keys = workflow_keys(gate[6])
+            if any(keys & workflow_keys(row[0]) for row in neighbors):
+                raise ValueError("A different workflow owns a capability, record kind or view with the same key")
         previous = connection.execute(
             "SELECT id, blueprint_id FROM releases WHERE organization_id = %s "
-            "AND state = 'active' FOR UPDATE",
-            (context.organization_id,),
+            "AND workflow_case_id IS NOT DISTINCT FROM %s AND state = 'active' FOR UPDATE",
+            (context.organization_id, lineage),
         ).fetchone()
         if previous:
             connection.execute(
@@ -345,13 +379,13 @@ def publish(
         )
         release_id = connection.execute(
             "INSERT INTO releases (organization_id, blueprint_id, build_id, "
-            "rollback_release_id, approved_by) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            "rollback_release_id, approved_by, workflow_case_id) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
             (
                 context.organization_id,
                 blueprint_id,
                 build_id,
                 previous[0] if previous else None,
-                context.actor.user_id,
+                context.actor.user_id, lineage,
             ),
         ).fetchone()[0]
         connection.execute(

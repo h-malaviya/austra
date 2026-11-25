@@ -3,9 +3,12 @@ import { A2uiLitElement, basicCatalog } from "@a2ui/lit/v0_9";
 import { css, html, nothing } from "lit";
 import { z } from "zod";
 import { reportTableImplementation } from "./report-table.js";
+import { workflowGraphImplementation } from "./workflow-graph.js";
+import { workflowInputImplementation } from "./workflow-input.js";
 
 const chartRow = z.object({
   label: z.string().max(120),
+  key: z.string().optional(),
   first: z.string(),
   second: z.string().nullable(),
   first_label: z.string(),
@@ -58,7 +61,7 @@ class AustraBarChart extends A2uiLitElement {
     .label { overflow-wrap: anywhere; font-size: 12px; font-weight: 650; }
     .track { display: flex; height: 17px; border-radius: 4px; background: var(--color-accent-soft); overflow: hidden; }
     .value-track { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; }
-    .value { min-width: 52px; color: var(--theme-accent); font-size: 12px; font-weight: 750; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+    .value { color: var(--theme-accent); font-size: 12px; font-weight: 750; font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
     .bar { display: block; height: 100%; background: var(--theme-accent); }
     .bar.second { background: var(--theme-warning); }
     .pair { display: grid; gap: 3px; }
@@ -66,11 +69,10 @@ class AustraBarChart extends A2uiLitElement {
     .unknown { color: var(--theme-muted); font-size: 11px; }
     .detail { margin-top: 13px; padding: 11px 12px; border-radius: 8px; background: var(--color-accent-soft); color: var(--theme-ink); font-size: 12px; line-height: 1.5; }
     .detail strong { display: block; margin-bottom: 2px; }
-    .tooltip { position: absolute; z-index: 10; top: calc(100% + 5px); right: 8px; width: min(300px, calc(100% - 16px)); padding: 12px 14px; border: 1px solid var(--theme-border); border-radius: 10px; background: var(--theme-surface); box-shadow: 0 12px 30px var(--color-shadow); color: var(--theme-ink); font-size: 12px; }
-    .tooltip.above { top: auto; bottom: calc(100% + 5px); }
+    .tooltip { margin: 4px 0 8px; padding: 12px; border: 1px solid var(--theme-border); border-radius: 8px; background: var(--theme-surface); color: var(--theme-ink); font-size: 12px; overflow-wrap: anywhere; }
     .tooltip strong { display: block; margin-bottom: 8px; font-size: 13px; }
     .tooltip dl { display: grid; gap: 5px; margin: 0; }
-    .tooltip dl > div { display: flex; justify-content: space-between; gap: 12px; }
+    .tooltip dl > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
     .tooltip dt { color: var(--theme-muted); }
     .tooltip dd { margin: 0; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
     @media (max-width: 540px) { button { grid-template-columns: 1fr; gap: 5px; } }
@@ -79,24 +81,33 @@ class AustraBarChart extends A2uiLitElement {
   constructor() {
     super();
     this.selectedIndex = 0;
-    this.hoverIndex = null;
     this.pinnedIndex = null;
+    this.hoverIndex = null;
   }
 
   dismissTooltip(event) {
     if (event.key === "Escape") {
-      this.hoverIndex = null;
+      const previouslySelected = this.controller?.props?.rows[this.pinnedIndex];
       this.pinnedIndex = null;
+      this.hoverIndex = null;
+      if (previouslySelected?.key !== undefined) this.changeGroup(null);
       event.stopPropagation();
     }
   }
 
-  tooltip(row, unit, mode, above) {
+  changeGroup(row) {
+    this.dispatchEvent(new CustomEvent("austra-chart-select", {
+      bubbles: true, composed: true,
+      detail: row ? { key: row.key, label: row.label } : { key: null }
+    }));
+  }
+
+  tooltip(row, unit, mode) {
     const details = row.details ?? [
       { label: row.first_label, value: measure(row.first, unit) },
       ...(mode === "single" ? [] : [{ label: row.second_label, value: measure(row.second, unit) }])
     ];
-    return html`<div id="chart-tooltip" role="tooltip" class=${above ? "tooltip above" : "tooltip"}>
+    return html`<div id="chart-tooltip" class="tooltip" role="tooltip">
       <strong>${row.label}</strong>
       <dl>${details.map(item => html`<div><dt>${item.label}</dt><dd>${item.value}</dd></div>`)}</dl>
     </div>`;
@@ -116,23 +127,19 @@ class AustraBarChart extends A2uiLitElement {
       <div class="legend"><span><i class="swatch"></i>${rows[0]?.first_label}</span>
         ${mode === "single" ? nothing : html`<span><i class="swatch second"></i>${rows[0]?.second_label}</span>`}</div>
       <div class="rows">${rows.map((row, index) => html`<div class="chart-row"
-        @mouseenter=${() => { this.hoverIndex = index; }}
+        @mouseenter=${() => { if (row.key === undefined) this.hoverIndex = index; }}
         @mouseleave=${() => { if (this.hoverIndex === index) this.hoverIndex = null; }}>
         <button type="button" aria-pressed=${mode === "single" ? this.pinnedIndex === index : index === this.selectedIndex}
           aria-expanded=${activeIndex === index}
-          aria-describedby=${activeIndex === index ? "chart-tooltip" : nothing}
+          aria-describedby=${activeIndex === index && row.key === undefined ? "chart-tooltip" : nothing}
           aria-label=${mode === "single" ? `${row.label}: ${row.first_label} ${row.first} ${unit}` : `${row.label}: ${row.first_label} ${row.first} ${unit}; ${row.second_label} ${row.second ?? "unknown"} ${row.second === null ? "" : unit}`}
-          @focus=${() => { this.hoverIndex = index; }}
-          @blur=${() => { if (this.pinnedIndex !== index) this.hoverIndex = null; }}
+          @focus=${() => { if (row.key === undefined) this.hoverIndex = index; }}
+          @blur=${() => { this.hoverIndex = null; }}
           @keydown=${event => this.dismissTooltip(event)}
           @click=${() => {
             this.selectedIndex = index;
-            if (this.pinnedIndex === index) {
-              this.pinnedIndex = null;
-              this.hoverIndex = null;
-            } else {
-              this.pinnedIndex = index;
-            }
+            this.pinnedIndex = this.pinnedIndex === index ? null : index;
+            if (row.key !== undefined) this.changeGroup(this.pinnedIndex === null ? null : row);
           }}>
           <span class="label">${row.label}</span>
           ${mode === "single"
@@ -142,8 +149,9 @@ class AustraBarChart extends A2uiLitElement {
             : html`<span class="pair"><span class="track"><span class="bar" style=${`width:${width(row.first, maximum)}`}></span></span>
                 ${row.second === null ? html`<span class="unknown">Available stock unknown</span>` : html`<span class="track"><span class="bar second" style=${`width:${width(row.second, maximum)}`}></span></span>`}</span>`}
         </button>
-        ${activeIndex === index ? this.tooltip(row, unit, mode, rows.length > 3 && index >= rows.length - 2) : nothing}
       </div>`)}</div>
+      ${rows[activeIndex] && rows[activeIndex].key === undefined
+        ? this.tooltip(rows[activeIndex], unit, mode) : nothing}
       ${selected && mode !== "single" ? html`<div class="detail" role="status"><strong>${selected.label}</strong>
         ${selected.first_label}: ${selected.first} ${unit}${mode === "single" ? nothing : html` · ${selected.second_label}: ${selected.second ?? "Unknown"}${selected.second === null ? "" : ` ${unit}`}`}
       </div>` : nothing}
@@ -156,6 +164,7 @@ customElements.define(AustraBarChart.tagName, AustraBarChart);
 
 export const reportCatalog = new Catalog(
   "https://austra.local/catalogs/report.json", "0.9",
-  [...basicCatalog.components.values(), { ...chartApi, tagName: AustraBarChart.tagName }, reportTableImplementation],
+  [...basicCatalog.components.values(), { ...chartApi, tagName: AustraBarChart.tagName },
+    reportTableImplementation, workflowGraphImplementation, workflowInputImplementation],
   [...basicCatalog.functions.values()]
 );

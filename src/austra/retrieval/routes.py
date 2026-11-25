@@ -24,10 +24,19 @@ from austra.memory import (
     extract_memory_update,
 )
 from austra.observability import trace_turn
+from austra.onboarding.discovery import workflow_draft_requested
 from austra.onboarding.routes import discovery_status_requested
 from austra.platform.auth import SaasIdentity
 from austra.retrieval.context import answer_packet
+from austra.retrieval.profile import own_role_answer, own_role_requested
 from austra.retrieval.service import retrieve
+from austra.retrieval.workspace_status import (
+    blocked_action_answer,
+    blocked_action_requested,
+    secret_disclosure_requested,
+    workspace_status,
+    workspace_status_requested,
+)
 from austra.tenant.context import TenantContext
 from austra.tenant.memory import (
     add_assistant_message,
@@ -42,6 +51,7 @@ from austra.tenant.memory import (
 from austra.tenant.memory import (
     delete_chat as delete_stored_chat,
 )
+from austra.tenant.permissions.evaluator import permits
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +66,52 @@ class RetrievalInput(BaseModel):
 
 
 def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
-    def chat_context(request: Request) -> TenantContext:
+    def chat_context(request: Request, department_id: UUID | None = None) -> TenantContext:
         actor, _remaining = identity.session(request.cookies.get("austra_session"))
         if actor is None or request.state.organization_slug in {None, "platform"}:
             raise HTTPException(status_code=403, detail="Organization session required")
         context = TenantContext.from_auth(actor)
-        context.require("chat.use")
+        if context.actor.role == "employee" and department_id is None:
+            if not any(
+                permits(context.actor, context.organization_id, grant.department_id, "chat.use")
+                for grant in context.actor.grants
+            ):
+                raise HTTPException(status_code=403, detail="You do not have access to chat.")
+        else:
+            context.require("chat.use", department_id)
         return context
+
+    def ask_department(context: TenantContext, requested: UUID | None) -> UUID | None:
+        if context.actor.role != "employee" or requested is not None:
+            return requested
+        available = [
+            grant.department_id for grant in context.actor.grants
+            if permits(context.actor, context.organization_id, grant.department_id, "chat.use")
+        ]
+        return available[0] if len(available) == 1 else None
+
+    @app.get("/api/org/ask/departments")
+    def ask_departments(request: Request):
+        actor, _remaining = identity.session(request.cookies.get("austra_session"))
+        if actor is None or request.state.organization_slug in {None, "platform"}:
+            raise HTTPException(status_code=403, detail="Organization session required")
+        try:
+            context = TenantContext.from_auth(actor)
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+        if context.actor.role != "employee":
+            return []
+        allowed = [
+            grant.department_id for grant in context.actor.grants
+            if permits(context.actor, context.organization_id, grant.department_id, "chat.use")
+        ]
+        with identity.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name FROM departments WHERE organization_id = %s "
+                "AND id = ANY(%s) AND archived_at IS NULL ORDER BY name",
+                (context.organization_id, allowed),
+            ).fetchall()
+        return [{"id": str(identifier), "name": name} for identifier, name in rows]
 
     @app.get("/api/org/chats")
     def organization_chats(request: Request):
@@ -95,6 +144,8 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
             raise HTTPException(status_code=403, detail="Organization session required")
         try:
             context = TenantContext.from_auth(actor)
+            if context.actor.role == "employee" and payload.department_id is None:
+                raise ValueError("Choose a department for this question")
             with identity.connect() as connection:
                 result = retrieve(connection, context, **payload.model_dump(exclude={"chat_id"}))
                 if result["status"] == "unknown":
@@ -115,7 +166,9 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
         on_text: Callable[[str], None] | None = None,
         on_accepted: Callable[[UUID, UUID], None] | None = None,
     ) -> dict:
-        context = chat_context(request)
+        context = chat_context(request, payload.department_id)
+        department_id = ask_department(context, payload.department_id)
+        payload = payload.model_copy(update={"department_id": department_id})
         started = perf_counter()
         with identity.connect() as connection:
             try:
@@ -136,7 +189,51 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
             if request.state.organization_slug == os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG")
             else ModelCredentials(identity.legacy_root).get(context.organization_id)
         )
-        if discovery_status_requested(payload.question):
+        if secret_disclosure_requested(payload.question):
+            evidence = {"status": "not_applicable"}
+            answer = {
+                "status": "not_applicable",
+                "answer": "I can't display a saved API key or other credential. Test or replace it in Connections.",
+                "citation_ids": [],
+            }
+        elif own_role_requested(payload.question):
+            with identity.connect() as connection:
+                answer = own_role_answer(connection, context, payload.question)
+            evidence = {"status": "not_applicable"}
+        elif blocked_action_requested(payload.question):
+            with identity.connect() as connection:
+                answer = blocked_action_answer(connection, context, payload.question)
+            evidence = {"status": "not_applicable"}
+        elif context.actor.role == "employee" and department_id is None:
+            answer = {
+                "status": "not_applicable",
+                "answer": "Please choose which department you're asking about so I can use the right access rules.",
+                "citation_ids": [],
+            }
+            evidence = {"status": "not_applicable"}
+        elif workflow_draft_requested(payload.question):
+            evidence = {"status": "not_applicable"}
+            answer = {"status": "not_applicable", "citation_ids": [],
+                      "answer": ("Open Plan a process to create or revise a named workflow draft."
+                                 if context.actor.role == "org_admin"
+                                 else "Ask your organization administrator to create or revise a workflow.")}
+        elif workspace_status_requested(payload.question):
+            if context.actor.role == "org_admin":
+                with identity.connect() as connection:
+                    answer = workspace_status(connection, context)
+                evidence = {"status": "supported", "plan": "workspace_status"}
+            else:
+                answer = {
+                    "status": "not_applicable",
+                    "answer": (
+                        "I can answer from approved information available to your department. "
+                        "I can't view organization-wide onboarding drafts, connection settings, "
+                        "or external action records. Ask an organization admin for that status."
+                    ),
+                    "citation_ids": [],
+                }
+                evidence = {"status": "not_applicable"}
+        elif discovery_status_requested(payload.question):
             evidence = {"status": "not_applicable"}
             answer = {
                 "status": "not_applicable",
@@ -146,10 +243,26 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
                 ),
                 "citation_ids": [],
             }
+        elif context.actor.role == "employee" and not all(
+            permits(context.actor, context.organization_id, department_id, permission)
+            for permission in ("evidence.read", "policies.read")
+        ):
+            answer = {
+                "status": "not_applicable",
+                "answer": (
+                    "I can't access approved evidence for your department with your current role. "
+                    "Ask a department manager to review the information or your access."
+                ),
+                "citation_ids": [],
+            }
+            evidence = {"status": "not_applicable"}
         else:
             evidence = packet(request, payload)
-            if evidence["status"] == "unknown" or evidence.get("aggregate"):
-                answer = answer_packet(None, payload.question, evidence)
+            if evidence["status"] == "unknown" or evidence.get("aggregate") or evidence.get("profile"):
+                answer = answer_packet(
+                    None, payload.question, evidence,
+                    administrator=context.actor.role == "org_admin",
+                )
             else:
                 if not key:
                     raise HTTPException(
@@ -177,7 +290,7 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
                                 "recent_messages": prior_chat["messages"][-8:],
                                 "memory": memory,
                             },
-                            on_text=on_text,
+                            administrator=context.actor.role == "org_admin",
                         )
                 except ValueError as error:
                     _measure(
@@ -193,7 +306,9 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
                     raise HTTPException(status_code=422, detail=str(error)) from error
         with identity.connect() as connection:
             add_assistant_message(connection, context, chat_id, answer["answer"])
-            if key and evidence["status"] != "not_applicable":
+            result_chat = stored_chat(connection, context, chat_id)
+        if key and evidence["status"] != "not_applicable":
+            try:
                 update = extract_memory_update(
                     key,
                     payload.question,
@@ -207,12 +322,17 @@ def install_retrieval_routes(app: FastAPI, identity: SaasIdentity) -> None:
                         or memory["pending_message_count"] + 1 >= MEMORY_COMPACTION_MESSAGES
                     ),
                 )
-                save_memory_update(
-                    connection, context, "ask", chat_id, message_id, payload.question, update
-                )
-            result_chat = stored_chat(connection, context, chat_id)
+                with identity.connect() as connection:
+                    save_memory_update(
+                        connection, context, "ask", chat_id, message_id, payload.question, update
+                    )
+            except Exception:
+                logger.exception("Organization chat memory update failed after answer was saved")
         if evidence["status"] != "not_applicable":
-            _measure(request, message_id, answer, started)
+            try:
+                _measure(request, message_id, answer, started)
+            except Exception:
+                logger.exception("Organization answer metric failed after answer was saved")
         return {"evidence": evidence, "answer": answer, "chat": result_chat}
 
     @app.post("/api/org/ask")

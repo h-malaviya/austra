@@ -14,8 +14,10 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from docx import Document
@@ -37,7 +39,7 @@ from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from austra.a2ui import chat_surfaces, workspace_page
+from austra.a2ui import chat_surfaces, workspace_consent_surface, workspace_page
 from austra.a2ui_tables import markdown_tables, table_summary
 from austra.access import CONNECTORS, GUIDES, SESSION_TTL_SECONDS, VISIBLE_FIELDS, Access
 from austra.admin_intents import (
@@ -60,8 +62,11 @@ from austra.connectors import VERIFIERS, Verifier, exchange_gmail_code, gmail_au
 from austra.files import SECRET_PATTERN, Files
 from austra.imports import import_chat_tables, inspect_chat_table
 from austra.infrastructure import Infrastructure, InfrastructureError
+from austra.integrations.connections import connect_gmail, workspace_access_missing
+from austra.integrations.gmail_reply_worker import run_gmail_reply_worker
 from austra.integrations.model_credentials import ModelCredentials
-from austra.integrations.routes import install_integration_routes
+from austra.integrations.routes import GMAIL_OAUTH_CALLBACK_PATH, install_integration_routes
+from austra.integrations.workspace_oauth import WORKSPACE_STATE_PREFIX, install_workspace_oauth
 from austra.mail_draft import is_requirement_mail_request, requirement_email, requirement_pdf
 from austra.material_plan import (
     build_material_plan,
@@ -81,6 +86,7 @@ from austra.memory import (
 )
 from austra.observability import trace_turn
 from austra.onboarding.routes import install_onboarding_routes
+from austra.onboarding.workflow_plans import install_workflow_plan_routes
 from austra.pdf_text import PDFExtractionError, extract_pdf_text
 from austra.platform.auth import SaasIdentity
 from austra.platform.routes import install_platform_routes
@@ -91,11 +97,13 @@ from austra.reports import (
     stock_report,
 )
 from austra.retrieval.routes import install_retrieval_routes
+from austra.semantics.purchase_workflow import prepare_purchase_workflow
 from austra.semantics.routes import install_semantic_routes
 from austra.skills import PLATFORM_SKILLS
 from austra.slack import event_message, verify_signature
 from austra.slack_socket import run_socket_mode
 from austra.supplier_plan import supplier_shortlist, supplier_shortlist_reply
+from austra.tenant.context import TenantContext, tenant_transaction
 from austra.tenant.manager_routes import install_manager_routes
 from austra.tenant.routes import install_tenant_routes
 
@@ -107,6 +115,7 @@ MAX_ATTACHMENT_TEXT_CHARS = 20000
 DIRECT_TABLE_IMPORT_BYTES = 20 * 1024
 SUPPORTED_ATTACHMENTS = {".pdf", ".docx", ".csv", ".txt", ".md", ".xlsx"}
 SESSION_COOKIE = "austra_session"
+LEGACY_GMAIL_CALLBACK_PATH = "/api/connections/gmail/callback"
 OAUTH_STATE_SECONDS = 600
 SAAS_HOST_PATTERN = re.compile(
     r"(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)\.localhost(?::(?P<port>[0-9]{1,5}))?"
@@ -147,6 +156,11 @@ class McpToolInput(BaseModel):
 
 class Review(BaseModel):
     decision: Literal["approved", "rejected"]
+
+
+class PurchaseWorkflowInput(BaseModel):
+    department_id: UUID
+    approval_limit_usd: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
 
 
 def _extract_attachment(filename: str, content: bytes) -> str:
@@ -252,21 +266,16 @@ def create_app(
     jobs_condition = threading.Condition(jobs_lock)
     slack_socket_status = {"connected": False}
     public_url = os.getenv("AUSTRA_PUBLIC_URL", "http://127.0.0.1:8000").rstrip("/")
-    gmail_redirect_uri = f"{public_url}/api/connections/gmail/callback"
-
-    def redirect_uri(request: Request) -> str:
-        if not saas:
-            return gmail_redirect_uri
-        scheme = "https" if public_url.startswith("https://") else "http"
-        return f"{scheme}://{request.headers['host']}/api/connections/gmail/callback"
+    public = urlsplit(public_url)
+    public_port = f":{public.port}" if public.port else ""
+    gmail_callback_origin = f"{public.scheme}://localhost{public_port}" if saas else public_url
+    gmail_redirect_uri = f"{gmail_callback_origin}{LEGACY_GMAIL_CALLBACK_PATH}"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        if saas:
-            yield
-            return
         task = asyncio.create_task(
-            run_socket_mode(access, files, process_socket_event, slack_socket_status)
+            run_gmail_reply_worker(saas.connect, workspace) if saas
+            else run_socket_mode(access, files, process_socket_event, slack_socket_status)
         )
         try:
             yield
@@ -277,14 +286,43 @@ def create_app(
 
     app = FastAPI(title="Austra", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    def workspace_oauth_registration() -> tuple[str, str]:
+        configured = (
+            os.getenv("AUSTRA_GOOGLE_WORKSPACE_CLIENT_ID", ""),
+            os.getenv("AUSTRA_GOOGLE_WORKSPACE_CLIENT_SECRET", ""),
+        )
+        return configured if any(configured) else (
+            access.get("GMAIL_CLIENT_ID"), access.get("GMAIL_CLIENT_SECRET")
+        )
+
+    def workspace_consent_configured() -> bool:
+        return all(workspace_oauth_registration())
+
+    def workflow_planning_key(organization_id: UUID) -> str:
+        configured = model_credentials.get(organization_id)
+        legacy_slug = os.getenv("AUSTRA_LEGACY_ORGANIZATION_SLUG")
+        if configured or not saas or not legacy_slug:
+            return configured
+        with saas.connect() as connection:
+            legacy = connection.execute(
+                "SELECT 1 FROM organizations WHERE id=%s AND slug=%s", (organization_id, legacy_slug),
+            ).fetchone()
+        return access.get("ANTHROPIC_API_KEY") if legacy else ""
+
+    finish_workspace_consent = None
     if saas:
         install_platform_routes(app, saas)
-        install_onboarding_routes(app, saas, model_credentials.get)
+        install_onboarding_routes(app, saas, model_credentials.get, workspace_consent_configured)
+        install_workflow_plan_routes(app, saas, workflow_planning_key)
         install_semantic_routes(app, saas)
         install_retrieval_routes(app, saas)
         install_capability_routes(app, saas)
         install_monitoring_routes(app, saas)
         install_integration_routes(app, saas, workspace)
+        finish_workspace_consent = install_workspace_oauth(
+            app, saas, workspace, gmail_redirect_uri, workspace_oauth_registration,
+        )
         install_tenant_routes(app, saas)
         install_manager_routes(app, saas)
 
@@ -310,7 +348,11 @@ def create_app(
                     scheme = "https" if public_url.startswith("https://") else "http"
                     suffix = f":{port}" if port else ""
                     return RedirectResponse(f"{scheme}://admin.localhost{suffix}/")
-                if request.url.path != "/api/config":
+                if request.url.path not in {
+                    "/api/config",
+                    GMAIL_OAUTH_CALLBACK_PATH,
+                    LEGACY_GMAIL_CALLBACK_PATH,
+                }:
                     return JSONResponse(
                         {"detail": "Use an organization subdomain"}, status_code=404
                     )
@@ -353,13 +395,18 @@ def create_app(
         ):
             return JSONResponse({"detail": "Request verification required"}, status_code=403)
         response = await call_next(request)
-        if request.url.path == "/" or request.url.path.startswith(("/static/", "/api/")):
+        if request.url.path == "/" or request.url.path.startswith(
+            ("/static/", "/api/", "/organization/", "/platform/")
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     def require_admin(request: Request) -> None:
+        require_admin_session(request.cookies.get(SESSION_COOKIE))
+
+    def require_admin_session(session: str | None) -> None:
         if saas:
-            context, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+            context, _remaining = saas.session(session)
             if context is None:
                 raise HTTPException(status_code=401, detail="Sign in required")
             if (
@@ -377,7 +424,7 @@ def create_app(
             if not legacy or context.organization_id != legacy[0]:
                 raise HTTPException(status_code=403, detail="Business workspace unavailable")
             return
-        if not access.authenticated(request.cookies.get(SESSION_COOKIE)):
+        if not access.authenticated(session):
             raise HTTPException(status_code=401, detail="Administrator sign in required")
 
     def require_model_admin(request: Request) -> UUID | None:
@@ -673,7 +720,12 @@ def create_app(
         if result.title.strip() and not files.chat(chat_id).get("title_generated"):
             files.set_chat_title(chat_id, result.title)
         if result.needs_input:
-            result = AgentReply(reply=f"Nothing new was saved. {result.reply}", needs_input=True)
+            result = AgentReply(
+                reply=f"Nothing new was saved. {result.reply}",
+                decision=result.decision,
+                needs_input=True,
+                google_workspace_required=result.google_workspace_required,
+            )
         elif is_rule_suggestion(latest_text) and result.rule_changes:
             result.drafts.extend(
                 Draft(
@@ -933,6 +985,7 @@ def create_app(
             display_body=table_summary(result.reply) if visualize else None,
             visualize=visualize,
             report=verified_material_plan,
+            google_workspace_required=result.google_workspace_required,
         )
         files.record_event(
             "agent.replied",
@@ -1133,8 +1186,12 @@ def create_app(
         }
 
     @app.get("/")
+    @app.get("/workspace")
+    @app.get("/connections")
+    @app.get("/infrastructure")
+    @app.get("/profile")
     def home() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
     @app.get("/platform/organizations")
     @app.get("/platform/organizations/{organization_id}")
@@ -1145,9 +1202,13 @@ def create_app(
 
     @app.get("/organization/departments")
     @app.get("/organization/departments/{department_id}")
+    @app.get("/organization/info")
     @app.get("/organization/people")
     @app.get("/organization/onboarding")
     @app.get("/organization/capability")
+    @app.get("/organization/workflows")
+    @app.get("/organization/workflow-reviews")
+    @app.get("/organization/workflow-planning")
     @app.get("/organization/connections")
     @app.get("/organization/monitoring")
     def organization_page(request: Request, department_id: str | None = None) -> FileResponse:
@@ -1209,7 +1270,7 @@ def create_app(
             "fields": {
                 name: list(VISIBLE_FIELDS.get(name, fields)) for name, fields in CONNECTORS.items()
             },
-            "gmail_redirect_uri": redirect_uri(request),
+            "gmail_redirect_uri": gmail_redirect_uri,
             "slack_socket_connected": slack_socket_status["connected"],
         }
 
@@ -1406,7 +1467,7 @@ def create_app(
         return {"removed": True}
 
     @app.post("/api/connections/gmail/start", dependencies=[Depends(require_admin)])
-    def start_gmail_connection(request: Request) -> dict[str, str]:
+    def start_gmail_connection(request: Request, read_content: bool = False) -> dict[str, str]:
         client_id = access.get("GMAIL_CLIENT_ID")
         if not client_id or not access.get("GMAIL_CLIENT_SECRET"):
             raise HTTPException(status_code=400, detail="Save the Gmail OAuth client details first")
@@ -1415,34 +1476,32 @@ def create_app(
         oauth_states[state] = (
             time.monotonic() + OAUTH_STATE_SECONDS,
             session,
-            request.state.organization_slug if saas else None,
+            f"{public.scheme}://{request.headers['host']}" if saas else None,
         )
         files.record_event("connection.authorization_started", "Admin", "connector", "gmail")
-        return {
-            "authorization_url": gmail_authorization_url(client_id, redirect_uri(request), state)
-        }
+        return {"authorization_url": gmail_authorization_url(
+            client_id, gmail_redirect_uri, state, read_content=read_content,
+        )}
 
-    @app.get("/api/connections/gmail/callback")
+    @app.get(LEGACY_GMAIL_CALLBACK_PATH)
     def finish_gmail_connection(request: Request) -> RedirectResponse:
         state = request.query_params.get("state", "")
+        if finish_workspace_consent and state.startswith(WORKSPACE_STATE_PREFIX):
+            return finish_workspace_consent(request)
+        if saas and request.state.organization_slug is not None:
+            raise HTTPException(status_code=400, detail="Use the localhost Gmail callback")
         pending = oauth_states.pop(state, None)
-        authenticated = (
-            bool(saas.session(pending[1])[0])
-            if saas and pending
-            else access.authenticated(pending[1])
-            if pending
-            else False
-        )
-        if (
-            not pending
-            or pending[0] < time.monotonic()
-            or not authenticated
-            or (saas and pending[2] != request.state.organization_slug)
-        ):
+        try:
+            if not pending or pending[0] < time.monotonic():
+                raise HTTPException(status_code=400)
+            require_admin_session(pending[1])
+        except HTTPException as error:
             files.record_event(
                 "connection.authorization_failed", "unknown", "connector", "gmail", outcome="failed"
             )
-            raise HTTPException(status_code=400, detail="Gmail authorization expired. Try again")
+            raise HTTPException(
+                status_code=400, detail="Gmail authorization expired. Try again"
+            ) from error
         result = "denied"
         code = request.query_params.get("code", "")
         if code and len(code) <= 2048 and not request.query_params.get("error"):
@@ -1451,7 +1510,7 @@ def create_app(
                     code,
                     access.get("GMAIL_CLIENT_ID"),
                     access.get("GMAIL_CLIENT_SECRET"),
-                    redirect_uri(request),
+                    gmail_redirect_uri,
                 )
                 access.save(
                     "gmail", {"GMAIL_REFRESH_TOKEN": refresh_token, "GMAIL_SENDER_EMAIL": email}
@@ -1472,14 +1531,18 @@ def create_app(
             files.record_event(
                 "connection.authorization_failed", "Admin", "connector", "gmail", outcome="failed"
             )
-        response = RedirectResponse(f"/?connection=gmail&oauth={result}", status_code=303)
-        response.set_cookie(
-            SESSION_COOKIE,
-            pending[1],
-            httponly=True,
-            secure=public_url.startswith("https://"),
-            samesite="strict",
+        return_origin = pending[2] or ""
+        response = RedirectResponse(
+            f"{return_origin}/?connection=gmail&oauth={result}", status_code=303
         )
+        if not saas:
+            response.set_cookie(
+                SESSION_COOKIE,
+                pending[1],
+                httponly=True,
+                secure=public_url.startswith("https://"),
+                samesite="strict",
+            )
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
@@ -1505,11 +1568,22 @@ def create_app(
             raise HTTPException(status_code=404, detail="Chat not found") from error
 
     @app.get("/api/ui/chats/{chat_id}", dependencies=[Depends(require_admin)])
-    def get_chat_ui(chat_id: str) -> dict[str, Any]:
+    def get_chat_ui(chat_id: str, request: Request) -> dict[str, Any]:
         try:
-            return {"surfaces": chat_surfaces(files, chat_id)}
+            chat = files.chat(chat_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Chat not found") from error
+        surfaces = chat_surfaces(files, chat)
+        latest = chat["messages"][-1] if chat["messages"] else {}
+        app = latest.get("google_workspace_required") if latest.get("role") == "assistant" else None
+        if saas and app and chat["source"] == "ui" and request.state.organization_slug:
+            actor, _remaining = saas.session(request.cookies.get(SESSION_COOKIE))
+            if actor and workspace_consent_configured():
+                context = TenantContext.from_auth(actor)
+                with saas.connect() as db:
+                    if workspace_access_missing(db, context, app):
+                        surfaces.append(workspace_consent_surface(latest["id"], app))
+        return {"surfaces": surfaces}
 
     @app.get("/api/ui/workspace", dependencies=[Depends(require_admin)])
     def get_workspace_ui(
@@ -1745,6 +1819,57 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
         except InfrastructureError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @app.post("/api/drafts/{draft_id}/prepare-purchase-workflow", dependencies=[Depends(require_admin)])
+    def prepare_purchase_draft(draft_id: UUID, payload: PurchaseWorkflowInput, request: Request) -> dict:
+        if not saas:
+            raise HTTPException(status_code=409, detail="Organization workflow management is required")
+        draft = next((item for item in files.drafts() if item["id"] == draft_id.hex), None)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        actor, _ = saas.session(request.cookies.get(SESSION_COOKIE))
+        try:
+            with saas.connect() as db:
+                return prepare_purchase_workflow(
+                    db, TenantContext.from_auth(actor), workspace, draft,
+                    payload.department_id, payload.approval_limit_usd,
+                )
+        except (LookupError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+
+    @app.post("/api/connections/gmail/link-workflow", dependencies=[Depends(require_admin)])
+    def link_gmail_workflow(request: Request) -> dict:
+        if not saas or access.missing("gmail"):
+            raise HTTPException(status_code=409, detail="Connect Gmail first")
+        credentials = {name: access.get(name) for name in CONNECTORS["gmail"]}
+        actor, _ = saas.session(request.cookies.get(SESSION_COOKIE))
+        context = TenantContext.from_auth(actor)
+        try:
+            gmail = call_external("gmail_verify", {}, credentials)
+            account = credentials["GMAIL_SENDER_EMAIL"]
+            if gmail["email"].casefold() != account.casefold():
+                raise ValueError("Gmail account does not match the saved sender")
+            with saas.connect() as db, db.transaction():
+                db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                           (f"gmail:{context.organization_id}",))
+                with tenant_transaction(db, context):
+                    prior = db.execute(
+                        "SELECT id FROM integration_connections WHERE organization_id = %s "
+                        "AND template_key = 'gmail' AND lower(account_label) = lower(%s) "
+                        "AND revoked_at IS NULL ORDER BY checked_at DESC LIMIT 1",
+                        (context.organization_id, account),
+                    ).fetchone()
+                return connect_gmail(
+                    db, context, workspace, credentials["GMAIL_REFRESH_TOKEN"], account,
+                    tuple(gmail.get("scopes", "").split()), credentials["GMAIL_CLIENT_ID"],
+                    credentials["GMAIL_CLIENT_SECRET"], prior[0] if prior else None,
+                )
+        except ExternalToolError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     def analyze_slack(chat_id: str, channel: str, thread_ts: str) -> None:
         result = analyzed_chat(chat_id)

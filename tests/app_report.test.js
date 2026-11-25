@@ -32,6 +32,16 @@ function chat() {
   };
 }
 
+test("workflow review links preserve the selected case", () => {
+  const body = document.createElement("div");
+  const href = "/organization/workflow-reviews?workflow=b23cac6f-d943-49df-8cab-61b14808e7bf";
+  window.renderMarkdown(body, `[Review workflow](${href})`);
+
+  const link = body.querySelector("a");
+  expect(link.getAttribute("href")).toBe(href);
+  expect(link.hasAttribute("target")).toBe(false);
+});
+
 test("full answer is available before the visual surface loads", () => {
   window.AustraA2UI = { mount: jest.fn() };
   window.fetch = jest.fn(path => path === "/api/ui/chats/chat-test"

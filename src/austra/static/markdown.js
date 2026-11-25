@@ -27,7 +27,7 @@ function markdownTableAt(lines, index) {
 }
 
 function markdownInline(parent, source) {
-  const token = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*]+)\*|_([^_]+)_/g;
+  const token = /\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/organization\/[a-z-]+(?:\?(?:workflow|purchase_draft)=[a-z\d-]+)?)\)|`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*]+)\*|_([^_]+)_/g;
   let last = 0;
   for (const match of source.matchAll(token)) {
     parent.appendChild(document.createTextNode(source.slice(last, match.index)));
@@ -36,8 +36,10 @@ function markdownInline(parent, source) {
       element = document.createElement("a");
       element.textContent = match[1];
       element.href = match[2];
-      element.target = "_blank";
-      element.rel = "noopener noreferrer";
+      if (match[2].startsWith("http")) {
+        element.target = "_blank";
+        element.rel = "noopener noreferrer";
+      }
     } else {
       const tag = match[3] ? "code" : (match[4] || match[5]) ? "strong" : match[6] ? "del" : "em";
       element = document.createElement(tag);

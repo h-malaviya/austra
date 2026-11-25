@@ -2,12 +2,17 @@
 
 import csv
 import io
+import logging
 import re
+import shutil
+import subprocess
+import warnings
 import zipfile
 from collections.abc import Iterator
 
 from docx import Document
 from openpyxl import load_workbook
+from PIL import Image, UnidentifiedImageError
 from pypdf import PdfReader, PdfWriter
 
 from austra.pdf_text import extract_pdf_text
@@ -16,19 +21,38 @@ MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 MAX_ROWS_PER_GROUP = 25
 MAX_WORDS_PER_CHUNK = 600
 MAX_CHARS_PER_CHUNK = 5000
+logger = logging.getLogger(__name__)
+MAX_IMAGE_PIXELS = 20_000_000
+IMAGE_FORMATS = {"png": ("PNG", "image/png"), "jpg": ("JPEG", "image/jpeg"),
+                 "jpeg": ("JPEG", "image/jpeg"), "webp": ("WEBP", "image/webp")}
 
 
 def validate_file(name: str, content: bytes) -> str:
     suffix = name.lower().rsplit(".", 1)[-1]
     media = {
         "txt": "text/plain",
+        "md": "text/markdown",
         "pdf": "application/pdf",
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "csv": "text/csv",
         "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        **{suffix: media for suffix, (_, media) in IMAGE_FORMATS.items()},
     }.get(suffix)
     if media is None or not content:
-        raise ValueError("Use a nonempty TXT, PDF, DOCX, CSV, or XLSX file")
+        raise ValueError("Use a nonempty TXT, MD, PDF, DOCX, CSV, XLSX, PNG, JPG, or WEBP file")
+    if suffix in IMAGE_FORMATS:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(content)) as image:
+                    if (image.format != IMAGE_FORMATS[suffix][0]
+                            or image.width * image.height > MAX_IMAGE_PIXELS
+                            or max(image.width, image.height) > 8000):
+                        raise ValueError("Invalid or oversized image")
+                    image.verify()
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError,
+                Image.DecompressionBombWarning) as error:
+            raise ValueError("Invalid or oversized image") from error
     if suffix == "pdf" and not content.startswith(b"%PDF-"):
         raise ValueError("Invalid PDF file")
     if suffix in {"docx", "xlsx"}:
@@ -41,7 +65,7 @@ def validate_file(name: str, content: bytes) -> str:
                     raise ValueError("Invalid Office document")
         except zipfile.BadZipFile as error:
             raise ValueError("Invalid Office document") from error
-    if suffix in {"txt", "csv"}:
+    if suffix in {"txt", "md", "csv"}:
         content.decode("utf-8-sig")
     return media
 
@@ -133,7 +157,19 @@ def _xlsx_units(content: bytes) -> Iterator[tuple[str, str]]:
 
 
 def units(media_type: str, content: bytes) -> Iterator[tuple[str, str]]:
-    if media_type == "application/pdf":
+    if media_type.startswith("image/"):
+        extracted = ""
+        if shutil.which("tesseract"):
+            try:
+                result = subprocess.run(
+                    ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "3"],
+                    input=content, check=True, capture_output=True, timeout=45,
+                )
+                extracted = result.stdout.decode("utf-8", errors="replace")
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                logger.warning("Image OCR unavailable: %s", type(error).__name__)
+        yield "image text", extracted
+    elif media_type == "application/pdf":
         yield from _pdf_units(content)
     elif media_type.endswith("wordprocessingml.document"):
         yield from _docx_units(content)

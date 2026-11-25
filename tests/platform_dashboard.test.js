@@ -77,6 +77,29 @@ test("direct organization page load and back navigation show the right page", as
   expect(document.getElementById("platformDetail").textContent).toContain("Alex Owner");
 });
 
+test("test reset is visible only when enabled and requires the subdomain", async () => {
+  organization.test_reset_enabled = true;
+  try {
+    window.history.replaceState({}, "", "/platform/organizations/org-1");
+    await window.renderPlatformDashboard();
+    [...document.querySelectorAll("#platformDetail button")]
+      .find(button => button.textContent === "Reset test data").click();
+    const field = document.querySelector('input[name="confirm_slug"]');
+    expect(field.required).toBe(true);
+    field.value = "acme";
+    document.querySelector(".platform-modal form").dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true })
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(window.fetch).toHaveBeenCalledWith(
+      "/api/platform/organizations/org-1/test-reset",
+      expect.objectContaining({ method: "POST", body: '{"confirm_slug":"acme"}' })
+    );
+  } finally {
+    delete organization.test_reset_enabled;
+  }
+});
+
 test("administrator modal actions have matching button alignment", () => {
   const style = document.createElement("style");
   style.textContent = fs.readFileSync(path.join(staticRoot, "app.css"), "utf8");

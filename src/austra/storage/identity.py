@@ -59,7 +59,7 @@ def resolve_session(connection: psycopg.Connection, token: str) -> AuthContext |
     organization_active = organization_status == "active" if organization_id else True
     if role == "super_admin" and support:
         organization_active = supported_status == "active"
-    grants = _active_grants(connection, user_id) if role == "employee" else ()
+    grants = active_department_grants(connection, user_id) if role == "employee" else ()
     return AuthContext(
         user_id=user_id,
         organization_id=organization_id,
@@ -72,7 +72,7 @@ def resolve_session(connection: psycopg.Connection, token: str) -> AuthContext |
     )
 
 
-def _active_grants(connection: psycopg.Connection, user_id: UUID) -> tuple[DepartmentGrant, ...]:
+def active_department_grants(connection: psycopg.Connection, user_id: UUID) -> tuple[DepartmentGrant, ...]:
     rows = connection.execute(
         """
         SELECT m.department_id, a.role_id, p.permission_key

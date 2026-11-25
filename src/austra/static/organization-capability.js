@@ -1,43 +1,6 @@
-const capabilityFields = {
-  submit_order: [["external_id", "Order ID"], ["product", "Product"],
-    ["quantity_kg", "Quantity (kg)"]],
-  reserve_stock: [["order_id", "Sales order", "sales_order"],
-    ["lot_id", "Stock lot", "stock_lot"], ["quantity_kg", "Quantity (kg)"]],
-  draft_po: [["order_id", "Sales order", "sales_order"], ["external_id", "PO ID"],
-    ["supplier", "Supplier"], ["quantity_kg", "Quantity (kg)"],
-    ["unit_price_per_kg", "Price per kg"], ["currency", "Currency (ISO 4217)"]],
-  approve_po: [["po_id", "Purchase order", "purchase_order"]],
-  propose_email: [["po_id", "Purchase order", "purchase_order"],
-    ["external_id", "Proposal ID"], ["recipient", "Recipient"],
-    ["subject", "Subject"], ["body", "Message"]],
-  approve_email: [["email_id", "Email proposal", "email_proposal"]]
-};
-
 function capabilityOption(select, value, label) {
   const option = add(select, "option", label);
   option.value = value;
-}
-
-function capabilityInput(parent, field, records) {
-  const [name, label, recordKind] = field;
-  const wrapper = add(parent, "label", label, "org-capability-field");
-  let control;
-  if (recordKind) {
-    control = add(wrapper, "select");
-    capabilityOption(control, "", "Choose a record");
-    records.filter(record => record.kind === recordKind).forEach(record =>
-      capabilityOption(control, record.id, `${record.external_id} · ${record.state} · r${record.revision}`));
-  } else if (name === "body") {
-    control = add(wrapper, "textarea", "", "org-onboarding-textarea");
-  } else {
-    control = add(wrapper, "input");
-    control.type = name === "recipient" ? "email" : "text";
-    if (name === "currency") control.value = "USD";
-  }
-  control.name = name;
-  control.required = true;
-  control.setAttribute("aria-label", label);
-  return control;
 }
 
 function capabilityRevisions(payload, records) {
@@ -78,93 +41,357 @@ function capabilityResult(parent, decision) {
   }
   if (decision.escalation_required) add(result, "p", "Above approval limit. Escalation required.");
   if (decision.effect === "repair_connection") add(result, "p", "Reconnect the email provider to send.");
-  add(result, "small", `Blueprint ${decision.blueprint_id} · Build ${decision.build_id} · Event ${decision.event_id}`);
+
 }
 
-function capabilityForm(content, view, departmentId) {
+function purchaseWorkflowGraph(content, view, selectAction, selectedStep) {
+  if (!window.AustraA2UI) return;
   const panel = add(content, "section", "", "org-panel org-capability-panel");
-  add(panel, "h2", "Run a command");
-  const form = add(panel, "form", "", "org-capability-form");
-  const actionLabel = add(form, "label", "Action", "org-capability-field");
-  const action = add(actionLabel, "select");
-  view.commands.forEach(name => capabilityOption(action, name, name.replaceAll("_", " ")));
-  const fields = add(form, "div", "", "org-capability-fields");
-  add(content, "section", "", "org-capability-output");
-  let retryKey = null;
-  function renderFields() {
-    fields.replaceChildren();
-    (capabilityFields[action.value] || []).forEach(field => capabilityInput(fields, field, view.records));
-    retryKey = null;
+  add(panel, "h3", "Workflow steps");
+  const steps = [
+    ["submit_order", "Enter order", "Record the product and quantity in kilograms.", "Check verified stock."],
+    ["reserve_stock", "Reserve stock", "Reserve no more than available stock or open demand.", "If demand remains, draft a purchase request."],
+    ["draft_po", "Draft purchase", "Use the remaining quantity and a reviewed supplier price.", "Review the purchase request."],
+    ["approve_po", "Approve purchase", "Requests above the approval limit go to escalation.", "Prepare an email for an approved request."],
+    ["propose_email", "Draft email", "Review the recipient, subject and message.", "Approve the exact proposal."],
+    ["approve_email", "Approve email", "Approval queues the message for delivery.", "Send from the approved Gmail account."],
+    ["email_jobs", "Send and track replies", "Send the approved message once. Follow replies in the original Gmail thread.", ""]
+  ].filter(([key]) => key === "email_jobs" ? view.commands.includes("approve_email") : view.commands.includes(key))
+    .map(([key, label, detail, next]) => ({key, label, detail, next}));
+  if (!steps.length) { panel.remove(); return; }
+  const id = "purchase_steps";
+  window.AustraA2UI.mount(panel, {id, messages: [
+    {version: "v0.9.1", createSurface: {surfaceId: id, catalogId: "https://austra.local/catalogs/report.json"}},
+    {version: "v0.9.1", updateComponents: {surfaceId: id,
+      components: [{id: "root", component: "AustraWorkflowGraph", steps, selectedStep}]}}
+  ]}, () => {});
+  panel.addEventListener("austra-workflow-step", event => selectAction?.(event.detail));
+}
+
+function renderCapabilityEmailJobs(content, view, departmentId, { report, emailReference, connectGmail }) {
+  const panel = add(content, "section", "", "org-panel org-capability-panel");
+  panel.dataset.workflowEmail = "";
+  add(panel, "h3", view.capabilities ? "Workflow email" : "Purchase request email");
+  const jobs = add(add(panel, "label", "Email reference"), "select");
+  const detail = add(panel, "div");
+  const replyRefreshMs = 5000;
+  let replyRefresh;
+  view.email_jobs.forEach(job => capabilityOption(jobs, job.id, job.reference));
+  if (!view.email_jobs.length) {
+    panel.replaceChildren();
+    add(panel, "p", "Approve an exact email draft before choosing Gmail and sending.");
+    return;
   }
-  action.onchange = renderFields;
-  renderFields();
-  const submit = add(form, "button", "Run command", "org-button primary");
-  submit.type = "submit";
-  form.onsubmit = async event => {
-    event.preventDefault();
-    const payload = Object.fromEntries(new FormData(form).entries());
-    delete payload.action;
-    const command = { action: action.value, department_id: departmentId,
-      idempotency_key: retryKey ||= crypto.randomUUID(), correlation_id: crypto.randomUUID(),
-      expected_revisions: capabilityRevisions(payload, view.records), payload };
-    submit.disabled = true;
-    try {
-      const decision = await api("/api/org/capability-ui/commands", {
-        method: "POST", body: JSON.stringify(command) });
-      orgAdminState.lastCapabilityDecision = decision;
-      await window.renderOrganizationManagement(true);
-      orgNotice("Command recorded.");
-    } catch (error) { orgNotice(error.message, true); }
-    finally { submit.disabled = false; }
-  };
+  const preferred = view.email_jobs.find(job => job.reference === emailReference);
+  if (preferred) jobs.value = preferred.id;
+  const request = (path, payload) => api(path, {method: "POST", body: JSON.stringify(payload || {})});
+  function button(parent, label, work) {
+    const control = orgButton(parent, label, "org-button secondary", async () => {
+      control.disabled = true;
+      try { await work(); }
+      catch (error) { report(error.message, true); }
+      finally { control.disabled = false; }
+    });
+    return control;
+  }
+  function show() {
+    clearTimeout(replyRefresh);
+    const job = view.email_jobs.find(item => item.id === jobs.value);
+    if (!job) return;
+    detail.replaceChildren();
+    add(detail, "p", job.subject);
+    add(detail, "p", "To " + job.recipient);
+    const base = `/api/org/email-jobs/${departmentId}/${job.id}`;
+    if (job.state === "delivered") {
+      const caseStatus = add(detail, "p");
+      caseStatus.setAttribute("role", "status");
+      caseStatus.hidden = true;
+      const timeline = add(detail, "div");
+      const tracking = add(detail, "p");
+      const automaticTracking = add(detail, "p", "Approved replies will be sent automatically in this thread.");
+      const replyCount = add(timeline, "strong");
+      replyCount.setAttribute("aria-live", "polite");
+      const items = add(timeline, "ol");
+      let evidence = {};
+      let renderedEvidence = "";
+      const trackingMessages = {
+        tracking: "Checking this Gmail thread automatically",
+        retrying: "Austra will retry pending Gmail checks.",
+        ended: "Automatic checks have ended. You can still check this thread.",
+        manual: "Check now to start tracking this thread."
+      };
+      const recoveryMessages = {
+        retrying: "Reply saved. Austra will retry processing its content automatically.",
+        applying: "Reply content saved. Austra will resume the approved record update.",
+        recovered: "Austra recovered this reply’s content and resumed processing.",
+        needs_review: "Reply saved. Its content needs review after automatic attempts."
+      };
+      const automaticMessages = {
+        pending: "Automatic reply queued.", sending: "Sending an approved reply in this thread.",
+        sent: "Austra replied in this Gmail thread.", completed: "Austra processed this reply.",
+        needs_review: "Austra saved this reply for review.", uncertain: "Reply delivery needs verification.",
+      };
+      let checking = false;
+      let requestVersion = 0;
+      function applyReplies(result) {
+        if (result.tracked_record) {
+          const {reference, state, revision} = result.tracked_record;
+          const label = `${reference} · ${workflowLabel(state)} · Revision ${revision}`;
+          if (caseStatus.textContent !== label) caseStatus.textContent = label;
+          caseStatus.hidden = false;
+        }
+        evidence = result.evidence || evidence;
+        job.record_updates = result.record_updates || job.record_updates || {};
+        job.recovery = result.recovery || job.recovery || {};
+        job.automatic_actions = result.automatic_actions || job.automatic_actions || {};
+        job.automatic_enabled = result.automatic_enabled ?? job.automatic_enabled ?? false;
+        automaticTracking.hidden = !job.automatic_enabled;
+        job.replies = result.replies || (result.reply ? [result.reply] : []);
+        job.tracking = result.tracking;
+        job.tracking_until = result.tracking_until;
+        const text = job.replies.length
+          ? `${job.replies.length} ${job.replies.length === 1 ? "reply" : "replies"} received`
+          : "Sent · Awaiting replies";
+        if (replyCount.textContent !== text) replyCount.textContent = text;
+        tracking.textContent = trackingMessages[job.tracking] || trackingMessages.tracking;
+        const signature = JSON.stringify([job.replies, evidence, job.record_updates, job.recovery, job.automatic_actions]);
+        if (signature === renderedEvidence) return;
+        renderedEvidence = signature;
+        const open = new Set([...items.querySelectorAll("details[open]")].map(item => item.dataset.replyId));
+        items.replaceChildren();
+        job.replies.forEach(reply => {
+          const row = add(items, "li");
+          add(row, "strong", reply.subject || "(No subject)");
+          add(row, "p", `${reply.from} · ${new Date(reply.received_ms).toLocaleString()}`);
+          const update = job.record_updates[reply.message_id];
+          const recovery = job.recovery[reply.message_id]?.state;
+          if (recoveryMessages[recovery]) add(row, "p", recoveryMessages[recovery]);
+          const automatic = job.automatic_actions[reply.message_id];
+          if (automaticMessages[automatic?.state]) add(row, "p", automaticMessages[automatic.state]);
+          if (automatic?.findings?.length) {
+            const findings = add(row, "ul");
+            for (const finding of automatic.findings) add(findings, "li", finding);
+          }
+          if (update?.reason) add(row, "p", update.reason);
+          if (update?.updated?.length) add(row, "p", `Record updated: ${update.updated.map(workflowLabel).join(", ")}`);
+          if (update?.review?.length) add(row, "p", `Review missing or conflicting values for ${update.review.map(workflowLabel).join(", ")}.`);
+          if (update?.waiting?.length && !recovery) add(row, "p", `Waiting for reply content for ${update.waiting.map(workflowLabel).join(", ")}.`);
+          const replyContent = evidence[reply.message_id];
+          if (replyContent) {
+            const details = add(row, "details");
+            details.dataset.replyId = reply.message_id;
+            details.open = open.has(reply.message_id);
+            add(details, "summary", "Reply and documents");
+            if (replyContent.body) add(details, "pre", replyContent.body);
+            for (const attachment of replyContent.attachments || []) {
+              add(details, "strong", attachment.name);
+              if (attachment.status !== "extracted") add(details, "p", attachment.reason || "Needs review");
+              for (const excerpt of attachment.excerpts || []) add(details, "pre", excerpt.text);
+            }
+          }
+        });
+        items.hidden = !job.replies.length;
+      }
+      const threadLink = add(detail, "a", "Open the original thread in Gmail");
+      threadLink.hidden = true;
+      threadLink.target = "_blank";
+      threadLink.rel = "noopener noreferrer";
+      function showThread() {
+        const thread = job.replies.at(-1)?.thread_id;
+        if (!thread) return;
+        threadLink.href = `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(thread)}`;
+        threadLink.hidden = false;
+      }
+      function scheduleRefresh() {
+        replyRefresh = setTimeout(async () => {
+          if (!timeline.isConnected) return;
+          const version = requestVersion;
+          try {
+            if (!document.hidden && !checking) {
+              const result = await api(base + "/replies");
+              if (timeline.isConnected && version === requestVersion) {
+                applyReplies(result);
+                showThread();
+              }
+            }
+          } catch {
+            if (timeline.isConnected) tracking.textContent = "Couldn’t refresh replies. Austra will retry.";
+          } finally {
+            if (timeline.isConnected) scheduleRefresh();
+          }
+        }, replyRefreshMs);
+      }
+      applyReplies(job);
+      showThread();
+      button(detail, "Check for Gmail replies", async () => {
+        requestVersion += 1;
+        checking = true;
+        try {
+          const previous = job.replies.length;
+          const result = await request(base + "/check-reply");
+          if (!timeline.isConnected) return;
+          applyReplies(result);
+          const added = job.replies.length - previous;
+          report(added ? `${added} new ${added === 1 ? "reply" : "replies"} saved.` : "No new matching replies.");
+        } finally {
+          checking = false;
+        }
+      });
+      scheduleRefresh();
+    } else {
+      add(detail, "p", job.state === "repair"
+        ? "Delivery needs review. Check whether Gmail sent this email before retrying."
+        : "Queued for delivery");
+      const approval = add(detail, "div");
+      button(approval, "Choose Gmail account", async () => {
+        const connections = (await api("/api/org/connections"))
+          .filter(connection => connection.template === "gmail" && connection.health === "healthy");
+        if (!connections.length) { connectGmail(approval); return; }
+        approval.replaceChildren();
+        const select = add(add(approval, "label", "Gmail account"), "select");
+        connections.forEach(account => capabilityOption(select, account.id, account.account));
+        const access = add(approval, "p");
+        const authorize = button(approval, "Authorize Gmail reply content", async () => connectGmail(approval, select.value));
+        const showAccess = () => {
+          const account = connections.find(item => item.id === select.value);
+          const content = account?.scopes?.includes("https://www.googleapis.com/auth/gmail.readonly");
+          access.textContent = content
+            ? "Austra can process reply text and supported attachments in the background."
+            : "This Gmail grant can track replies. Authorize reply content to process messages and attachments.";
+          authorize.hidden = Boolean(content);
+        };
+        select.onchange = showAccess;
+        showAccess();
+        button(approval, "Approve Gmail for this workflow", async () => {
+          await request(base + "/approve-connection", {connection_id: select.value});
+          approval.replaceChildren();
+          report("Gmail approved. Preview the exact email before sending.");
+        });
+      });
+      const preview = add(detail, "div");
+      button(detail, "Preview approved email", async () => {
+        const result = await request(base + "/preview");
+        if (jobs.value !== job.id) return;
+        preview.replaceChildren();
+        add(preview, "p", "From " + result.preview.account);
+        add(preview, "p", "To " + result.preview.arguments.to);
+        add(preview, "strong", result.preview.arguments.subject);
+        add(preview, "pre", result.preview.arguments.body);
+        const attachment = result.preview.workflow_email?.attachment;
+        if (attachment) {
+          const link = add(preview, "a", `Preview attachment: ${attachment.name}`);
+          link.href = `data:application/pdf;base64,${attachment.base64}`;
+          link.download = attachment.name;
+        }
+        const reminder = add(add(preview, "label", "Follow-up reminder"), "select");
+        for (const [value, label] of [["", "None"], ["1", "After 1 day"], ["2", "After 2 days"], ["7", "After 7 days"]]) {
+          capabilityOption(reminder, value, label);
+        }
+        const emailLabel = add(preview, "label", "Also email the workflow owner about replies and reminders");
+        const emailAlerts = add(emailLabel, "input");
+        emailAlerts.type = "checkbox";
+        let automaticReplies;
+        const config = result.preview.workflow_email?.automatic_email;
+        if (config) {
+          const reviewed = add(preview, "details");
+          add(reviewed, "summary", "Review automatic reply rules for this recipient");
+          renderAutomaticReplyRules(reviewed, config);
+          const automaticLabel = add(preview, "label", "Authorize these automatic replies in this Gmail thread ");
+          automaticReplies = add(automaticLabel, "input");
+          automaticReplies.type = "checkbox";
+        }
+        button(preview, "Send this exact email", async () => {
+          const sent = await request(`/api/org/email-jobs/${job.id}/deliver`, {
+            department_id: departmentId, proposal_id: result.proposal_id,
+            follow_up_days: reminder.value ? Number(reminder.value) : null,
+            owner_email_alerts: emailAlerts.checked,
+            ...(automaticReplies ? {automatic_replies: automaticReplies.checked} : {}),
+          });
+          job.state = sent.state;
+          if (sent.state === "delivered") {
+            job.tracking = "tracking";
+            job.automatic_enabled = Boolean(automaticReplies?.checked);
+          }
+          show();
+          report(sent.reason || "Delivery confirmed by Gmail.", sent.state !== "delivered");
+        });
+      });
+    }
+  }
+  jobs.onchange = show;
+  show();
+}
+
+const workflowLabels = {
+  submit_order: "Enter order", reserve_stock: "Reserve stock", draft_po: "Draft purchase",
+  approve_po: "Approve purchase", propose_email: "Draft email", approve_email: "Approve email",
+  email_jobs: "Send and track replies"
+};
+
+function workflowLabel(key) {
+  return workflowLabels[key] || key.replace(/^command\./, "").replaceAll("_", " ").replaceAll(".", " · ");
+}
+
+function workflowRules(panel, view) {
+  if (!view.rules?.length) return;
+  add(panel, "h3", "Approved rules");
+  const rules = add(panel, "ul");
+  view.rules.forEach(rule => {
+    const label = workflowLabel(rule.decision_key.replace(/^command\./, ""));
+    const permission = rule.required_permission === "workflows.approve"
+      ? "requires workflow approval" : "requires workflow run access";
+    const limit = rule.limit == null ? "" : ` · limit ${rule.unit} ${rule.limit}. Higher amounts escalate.`;
+    add(rules, "li", `${label} · ${permission}${limit}`);
+  });
 }
 
 async function orgCapabilityPage(content) {
-  const departments = (await api("/api/org/departments")).filter(item => !item.archived);
-  const heading = add(content, "div", "", "org-page-heading");
-  add(heading, "h2", "Released workflow");
-  if (!departments.length) {
-    add(content, "p", "Create a department before running a workflow.");
+  const items = await api("/api/org/released-workflows");
+  const title = add(content, "div", "", "org-page-heading");
+  add(title, "h2", "Released workflows");
+  if (!Array.isArray(items) || !items.length) {
+    add(content, "p", "No workflows have been released yet.");
     return;
   }
-  const department = add(heading, "select");
-  department.setAttribute("aria-label", "Workflow department");
-  departments.forEach(item => capabilityOption(department, item.id, item.name));
-  const selection = new URLSearchParams(window.location.search).get("department");
-  if (departments.some(item => item.id === selection)) department.value = selection;
-  department.onchange = () => {
-    window.history.replaceState({}, "", `${orgCapabilityPath}?department=${department.value}`);
-    window.renderOrganizationManagement().catch(error => orgNotice(error.message, true));
-  };
-  let view;
-  try { view = await api(`/api/org/capability/${department.value}`); }
-  catch (error) {
-    add(content, "p", error.message.includes("released capability")
-      ? "No approved workflow has been released for this organization yet." : error.message);
-    return;
-  }
-  if (view.capabilities) {
-    await window.renderCapabilityViews(content, view, department.value);
-    if (orgAdminState.lastCapabilityDecision) {
-      const result = add(content, "section", "", "org-capability-output");
-      capabilityResult(result, orgAdminState.lastCapabilityDecision);
+  const list = add(content, "div", "", "org-panel org-capability-panel");
+  const detail = add(content, "div");
+  let version = 0;
+  async function show(item) {
+    const current = ++version;
+    detail.replaceChildren();
+    try {
+      const view = await api(`/api/org/capability/${item.department_id}?build_id=${item.build_id}`);
+      if (current !== version || !detail.isConnected) return;
+      const card = add(detail, "section", "", "org-panel org-capability-panel");
+      add(card, "h3", item.name);
+      add(card, "p", item.department);
+      if (view.capabilities) {
+        for (const capability of view.capabilities) {
+          const steps = add(card, "ol");
+          for (const step of capability.transitions) {
+            const detail = step.from ? `From ${workflowLabel(step.from)} to ${workflowLabel(step.to)}`
+              : `Starts a record in ${workflowLabel(step.to)}`;
+            add(steps, "li", `${workflowLabel(step.key)} · ${detail}`);
+          }
+          if (capability.email_document) {
+            add(steps, "li", `Generate and preview “${capability.email_document.title}” before sending.`);
+          }
+          if (capability.reply_mapping) {
+            const mapping = capability.reply_mapping;
+            add(steps, "li", `Update ${mapping.fields.map(field => workflowLabel(field.target)).join(", ")} from replies while the record is ${mapping.states.map(workflowLabel).join(" or ")}.`);
+          }
+        }
+      } else purchaseWorkflowGraph(card, view);
+      workflowRules(card, view);
+    } catch (error) {
+      if (current === version) add(detail, "p", error.message, "org-error");
     }
-    return;
   }
-  if (!view.projections.some(item => item.key === "journey")) {
-    add(content, "p", "The released blueprint has no workflow projection.");
-    return;
+  for (const item of items) {
+    orgButton(list, `${item.name} · ${item.department}`, "org-button secondary", () => show(item));
   }
-  const summary = add(content, "section", "", "org-panel org-capability-panel");
-  add(summary, "h3", "Current records");
-  add(summary, "p", "Chat accepts /capability followed by the same typed command JSON.");
-  if (!view.complete) add(summary, "p", `Showing ${view.records.length} of ${view.record_count} records. Refresh or use the API for the full set.`);
-  if (!view.records.length) add(summary, "p", "No sales orders or stock lots are present yet.");
-  else view.records.forEach(record => add(summary, "p",
-    `${record.kind.replaceAll("_", " ")}: ${record.external_id} · ${record.state} · r${record.revision}`));
-  capabilityForm(content, view, department.value);
-  if (orgAdminState.lastCapabilityDecision) {
-    capabilityResult(content.querySelector(".org-capability-output"),
-      orgAdminState.lastCapabilityDecision);
-  }
+  const query = new URLSearchParams(window.location.search);
+  const initial = items.find(item => item.department_id === query.get("department")
+    && (!query.get("build") || item.build_id === query.get("build")));
+  if (initial) await show(initial);
 }

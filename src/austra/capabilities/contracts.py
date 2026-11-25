@@ -87,6 +87,7 @@ class CapabilityCommand(BaseModel):
 
     action: Action
     department_id: UUID
+    build_id: UUID | None = None
     idempotency_key: str = Field(min_length=1, max_length=200)
     correlation_id: UUID
     expected_revisions: dict[UUID, int] = Field(default_factory=dict)
@@ -124,7 +125,8 @@ class CapabilityCommand(BaseModel):
         return self
 
     def digest(self) -> str:
-        data = self.model_dump(mode="json", exclude={"correlation_id"})
+        excluded = {"correlation_id"} if self.build_id is not None else {"correlation_id", "build_id"}
+        data = self.model_dump(mode="json", exclude=excluded)
         return hashlib.sha256(
             json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

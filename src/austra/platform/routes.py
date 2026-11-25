@@ -1,7 +1,9 @@
 """Platform provisioning and account routes."""
 
 import hashlib
+import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID
 
 import psycopg
@@ -10,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from austra.onboarding.service import open_case
 from austra.platform.auth import SaasIdentity, normalize_username, password_hash, temporary_password
+from austra.platform.test_reset import clear_test_files, reset_test_organization
 from austra.tenant.permissions.evaluator import AuthContext, permits
 
 COOKIE = "austra_session"
@@ -102,6 +105,10 @@ class OrganizationStatus(BaseModel):
     status: str
 
 
+class TestResetInput(BaseModel):
+    confirm_slug: str
+
+
 def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
     def current(request: Request) -> AuthContext:
         context, _remaining = identity.session(request.cookies.get(COOKIE))
@@ -155,6 +162,7 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                 "city": row[6],
                 "country": row[7],
                 "admin_count": row[8],
+                "test_reset_enabled": row[1] == os.getenv("AUSTRA_TEST_RESET_SLUG", ""),
             }
             for row in rows
         ]
@@ -381,6 +389,27 @@ def install_platform_routes(app: FastAPI, identity: SaasIdentity) -> None:
                 (organization_id, actor.user_id, f"organization.{payload.status}"),
             )
         return {"id": str(organization_id), "status": payload.status}
+
+    @app.post("/api/platform/organizations/{organization_id}/test-reset")
+    def reset_organization_for_test(
+        organization_id: UUID, payload: TestResetInput, request: Request
+    ):
+        actor = platform(request)
+        enabled_slug = os.getenv("AUSTRA_TEST_RESET_SLUG", "")
+        if not enabled_slug or payload.confirm_slug != enabled_slug:
+            raise HTTPException(status_code=403, detail="Test reset is not enabled")
+        with identity.connect() as connection:
+            row = connection.execute(
+                "SELECT slug FROM organizations WHERE id = %s AND deleted_at IS NULL",
+                (organization_id,),
+            ).fetchone()
+            if row is None or row[0] != enabled_slug:
+                raise HTTPException(status_code=404, detail="Test organization not found")
+            reset_test_organization(
+                connection, organization_id, actor.user_id,
+            )
+        clear_test_files(Path(os.environ.get("AUSTRA_WORKSPACE", "data/blank")), organization_id)
+        return {"reset": True}
 
     @app.post("/api/platform/organizations/{organization_id}/support-context")
     def enter_support(organization_id: UUID, payload: SupportInput, request: Request):

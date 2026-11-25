@@ -17,7 +17,9 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from austra.onboarding.extract import chunks, units, validate_file
+from austra.onboarding.service import ensure_case
 from austra.onboarding.website import parse_page
+from austra.tenant.audit import record_event
 from austra.tenant.context import TenantContext, tenant_transaction
 
 MAX_SOURCE_BYTES = 25 * 1024 * 1024
@@ -88,19 +90,20 @@ def save_source(
         raise ValueError("Source must be nonempty and at most 25 MB")
     if not source_key.strip() or len(source_key) > 2048:
         raise ValueError("Invalid source name")
+    ensure_case(connection, context)
     digest = hashlib.sha256(content).hexdigest()
     blob_key = _store_bytes(root, context.organization_id, digest, content)
     with tenant_transaction(connection, context):
         case = connection.execute(
-            "SELECT id, state FROM onboarding_cases WHERE organization_id = %s "
-            "ORDER BY (state <> 'locked_candidate') DESC, created_at DESC "
+            "SELECT id, state, workflow_name FROM onboarding_cases WHERE organization_id = %s "
+            "AND parent_case_id IS NULL ORDER BY (state <> 'locked_candidate') DESC, created_at DESC "
             "LIMIT 1 FOR UPDATE",
             (context.organization_id,),
         ).fetchone()
         if case is None:
             raise ValueError("An onboarding case is required")
         if (
-            case[1] == "locked_candidate"
+            case[1] == "locked_candidate" and case[2] is None
             and connection.execute(
                 "SELECT 1 FROM releases WHERE organization_id = %s AND state = 'active'",
                 (context.organization_id,),
@@ -143,18 +146,19 @@ def save_source(
             "SELECT blueprint_id, approved_by FROM releases WHERE organization_id = %s "
             "AND state = 'active'",
             (context.organization_id,),
-        ).fetchone()
+        ).fetchall()
         if active:
             open_review(
                 connection,
                 context,
                 trigger="changed_evidence",
                 subject_id=revision,
-                owner_user_id=active[1],
-                blueprint_id=active[0],
+                owner_user_id=active[0][1] if len(active) == 1 else context.actor.user_id,
+                blueprint_id=active[0][0] if len(active) == 1 else None,
                 citations=[
                     {
                         "source_id": str(source),
+                        "active_blueprints": [str(item[0]) for item in active],
                         "prior_revision_id": str(previous[0]) if previous else None,
                         "revision_id": str(revision),
                     }
@@ -176,7 +180,7 @@ def save_file(connection, context, root, filename: str, content: bytes, *, linke
     media_type = validate_file(name, content)
     if linkedin and not name.lower().endswith((".csv", ".xlsx", ".txt", ".pdf", ".docx")):
         raise ValueError("Unsupported LinkedIn export")
-    return save_source(
+    saved = save_source(
         connection,
         context,
         root,
@@ -186,6 +190,14 @@ def save_file(connection, context, root, filename: str, content: bytes, *, linke
         media_type=media_type,
         content=content,
     )
+    if saved["changed"]:
+        with tenant_transaction(connection, context):
+            connection.execute(
+                "UPDATE evidence_sources SET review_state = 'pending' "
+                "WHERE organization_id = %s AND id = %s",
+                (context.organization_id, saved["source_id"]),
+            )
+    return saved
 
 
 def set_source_access(
@@ -277,7 +289,7 @@ def save_interview(connection, context: TenantContext, description: str, outcome
             "UPDATE onboarding_cases SET business_description = %s, desired_outcome = %s, "
             "state = CASE WHEN state = 'created' THEN 'collecting' ELSE state END, "
             "revision = revision + 1, updated_at = now() WHERE organization_id = %s "
-            "AND state IN ('created', 'collecting', 'clarifying') RETURNING id, state, revision",
+            "AND parent_case_id IS NULL AND state IN ('created', 'collecting', 'clarifying') RETURNING id, state, revision",
             (description, outcome, context.organization_id),
         ).fetchone()
     if row is None:
@@ -403,8 +415,9 @@ def list_sources(connection, context: TenantContext) -> list[dict]:
     context.require("policies.read")
     with tenant_transaction(connection, context):
         rows = connection.execute(
-            "SELECT s.id, s.kind, s.display_name, s.excluded, r.id, r.revision, r.sha256, "
-            "r.captured_at, r.status, r.extracted_units, r.total_units, r.error, "
+            "SELECT s.id, s.kind, s.display_name, s.excluded, s.review_state, "
+            "r.id, r.revision, r.sha256, "
+            "r.captured_at, r.status, r.extracted_units, r.total_units, r.error, r.media_type, "
             "(SELECT count(*) FROM evidence_chunks c WHERE c.organization_id = s.organization_id "
             "AND c.revision_id = r.id) FROM evidence_sources s "
             "JOIN LATERAL (SELECT * FROM evidence_revisions WHERE organization_id = s.organization_id "
@@ -420,6 +433,7 @@ def list_sources(connection, context: TenantContext) -> list[dict]:
                     "kind",
                     "name",
                     "excluded",
+                    "review_state",
                     "revision_id",
                     "revision",
                     "sha256",
@@ -428,6 +442,7 @@ def list_sources(connection, context: TenantContext) -> list[dict]:
                     "extracted_units",
                     "total_units",
                     "error",
+                    "media_type",
                     "chunk_count",
                 ),
                 row,
@@ -438,11 +453,28 @@ def list_sources(connection, context: TenantContext) -> list[dict]:
     ]
 
 
+def image_source_bytes(connection, context: TenantContext, root: Path, source_id: UUID) -> bytes:
+    context.require("policies.read")
+    with tenant_transaction(connection, context):
+        row = connection.execute(
+            "SELECT r.blob_key, r.sha256 FROM evidence_sources s "
+            "JOIN LATERAL (SELECT blob_key, sha256, media_type FROM evidence_revisions "
+            "WHERE organization_id = s.organization_id AND source_id = s.id "
+            "ORDER BY revision DESC LIMIT 1) r ON true "
+            "WHERE s.organization_id = %s AND s.id = %s AND s.kind = 'file' "
+            "AND NOT s.excluded AND r.media_type IN ('image/png', 'image/jpeg', 'image/webp')",
+            (context.organization_id, source_id),
+        ).fetchone()
+    if row is None:
+        raise ValueError("Attached image is unavailable")
+    return _load_bytes(root, context.organization_id, row[0], row[1])
+
+
 def preview_source(connection, context: TenantContext, source_id: UUID) -> list[dict]:
     context.require("policies.read")
     with tenant_transaction(connection, context):
         rows = connection.execute(
-            "SELECT c.locator, left(c.text, 1200), r.captured_at FROM evidence_sources s "
+            "SELECT c.id, c.locator, left(c.text, 1200), r.captured_at FROM evidence_sources s "
             "JOIN LATERAL (SELECT id, captured_at FROM evidence_revisions WHERE organization_id = s.organization_id "
             "AND source_id = s.id ORDER BY revision DESC LIMIT 1) r ON true "
             "JOIN evidence_chunks c ON c.organization_id = s.organization_id AND c.revision_id = r.id "
@@ -450,19 +482,38 @@ def preview_source(connection, context: TenantContext, source_id: UUID) -> list[
             (context.organization_id, source_id),
         ).fetchall()
     return [
-        {"locator": locator, "text": text, "captured_at": captured_at}
-        for locator, text, captured_at in rows
+        {"id": chunk_id, "locator": locator, "text": text, "captured_at": captured_at}
+        for chunk_id, locator, text, captured_at in rows
     ]
 
 
-def exclude_source(connection, context: TenantContext, source_id: UUID, excluded: bool) -> None:
+def exclude_source(
+    connection, context: TenantContext, source_id: UUID, excluded: bool,
+    reason: str | None = None,
+) -> str:
     context.require("policies.draft")
     if context.actor.role != "org_admin":
         raise PermissionError("Organization admin required")
-    with tenant_transaction(connection, context):
-        row = connection.execute(
-            "UPDATE evidence_sources SET excluded = %s WHERE organization_id = %s AND id = %s RETURNING id",
-            (excluded, context.organization_id, source_id),
-        ).fetchone()
-        if row is None:
-            raise LookupError("Evidence source not found")
+    clean_reason = reason.strip() if reason else None
+    with connection.transaction():
+        with tenant_transaction(connection, context):
+            row = connection.execute(
+                "SELECT review_state FROM evidence_sources WHERE organization_id = %s "
+                "AND id = %s FOR UPDATE",
+                (context.organization_id, source_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError("Evidence source not found")
+            if excluded and row[0] == "pending" and not clean_reason:
+                raise ValueError("Give a reason when rejecting a source awaiting review")
+            review_state = "excluded" if excluded else "included"
+            connection.execute(
+                "UPDATE evidence_sources SET excluded = %s, review_state = %s "
+                "WHERE organization_id = %s AND id = %s",
+                (excluded, review_state, context.organization_id, source_id),
+            )
+        action = "onboarding.source_rejected" if excluded and row[0] == "pending" else (
+            "onboarding.source_excluded" if excluded else "onboarding.source_included"
+        )
+        record_event(connection, context.actor, action, resource_id=source_id, reason=clean_reason)
+    return review_state

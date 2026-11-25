@@ -2,6 +2,20 @@
 
 Status: researched proposal, 16 November 2026. This is a design for Austra's proactive organization model; it is not an active business policy or an application change.
 
+## Implemented onboarding memory boundary (20 November 2026)
+
+The onboarding implementation keeps five scopes distinct:
+
+| Scope | Storage | Allowed use |
+| --- | --- | --- |
+| Conversation memory | `conversation_memory_notes` and `conversation_memory_summaries` | Continue a user's conversation; never serve as approved evidence for a factual answer. |
+| Confirmed company profile | Append-only `organization_profile_revisions` | Answer narrow company name, description, website, social link, and goal questions with the revision ID as citation. A completed welcome confirmation or later organization edit creates a revision. |
+| Raw documents and website captures | `evidence_sources`, `evidence_revisions`, and `evidence_chunks` | Discovery input only until claims are reviewed. An attachment excerpt enters only the turn where it is attached; later turns may reference its source ID without silently replaying its text. Exclusion removes it from retrieval. |
+| Workflow candidate | `blueprint_candidates` | Review manual steps, examples, and open decisions. A candidate with open decisions stays in `clarifying` and cannot be confirmed, built, or run. `candidate_order` identifies the newest revision even when timestamps tie. |
+| Published business semantics | `blueprints`, semantic revisions, and confirmed claims | Answer process and policy questions through the existing tenant, permission, time, and blueprint filtered retrieval path. |
+
+The profile lane is intentionally narrow and skips historical or explicit blueprint queries. A profile revision cannot authorize a workflow, an external action, or a policy answer. An administrator's workspace-status question reads the latest profile, saved candidate state, connection records, and action receipts separately, labeling working notes as unapproved and avoiding claims about activity outside Austra. Credential-disclosure requests never enter model context. Migration 021 backfills completed tours into the profile lane and repairs only case goals that exactly match the old discovery summary overwrite. Migration 022 fills a blank admin Name only from an explicit self-introduction in a completed tour; it preserves existing names. Tests use disposable schemas with two tenants and a simulated legacy candidate table; neither migration resets an organization.
+
 ## Design decision
 
 Use PostgreSQL for tenant scoped metadata, approved semantics, business records, revisions, full text search, and vector embeddings through `pgvector`. Store original PDF, DOCX, TXT, and other large evidence bytes in a tenant scoped content addressed blob store. Begin with exact lookup, hybrid full text and vector retrieval, and narrow graph traversal. The optional Redis, MongoDB, and Qdrant services are not needed for this first implementation. Austra's current `postgres:17-alpine` image requires an extension enabled replacement before this design can run; that is an implementation change, not part of this proposal.
@@ -153,3 +167,11 @@ The release gate uses a tenant scoped evaluation set: exact policy recall, histo
 The present `Files.records()` and `Files.approved()` scan JSON files, `search_workspace` uses case-insensitive substring matching, and the agent includes recent chat and workspace summaries before a character-based threshold triggers token counting. This design replaces those paths behind a tenant scoped repository and retrieval service. Preserve existing files as migration evidence; write canonical rows and source revisions with checksums, compare counts and hashes, then switch reads per organization. Do not use live business data for development tests.
 
 Implement in this order: (1) tenant scoped source and semantic tables; (2) exact active/as-of revision queries and RLS; (3) chunk extraction, GIN search, embeddings, and hybrid rank fusion; (4) bounded context assembler with real token counting and citation checks; (5) retrieval evaluation and index tuning. This order makes the first SO/PO/inventory/email capability reliable without requiring every possible organization feature up front.
+
+## Current reliability controls
+
+Migration files use ordered numeric names. `schema_migrations` records each version and SHA-256 checksum; startup rejects an applied script that changed or disappeared. Existing installations receive a repository checksum baseline when migration 024 runs. The baseline records the current script bytes, not a historical proof of what was executed before versioning. A migration failure reports its filename and checksum. SQLAlchemy declarative mappings cover schema-critical candidate, claim decision, profile, memory, source review, and migration columns. The migration runner compares their types and names with PostgreSQL before the app starts. Tenant operations retain psycopg transactions and row-level security; mapped queries compile through the PostgreSQL dialect inside those transactions.
+
+New or changed uploaded sources enter `pending` review. Their passages and claims cannot support approved answers or semantic revisions until an organization admin includes the source. Historical sources remain included during migration. Discovery may read an attached pending document as untrusted context for questions or draft planning; it does not turn that content into an approved rule. The UI shows the review state and offers an explicit include or exclude action.
+
+An organization admin can ask for saved status and receive a named draft, distinct open decisions, connection records, and whether Austra recorded external actions. This is a status view, not an approval. Employees ask within a permitted department and receive only evidence authorized for that scope. Unsupported questions return a reason appropriate to the actor. Chat answers display numbered source labels; technical UUIDs stay in structured citation metadata. Saved drafts have descriptive names; the technical candidate ID remains available only in the review details.

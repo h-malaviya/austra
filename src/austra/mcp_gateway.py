@@ -9,10 +9,19 @@ import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.types import TextContent
 
 
 class ExternalToolError(RuntimeError):
     """An external MCP tool failed without exposing provider credentials."""
+
+
+class ExternalContractError(ExternalToolError):
+    """A local tool returned an older response envelope."""
+
+    def __init__(self, name: str, legacy_text: str | None):
+        super().__init__(f"External MCP tool {name} returned invalid data")
+        self.legacy_text = legacy_text
 
 
 async def call_external_async(
@@ -33,7 +42,7 @@ async def call_external_async(
     except Exception as error:
         raise ExternalToolError(f"External MCP tool {name} is unavailable") from error
     if result.isError:
-        if name in {"gmail_verify", "gmail_send_email"} and any(
+        if name.startswith("gmail_") and any(
             "Gmail authorization expired or was revoked" in getattr(item, "text", "")
             for item in result.content
         ):
@@ -42,7 +51,12 @@ async def call_external_async(
             )
         raise ExternalToolError(f"External MCP tool {name} failed")
     if not isinstance(result.structuredContent, dict):
-        raise ExternalToolError(f"External MCP tool {name} returned invalid data")
+        legacy_text = (
+            result.content[0].text
+            if name == "gmail_read_reply_content" and len(result.content) == 1
+            and isinstance(result.content[0], TextContent) else None
+        )
+        raise ExternalContractError(name, legacy_text)
     return result.structuredContent
 
 

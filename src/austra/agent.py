@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from austra.access import Access
 from austra.files import Files
+from austra.integrations.google_workspace import (
+    GOOGLE_WORKSPACE_ENDPOINTS,
+    WORKSPACE_ACCESS_PROMPT,
+    GoogleWorkspaceApp,
+)
 from austra.mcp_connections import McpConnections
 from austra.mcp_gateway import ExternalToolError
 from austra.memory import (
@@ -90,6 +95,7 @@ class AgentReply(BaseModel):
     title: str = Field(default="", max_length=60)
     drafts: list[Draft] = Field(default_factory=list, max_length=50)
     credential_requests: list[ConnectorName] = Field(default_factory=list, max_length=3)
+    google_workspace_required: GoogleWorkspaceApp | None = None
     decision: Literal["allow", "deny"] = "allow"
     needs_input: bool = False
     save_records: bool = False
@@ -110,6 +116,7 @@ OUTPUT_SCHEMA = {
         "title",
         "drafts",
         "credential_requests",
+        "google_workspace_required",
         "decision",
         "needs_input",
         "save_records",
@@ -154,6 +161,12 @@ OUTPUT_SCHEMA = {
         "credential_requests": {
             "type": "array",
             "items": {"type": "string", "enum": ["anthropic", "gmail", "slack"]},
+        },
+        "google_workspace_required": {
+            "anyOf": [
+                {"type": "string", "enum": list(GOOGLE_WORKSPACE_ENDPOINTS)},
+                {"type": "null"},
+            ],
         },
         "decision": {"type": "string", "enum": ["allow", "deny"]},
         "needs_input": {"type": "boolean"},
@@ -688,6 +701,7 @@ def analyze(
                     "The app renders these tables as interactive A2UI views. Use "
                     "calculate_decimal for arithmetic during research; identify unknown "
                     "figures rather than estimating them."
+                    + (f"\n{WORKSPACE_ACCESS_PROMPT}" if chat["source"] == "ui" else "")
                     + (
                         "\nResearch was incomplete. Use only available evidence, state any "
                         "uncertainty, and do not claim complete extraction or save partial records."
